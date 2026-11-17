@@ -44,6 +44,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
     is read conservatively (fail closed); and two schema positions declaring the
     same `$id` or anchor are refused as `schema_unusable` with the duplicate
     named (the static index never silently replaces an identifier).
+  - The self-contained check follows local references *iteratively* (an explicit
+    work list, not call recursion), so a large but finite, non-recursive `$ref`
+    chain — hundreds of thousands of linked definitions — is analyzed without
+    ending the process by a signal and is accepted (exit 0) just as the default
+    mode accepts it; a chain that closes into a cycle is still refused
+    `schema_unusable`. Only a pathological document with millions of schema
+    positions exhausts the static-analysis budget and is refused
+    `schema_unusable` (exit 20) — never a crash.
 - **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
   session-free JSON dump of the effective tool contract (contract version,
   effective options, and the effective tools with their schemas), reusing the

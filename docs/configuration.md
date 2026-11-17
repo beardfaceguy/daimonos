@@ -623,6 +623,17 @@ anchor (one base URI and name), the document is refused `schema_unusable` with
 the duplicate named: the static index never silently replaces an identifier.
 Context: ADR-030.
 
+A **very deep** schema is analyzed without ever ending the process by a signal.
+The self-contained check follows local references iteratively (an explicit work
+list, not call recursion), so a large but finite, non-recursive `$ref` chain —
+hundreds of thousands of linked definitions — is analyzed and **accepted**
+(exit 0) exactly as the default placeholder mode accepts it; a chain that closes
+into a cycle is still refused `schema_unusable`. Only a genuinely pathological
+document with millions of schema positions exhausts the static-analysis budget
+and is refused `schema_unusable` (exit 20) — never a crash. (A schema whose JSON
+nesting exceeds the JSON parser's own depth limit is rejected by the parser
+before this check runs, in both modes.) Context: ADR-030.
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,

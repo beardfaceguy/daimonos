@@ -815,3 +815,69 @@ def test_v5_default_mode_accepts_recursive_id_despite_decoy(daimonos_binary, tmp
         f"recursive $id schema must be accepted by default, got "
         f"{completed.returncode}\nstderr={completed.stderr}")
     assert posts == 1, f"expected exactly one model request, got {posts}"
+
+
+# ---------------------------------------------------------------------------
+# WP17 r5 (W1): a very deep but FINITE, non-recursive supplied ``$ref`` chain
+# must be analyzed without ending the process by a signal. The recursion check
+# runs before any model request, so one wire exercises it. Option (a) keeps the
+# cycle search iterative (an explicit work list), so a finite acyclic chain is
+# accepted (exit 0) in full-schema mode, matching the default placeholder path.
+# Context: docs/adr/030-self-contained-full-schemas.md, issues D-WP17-13.
+# ---------------------------------------------------------------------------
+
+
+def _deep_chain_schema(n):
+    """A finite, NON-recursive local ``$ref`` chain of ``n`` definitions:
+    ``#/$defs/d0 -> properties.n -> $ref d1 -> ... -> d(n-1)`` whose last
+    definition is a plain string leaf; the document root references ``d0``.
+    Deep in reference hops, shallow in JSON nesting."""
+    defs = {}
+    for i in range(n):
+        if i + 1 == n:
+            defs[f"d{i}"] = {"type": "string"}
+        else:
+            defs[f"d{i}"] = {
+                "type": "object",
+                "properties": {"n": {"$ref": f"#/$defs/d{i + 1}"}},
+            }
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"root": {"$ref": "#/$defs/d0"}},
+        "$defs": defs,
+    }
+
+
+@pytest.mark.parametrize("length", [2000, 100000])
+def test_w1_full_mode_analyzes_deep_finite_chain_without_a_signal(
+        daimonos_binary, tmp_path, length):
+    """W1: in full-schema mode a finite, non-recursive supplied final-answer
+    chain of 2000 and of 100000 definitions is analyzed WITHOUT the process
+    being killed by a signal. The iterative cycle search (option a) accepts the
+    acyclic chain, so the return code is non-negative AND zero, and exactly one
+    model request is made once the check passes (ADR-030, issues D-WP17-13)."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, "chat", _deep_chain_schema(length),
+        {}, full_mode=True)
+    assert completed.returncode >= 0, (
+        f"deep finite chain of {length} was killed by signal "
+        f"{-completed.returncode} in full mode\nstderr={completed.stderr[-2000:]}")
+    assert completed.returncode == 0, (
+        f"finite non-recursive chain of {length} must be accepted in full "
+        f"mode, got {completed.returncode}\nstderr={completed.stderr[-2000:]}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"
+
+
+def test_w1_default_mode_accepts_deep_finite_chain(daimonos_binary, tmp_path):
+    """W1 default pin: WITHOUT full-schema mode the same deep finite chain of
+    2000 definitions is accepted exactly as today (exit 0, one model request).
+    The recursion check does not run outside the opt-in mode; this must hold
+    before and after the r5 change."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, "chat", _deep_chain_schema(2000),
+        {}, full_mode=False)
+    assert completed.returncode == 0, (
+        f"finite chain of 2000 must be accepted by default, got "
+        f"{completed.returncode}\nstderr={completed.stderr[-2000:]}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"

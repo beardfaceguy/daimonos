@@ -34,16 +34,22 @@
 //! validated and offered unchanged through WP05's validator; this module
 //! governs the native/served tool catalog, not the final-answer schema.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
 use crate::schema_validation::{CompiledSchema, SchemaError};
 
 /// Internal bound on static-analysis work for one schema. A document that
-/// exceeds it is treated as statically unusable rather than explored forever;
-/// the native tool schemas are tiny and well under this cap.
-const MAX_ANALYSIS_STEPS: usize = 200_000;
+/// exceeds it is treated as statically unusable (`schema_unusable`, exit 20 —
+/// never a signal) rather than explored forever. The cycle search is iterative
+/// (WP17 r5 / W1, issues D-WP17-13) and its work is linear in the document
+/// size (each reference target is explored once), so this cap only guards a
+/// genuinely pathological document with millions of schema positions. It is
+/// set far above any realistic tool schema and above the deepest chains the
+/// integrator exercised (a 100000-definition `$ref` chain visits ~400k nodes);
+/// the native tool schemas are tiny.
+const MAX_ANALYSIS_STEPS: usize = 10_000_000;
 
 /// A served/exported tool schema that cannot be used locally, detected before
 /// any model request or external I/O (ADR-030). Every variant maps to the run
@@ -826,18 +832,93 @@ fn compose_uri(
 /// target already on the path is a cycle; a target fully explored with no cycle
 /// through it is cached so a shared (diamond) definition is visited once,
 /// keeping a DAG linear.
+/// The depth-first colour of one reference-target node in the iterative cycle
+/// search (WP17 r5 / W1). `Gray` is a node on the active path — a reference
+/// back-edge to it is a recursive cycle; `Black` is a node fully explored with
+/// no cycle through it (the diamond cache a shared definition reuses). A node
+/// not in the map is unvisited (white).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Color {
+    Gray,
+    Black,
+}
+
+/// One entry of the explicit depth-first work list (WP17 r5 / W1). `Enter`
+/// begins exploring a reference target (collecting its out-edges); the matching
+/// `Exit`, pushed beneath its children, marks it fully explored.
+enum Visit {
+    Enter(String),
+    Exit(String),
+}
+
 fn detect_recursion(tool: &str, root: &Value) -> Result<(), SchemaContractError> {
     let index = SchemaIndex::build(tool, root)?;
     let mut search = CycleSearch {
         tool,
         index: &index,
         root,
-        on_path: BTreeSet::new(),
-        acyclic: BTreeSet::new(),
+        pending: Vec::new(),
         steps: 0,
     };
-    // The document root is a schema position (D46 typed traversal).
-    search.schema(root, "")
+    // Iterative depth-first cycle search over the document's reference graph
+    // (WP17 r5 / W1, issues D-WP17-13). The previous version recursed through
+    // every `$ref` hop (`follow_edges` -> `schema` -> `follow_edges` ...), so a
+    // chain of N local definitions recursed N deep and overflowed the thread
+    // stack for a large but finite, non-recursive schema. The work list lives
+    // on the heap, so the reference depth no longer touches the stack; only the
+    // per-node structural walk still recurses, and that is bounded by the
+    // document's JSON nesting depth, which the JSON parser already caps. A node
+    // is keyed by its canonical pointer (the document root is `""`).
+    let mut color: BTreeMap<String, Color> = BTreeMap::new();
+    let mut stack: Vec<Visit> = vec![Visit::Enter(String::new())];
+    while let Some(visit) = stack.pop() {
+        match visit {
+            Visit::Enter(pointer) => {
+                // Already fully explored, or already on the active path and
+                // re-queued by a diamond edge: skip.
+                if color.contains_key(&pointer) {
+                    continue;
+                }
+                let Some(node) = root.pointer(&pointer) else {
+                    // A target that resolves to no node: `resolve` already
+                    // fails closed for a reference it cannot place in the
+                    // document, so simply mark it explored.
+                    color.insert(pointer, Color::Black);
+                    continue;
+                };
+                color.insert(pointer.clone(), Color::Gray);
+                // Collect this node's out-edges with a bounded structural walk
+                // of its subtree; `schema` fills `pending` and never recurses
+                // into a reference target itself.
+                search.bump()?;
+                search.pending.clear();
+                search.schema(node, &pointer)?;
+                let edges = std::mem::take(&mut search.pending);
+                // Exit is pushed beneath the children so it runs only after the
+                // whole subtree is explored (keeps `color` a correct path set).
+                stack.push(Visit::Exit(pointer));
+                for target in edges {
+                    match color.get(&target) {
+                        // A back-edge to a node still on the active path is the
+                        // recursive cycle.
+                        Some(Color::Gray) => {
+                            return Err(SchemaContractError::Recursive {
+                                tool: tool.to_string(),
+                                pointer: format!("#{target}"),
+                            });
+                        }
+                        // Already proven acyclic (diamond / shared definition).
+                        Some(Color::Black) => {}
+                        None => stack.push(Visit::Enter(target)),
+                    }
+                }
+            }
+            Visit::Exit(pointer) => {
+                color.insert(pointer, Color::Black);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// How a keyword's value is traversed inside a schema object (JSON Schema
@@ -894,20 +975,23 @@ fn classify_keyword(key: &str) -> KeywordKind {
     }
 }
 
-/// Depth-first cycle search over one document's reference graph (ADR-030),
-/// carrying the active reference path and a cache of fully-explored acyclic
-/// targets so a shared (diamond) definition is visited once. The structural
-/// descent is typed (D46): only schema positions are followed as schemas, data
-/// keywords are skipped, and an unknown keyword is walked conservatively.
+/// One document's reference-graph edge collector (ADR-030). A structural walk
+/// of a single node's subtree ([`CycleSearch::schema`]) gathers every
+/// `$ref`/`$dynamicRef` target found in it into [`Self::pending`] WITHOUT
+/// following any of them; the iterative driver ([`detect_recursion`]) does the
+/// depth-first cycle search over those edges on an explicit heap work list, so
+/// the reference depth never touches the thread stack (WP17 r5 / W1). The
+/// structural descent is typed (D46): only schema positions are followed as
+/// schemas, data keywords are skipped, and an unknown keyword is walked
+/// conservatively. The structural recursion is bounded by the document's JSON
+/// nesting depth, which the JSON parser already caps.
 struct CycleSearch<'a> {
     tool: &'a str,
     index: &'a SchemaIndex,
     root: &'a Value,
-    /// Reference targets currently on the active path (a hop back to one is a
-    /// cycle).
-    on_path: BTreeSet<String>,
-    /// Targets fully explored with no cycle through them (diamond cache).
-    acyclic: BTreeSet<String>,
+    /// Resolved reference targets collected from the subtree currently being
+    /// walked; drained by the driver after each node's structural walk.
+    pending: Vec<String>,
     /// Static-analysis step budget guard.
     steps: usize,
 }
@@ -924,8 +1008,11 @@ impl<'a> CycleSearch<'a> {
         Ok(())
     }
 
-    /// Follow the `$ref`/`$dynamicRef` edges at one object node, detecting a
-    /// cycle and recursing into each (schema) target.
+    /// Collect the `$ref`/`$dynamicRef` edges at one object node into
+    /// [`Self::pending`], resolving each to its canonical target pointer. The
+    /// edges are NOT followed here (the driver explores them iteratively); only
+    /// a reference the detector cannot resolve inside the document is refused
+    /// eagerly, fail-closed (integrator D41).
     fn follow_edges(
         &mut self,
         map: &serde_json::Map<String, Value>,
@@ -940,23 +1027,10 @@ impl<'a> CycleSearch<'a> {
         }
         for (reference, dynamic) in edges {
             match self.index.resolve(self.root, pointer, &reference, dynamic) {
-                RefEdge::To(target) => {
-                    if self.on_path.contains(&target) {
-                        return Err(SchemaContractError::Recursive {
-                            tool: self.tool.to_string(),
-                            pointer: format!("#{target}"),
-                        });
-                    }
-                    if !self.acyclic.contains(&target) {
-                        if let Some(target_node) = self.root.pointer(&target) {
-                            self.on_path.insert(target.clone());
-                            // A reference target is always a schema position.
-                            self.schema(target_node, &target)?;
-                            self.on_path.remove(&target);
-                            self.acyclic.insert(target);
-                        }
-                    }
-                }
+                // A reference target is always a schema position. Record it;
+                // the driver places it in the reference graph and detects a
+                // cycle (an edge back to a target on the active path).
+                RefEdge::To(target) => self.pending.push(target),
                 // Fail closed (integrator D41): a reference the WP05 validator
                 // accepted that we cannot resolve inside the document is
                 // refused, named, and never fetched.
@@ -1778,6 +1852,77 @@ mod tests {
         });
         let err = ValidatedToolSchema::validate("xm", &schema)
             .expect_err("a reference under an unknown keyword is read conservatively");
+        assert_eq!(err.reason(), "schema_unusable");
+    }
+
+    /// Build a finite, NON-recursive `$ref` chain of `n` local definitions:
+    /// `#/$defs/d0 -> properties.n -> $ref d1 -> ... -> d(n-1)`, whose last
+    /// definition is a plain string leaf (no reference). The document root
+    /// references `d0`. The chain is deep in reference hops but shallow in JSON
+    /// nesting, so the only unbounded recursion it can provoke is the cycle
+    /// search following the chain of references.
+    fn deep_reference_chain(n: usize) -> Value {
+        let mut defs = serde_json::Map::new();
+        for i in 0..n {
+            let def = if i + 1 == n {
+                json!({ "type": "string" })
+            } else {
+                json!({
+                    "type": "object",
+                    "properties": { "n": { "$ref": format!("#/$defs/d{}", i + 1) } }
+                })
+            };
+            defs.insert(format!("d{i}"), def);
+        }
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": { "root": { "$ref": "#/$defs/d0" } },
+            "$defs": Value::Object(defs)
+        })
+    }
+
+    /// WP17 r5 (W1, option a): a finite, non-recursive `$ref` chain of 5000
+    /// local definitions must be analyzed without overflowing the thread stack
+    /// (the check runs on a ~2 MiB tokio worker / test thread). With the
+    /// recursive cycle search this call aborted the whole test binary with
+    /// `fatal runtime error: stack overflow`; with the iterative work list it
+    /// passes the check (the chain is self-contained and acyclic).
+    #[test]
+    fn accepts_a_deep_finite_reference_chain_without_stack_overflow() {
+        let schema = deep_reference_chain(5000);
+        ValidatedToolSchema::validate("deepchain", &schema)
+            .expect("a finite non-recursive reference chain is not recursive");
+    }
+
+    /// WP17 r5 (W1): the same depth of reference hops, but closed into a cycle
+    /// at the far end, is still refused as `schema_unusable` (the iterative
+    /// driver detects the back-edge to an on-path target) rather than crashing
+    /// or being missed.
+    #[test]
+    fn refuses_a_deep_reference_chain_that_closes_into_a_cycle() {
+        let n = 5000;
+        let mut defs = serde_json::Map::new();
+        for i in 0..n {
+            // Every definition references the next; the last references d0, so
+            // the whole chain is one long recursive cycle.
+            let target = (i + 1) % n;
+            defs.insert(
+                format!("d{i}"),
+                json!({
+                    "type": "object",
+                    "properties": { "n": { "$ref": format!("#/$defs/d{target}") } }
+                }),
+            );
+        }
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": { "root": { "$ref": "#/$defs/d0" } },
+            "$defs": Value::Object(defs)
+        });
+        let err = ValidatedToolSchema::validate("deepcycle", &schema)
+            .expect_err("a deep chain that closes into a cycle is recursive");
         assert_eq!(err.reason(), "schema_unusable");
     }
 }
