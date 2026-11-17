@@ -14,6 +14,15 @@ pub async fn tool_run(session: &Session, op: &Op) -> Response {
         None => return Response::err(3, "tool_run requires tool id in 'p'"),
     };
 
+    // FR-02 (WP06, ADR-023) R1: a composite that resolves an inner registered
+    // tool by name must check that INNER name against the explicit allowlist
+    // before running it — delegation never bypasses the list (PM Q-FR-02-1).
+    // The refusal carries the reviewed `tool_not_allowed` code, naming the
+    // inner tool. With no explicit list this is always allowed (legacy).
+    if let Err(failure) = session.policy.admit(tool_id) {
+        return failure.into_response(tool_id);
+    }
+
     let command = match &op.s {
         Some(c) => c.as_str(),
         None => return Response::err(3, "tool_run requires command in 's'"),
@@ -73,6 +82,13 @@ pub async fn lint_repair(session: &Session, op: &Op) -> Response {
         None => return Response::err(3, "lint_repair requires tool id in 'p'"),
     };
 
+    // FR-02 (WP06, ADR-023) R1: check the inner `tool_id` against the explicit
+    // allowlist before the registry runs it (delegation must not bypass the
+    // list; PM Q-FR-02-1). Legacy (no list) always admits.
+    if let Err(failure) = session.policy.admit(tool_id) {
+        return failure.into_response(tool_id);
+    }
+
     let registry = match &session.tool_registry {
         Some(r) => r,
         None => return Response::err(4, "tool registry not available"),
@@ -98,6 +114,13 @@ pub async fn tool_pipeline(session: &Session, op: &Op) -> Response {
         Some(t) => t.as_str(),
         None => return Response::err(3, "tool_pipeline requires tool id in 'p'"),
     };
+
+    // FR-02 (WP06, ADR-023) R1: check the inner `tool_id` against the explicit
+    // allowlist before the registry runs any stage (delegation must not bypass
+    // the list; PM Q-FR-02-1). Legacy (no list) always admits.
+    if let Err(failure) = session.policy.admit(tool_id) {
+        return failure.into_response(tool_id);
+    }
 
     let stages = match &op.a {
         Some(s) if !s.is_empty() => s,
@@ -387,6 +410,62 @@ mod tests {
         assert!(list_resp.ok);
         let data = list_resp.d.unwrap();
         assert_eq!(data["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn tool_run_inner_tool_not_on_allowlist_is_refused() {
+        // FR-02 (WP06, ADR-023) R1: the inner `tool_id` of a delegating opcode
+        // is checked against the explicit allowlist before the registry is
+        // consulted. `tool_run` is reachable only over the raw native protocol
+        // (no named-tool mapping), so this is its policy-boundary test.
+        let (_dir, mut session) = test_session_with_registry();
+        session.policy = crate::run_policy::ToolPolicy::explicit(["other_tool"]);
+        let op = Op {
+            c: 20,
+            p: Some("marker".into()),
+            s: Some("run".into()),
+            ..Default::default()
+        };
+        let resp = tool_run(&session, &op).await;
+        assert!(!resp.ok);
+        let data = resp.d.expect("refusal carries structured data");
+        assert_eq!(data["code"], crate::run_policy::CODE_TOOL_NOT_ALLOWED);
+        assert_eq!(data["tool"], "marker");
+    }
+
+    #[tokio::test]
+    async fn tool_pipeline_inner_tool_not_on_allowlist_is_refused() {
+        let (_dir, mut session) = test_session_with_registry();
+        session.policy = crate::run_policy::ToolPolicy::explicit(["tool_pipeline"]);
+        let op = Op {
+            c: 22,
+            p: Some("marker".into()),
+            a: Some(vec!["run".into()]),
+            ..Default::default()
+        };
+        let resp = tool_pipeline(&session, &op).await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.d.unwrap()["code"],
+            crate::run_policy::CODE_TOOL_NOT_ALLOWED
+        );
+    }
+
+    #[tokio::test]
+    async fn lint_repair_inner_tool_not_on_allowlist_is_refused() {
+        let (_dir, mut session) = test_session_with_registry();
+        session.policy = crate::run_policy::ToolPolicy::explicit(["lint_repair"]);
+        let op = Op {
+            c: 21,
+            p: Some("marker".into()),
+            ..Default::default()
+        };
+        let resp = lint_repair(&session, &op).await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.d.unwrap()["code"],
+            crate::run_policy::CODE_TOOL_NOT_ALLOWED
+        );
     }
 
     #[tokio::test]

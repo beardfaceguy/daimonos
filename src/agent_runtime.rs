@@ -506,6 +506,9 @@ pub async fn run_agent(
                 workspace,
                 &cfg.prompts.resolved_tool_descriptions,
                 cfg.filesystem_authority.is_some(),
+                // Final-output name-collision check needs the FULL native
+                // catalog, independent of any --tool-allowlist.
+                &crate::run_policy::ToolPolicy::unrestricted(),
             )
             .iter()
             .any(|schema| schema.name.as_str() == spec.tool_name());

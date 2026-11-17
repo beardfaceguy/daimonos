@@ -118,7 +118,44 @@ impl ToolPolicy {
             })
         }
     }
+}
 
+/// Outcome of validating an explicit `--tool-allowlist` selection against the
+/// run's known-tool catalog and the configured final-answer tool (ADR-023,
+/// FR-02 requirement 5 and PM Q-FR-02-2). The first unknown entry is reported
+/// before the missing-final-output case, matching the exit-2 taxonomy order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowlistError {
+    /// A requested name matches no known tool (native, plugin, config-registered
+    /// local, or the configured final-answer tool). Fail-closed at startup.
+    UnknownEntry(String),
+    /// Final-output is configured but its final-answer tool is absent from the
+    /// explicit allowlist. It is NEVER inserted automatically (PM Q-FR-02-2).
+    MissingFinalOutput(String),
+}
+
+/// Validate an explicit allowlist selection at startup (ADR-023 Confirmation).
+/// `known` is the effective catalog of dispatchable names; `final_output_tool`
+/// is the caller's designated final-answer tool when final-output is active.
+/// The final-answer name is required to be present in `names` but is never
+/// added to it (fail-closed, not auto-correction).
+pub fn validate_allowlist(
+    names: &[String],
+    known: &std::collections::BTreeSet<String>,
+    final_output_tool: Option<&str>,
+) -> Result<(), AllowlistError> {
+    if let Some(unknown) = names.iter().find(|name| !known.contains(name.as_str())) {
+        return Err(AllowlistError::UnknownEntry(unknown.clone()));
+    }
+    if let Some(final_tool) = final_output_tool {
+        if !names.iter().any(|name| name == final_tool) {
+            return Err(AllowlistError::MissingFinalOutput(final_tool.to_string()));
+        }
+    }
+    Ok(())
+}
+
+impl ToolPolicy {
     /// The effective allowlist as a sorted vector, or `None` when no explicit
     /// list is in force. Intersected with the legacy restriction when one is
     /// supplied (the allowlist can only narrow it, never widen it — the
@@ -487,6 +524,103 @@ impl StartupDestinations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R6 (ADR-023 Confirmation): empty, absent, unknown, narrowed, and
+    // missing-final-name selections for the explicit `ToolPolicy`.
+    #[test]
+    fn explicit_empty_list_denies_all_and_is_active() {
+        let policy = ToolPolicy::explicit(Vec::<String>::new());
+        assert!(
+            policy.is_active(),
+            "an explicit empty list is active (deny-all)"
+        );
+        assert!(!policy.allows("read_file"));
+        assert!(!policy.allows("write_file"));
+        // Distinct from absent: it reports an explicit (empty) effective set.
+        assert_eq!(policy.effective(None), Some(Vec::<String>::new()));
+    }
+
+    #[test]
+    fn absent_list_allows_all_and_is_inactive() {
+        let policy = ToolPolicy::unrestricted();
+        assert!(!policy.is_active());
+        assert!(policy.allows("read_file"));
+        assert!(policy.allows("anything"));
+        assert_eq!(policy.effective(None), None);
+    }
+
+    #[test]
+    fn explicit_list_admits_only_listed_names() {
+        let policy = ToolPolicy::explicit(["read_file", "search"]);
+        assert!(policy.allows("read_file"));
+        assert!(!policy.allows("write_file"), "an unlisted name is refused");
+        assert_eq!(
+            policy.admit("write_file").unwrap_err().code,
+            CODE_TOOL_NOT_ALLOWED
+        );
+        assert!(policy.admit("read_file").is_ok());
+    }
+
+    #[test]
+    fn effective_intersects_the_legacy_restriction() {
+        let policy = ToolPolicy::explicit(["read_file", "search", "exec"]);
+        // No legacy restriction: the full sorted list.
+        assert_eq!(
+            policy.effective(None),
+            Some(vec![
+                "exec".to_string(),
+                "read_file".into(),
+                "search".into()
+            ])
+        );
+        // A legacy restriction that narrows (drops `exec`): the report is the
+        // intersection, never wider than the legacy set (ADR-023 R4).
+        let legacy = |name: &str| name != "exec";
+        assert_eq!(
+            policy.effective(Some(&legacy)),
+            Some(vec!["read_file".to_string(), "search".into()])
+        );
+    }
+
+    #[test]
+    fn validate_allowlist_rejects_unknown_before_missing_final() {
+        let known: std::collections::BTreeSet<String> = ["read_file", "search", "final_answer"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // Unknown entry is reported first (exit-2 taxonomy order).
+        let names = vec!["read_file".to_string(), "nope".into()];
+        assert_eq!(
+            validate_allowlist(&names, &known, Some("final_answer")),
+            Err(AllowlistError::UnknownEntry("nope".into()))
+        );
+    }
+
+    #[test]
+    fn validate_allowlist_requires_the_final_name_without_adding_it() {
+        let known: std::collections::BTreeSet<String> = ["read_file", "search", "final_answer"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let names = vec!["read_file".to_string(), "search".into()];
+        // Final-output configured but its tool is absent from the list => fail.
+        assert_eq!(
+            validate_allowlist(&names, &known, Some("final_answer")),
+            Err(AllowlistError::MissingFinalOutput("final_answer".into()))
+        );
+        // Listing it explicitly passes; it is never auto-added.
+        let with_final = vec![
+            "read_file".to_string(),
+            "search".into(),
+            "final_answer".into(),
+        ];
+        assert_eq!(
+            validate_allowlist(&with_final, &known, Some("final_answer")),
+            Ok(())
+        );
+        // No final-output configured: membership is not required.
+        assert_eq!(validate_allowlist(&names, &known, None), Ok(()));
+    }
 
     fn admission(read_only: bool) -> ToolAdmission {
         ToolAdmission::new(read_only, false, false)
