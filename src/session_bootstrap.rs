@@ -26,6 +26,9 @@ pub struct BootstrapOptions<'a> {
     pub agent_instructions: Option<&'a Path>,
     pub confine_reference: Option<&'a Path>,
     pub confine_identity: Option<&'a str>,
+    /// Independent no-follow option (WP14). Part of the daemon's launch
+    /// identity so a pinned session daemon enforces the same link policy.
+    pub no_follow: bool,
     pub debug_tokens: bool,
     pub socket_path: &'a Path,
     pub provider: Option<&'a str>,
@@ -189,6 +192,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
         args.push(OsString::from("--confine-root"));
         args.push(reference.as_os_str().to_owned());
     }
+    if options.no_follow {
+        args.push(OsString::from("--no-follow-symlinks"));
+    }
     args.push(OsString::from("session-daemon"));
     args.push(OsString::from("--socket"));
     args.push(options.socket_path.as_os_str().to_owned());
@@ -240,6 +246,9 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
         digest.update(identity.as_bytes());
         digest.update([0_u8]);
     }
+    if options.no_follow {
+        digest.update(b"no-follow\0");
+    }
     if let Some(provider) = options.provider {
         digest.update(provider.as_bytes());
     }
@@ -255,6 +264,7 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.agent_instructions.is_none()
         && !options.debug_tokens
         && options.confine_identity.is_none()
+        && !options.no_follow
     {
         return Ok(LaunchIdentity::NotRequested);
     }
@@ -336,6 +346,7 @@ mod tests {
             agent_instructions: None,
             confine_reference: None,
             confine_identity: None,
+            no_follow: false,
             debug_tokens: false,
             socket_path: socket,
             provider: Some("openrouter"),
@@ -401,6 +412,31 @@ mod tests {
         assert_ne!(
             bootstrap_fingerprint(&first),
             bootstrap_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn daemon_arguments_and_identity_include_no_follow() {
+        // WP14: the independent no-follow option must ride the daemon launch
+        // identity so a pinned session daemon enforces the same link policy.
+        let base = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        assert!(!daemon_args(&base).contains(&OsString::from("--no-follow-symlinks")));
+        let mut nofollow = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        nofollow.no_follow = true;
+        assert!(daemon_args(&nofollow).contains(&OsString::from("--no-follow-symlinks")));
+        assert_ne!(
+            bootstrap_fingerprint(&base),
+            bootstrap_fingerprint(&nofollow)
         );
     }
 

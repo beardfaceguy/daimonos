@@ -90,7 +90,14 @@ async fn read_confined(session: &mut Session, op: &Op) -> Response {
         .as_ref()
         .expect("confined read requires authority");
     let requested = session.resolve_path(raw);
-    let authorized = match authority.open_read(&requested) {
+    // WP14: under the no-follow policy, a symlink read is refused with its
+    // target text rather than followed to the target's content.
+    let open_result = if authority.no_follow() {
+        authority.open_read_no_follow(&requested)
+    } else {
+        authority.open_read(&requested)
+    };
+    let authorized = match open_result {
         Ok(file) => file,
         Err(error) => return error.with_argument(raw).into_response("read_file"),
     };
@@ -475,7 +482,8 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
             &path,
             WalkOptions {
                 max_depth: Some(depth - 1),
-                follow_symlinks: true,
+                // WP14: no-follow lists links but never descends into them.
+                follow_symlinks: !authority.no_follow(),
                 include_hidden: show_all,
                 skip_dirs: SKIP_DIRS,
             },
@@ -836,6 +844,8 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
                 &directory,
                 WalkOptions {
                     max_depth: depth,
+                    // WP14: no-follow never walks through links.
+                    follow_symlinks: !authority.no_follow(),
                     ..WalkOptions::default()
                 },
             )
@@ -991,6 +1001,8 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
             &root,
             WalkOptions {
                 include_hidden: false,
+                // WP14: no-follow never walks through links.
+                follow_symlinks: !authority.no_follow(),
                 ..WalkOptions::default()
             },
         )?;

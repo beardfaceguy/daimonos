@@ -197,6 +197,8 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
             &scan_root,
             WalkOptions {
                 include_hidden: false,
+                // WP14: no-follow never walks through links.
+                follow_symlinks: !authority.no_follow(),
                 ..WalkOptions::default()
             },
         )?;

@@ -350,6 +350,11 @@ pub async fn run_agent(
                 agent_instructions: explicit_agent_instructions.as_deref(),
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
+                // WP14: carry the independent no-follow option to the daemon.
+                no_follow: cfg
+                    .filesystem_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.no_follow()),
                 debug_tokens: token_log.is_some(),
                 socket_path: &socket_path,
                 provider: provider.as_deref(),
