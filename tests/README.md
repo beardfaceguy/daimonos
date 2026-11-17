@@ -56,6 +56,13 @@ python3 -m pytest tests/ -v
 Run from the repository root. The Python fixture builds the binary and starts a fresh MCP session per test.
 The git_read tests use temporary repositories and require no remote objects or provider API key.
 
+`tests/test_configuration_isolation.py` drives a real `daimonos` process to assert
+explicit-only configuration discovery (`--ignore-config-files`, FR-09): a hostile
+workspace corpus configures nothing, each ignored source is reported by path, and
+an explicit `--config` is still honored. Like the other suites it needs the CLI
+programs on `PATH` (the plugin tests spawn `pytest`); export the virtualenv's
+`bin` directory as shown above before running.
+
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
 If a local run uses temporary programs, report their versions and the PATH prefix explicitly.

@@ -174,8 +174,12 @@ pub async fn load_configured_specs(cfg: &Config) -> Vec<ServerSpec> {
     }
     let source = match cfg.agent.mcp.servers_file.as_deref() {
         Some(source) => source,
-        None if cfg.state_authority.is_some() || cfg.filesystem_authority.is_some() => {
-            return Vec::new()
+        None if cfg.state_authority.is_some()
+            || cfg.filesystem_authority.is_some()
+            || cfg.discovery_policy.is_explicit_only() =>
+        {
+            // D06/D07 (ADR-021, FR-09): no default Zed/home MCP settings read.
+            return Vec::new();
         }
         None => "~/.config/zed/settings.json",
     };
@@ -289,6 +293,17 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WP11 (FR-09, ADR-021): explicit-only mode reads no default MCP/Zed settings.
+    #[tokio::test]
+    async fn explicit_only_ignores_default_mcp_servers() {
+        let mut cfg = Config {
+            discovery_policy: crate::discovery_policy::DiscoveryPolicy::ExplicitOnly,
+            ..Default::default()
+        };
+        cfg.agent.mcp.enabled = true;
+        assert!(load_configured_specs(&cfg).await.is_empty());
+    }
 
     #[tokio::test]
     async fn confined_implicit_config_does_not_select_remote_servers() {

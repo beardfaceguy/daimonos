@@ -102,6 +102,53 @@ ignore files outside the root are not read. Confined glob patterns with a parent
 component after a wildcard are refused. Procfs symlink stat does not expose
 target text.
 
+## Explicit-only configuration (`--ignore-config-files`)
+
+`--ignore-config-files` refuses every *implicit* configuration source so a
+hostile workspace or home file cannot configure an opted-in run. It is a global
+run option and is default off: when it is absent, discovery is unchanged.
+
+When it is set, these implicit sources are disabled:
+
+- **Environment files:** a workspace `agent.env` and the
+  `~/.config/daimonos/agent.env` (or `$XDG_CONFIG_HOME`) fallback are not read
+  or applied.
+- **Config files:** a workspace `daimonos.toml` and the HOME/XDG config are not
+  read.
+- **Agent instructions:** global and workspace `agent-instructions.md` are not
+  read.
+- **Skills:** the global (`~/.agents/skills`) and workspace (`.agents/skills`)
+  roots are not discovered, and no skill executables are registered.
+- **MCP servers:** the default Zed `context_servers` settings file is not
+  opened.
+- **Ignore files:** `.gitignore`, `.ignore`, and global/parent ignore files do
+  not steer `search` or evidence walks.
+- **CLI plugins:** only explicitly configured tools are registered; no
+  workspace or user plugins.
+
+Explicit, caller-supplied inputs remain honored: an explicit `--config PATH` and
+the control paths it names (prompt overrides, `[agent.mcp] servers_file`, Zed
+settings), together with `--agent-env`, `$DAIMONOS_AGENT_ENV`, and
+`--agent-instructions`. An invalid explicit input fails the run rather than
+falling back to another source (ADR-021).
+
+At startup the run prints a one-line JSON effective-policy report to stderr that
+names each ignored source by path, without reading its contents, for example:
+
+```json
+{"effective_policy":{"ignore_config_files":true,"ignored":[{"kind":"D01","label":"environment file","path":"/work/agent.env"}]}}
+```
+
+The option is part of a session daemon's launch identity: a daemon started with
+`--ignore-config-files` is distinct from one started without it, the same way
+`--confine-paths` pins a daemon. Reusing a running daemon with a different
+setting spawns a new one.
+
+Live remote model discovery is governed separately (see controlled transport
+and `DAIMONOS_AGENT_MODELS_DISCOVER`), not by this option.
+
+See ADR-021 and `src/discovery_policy.rs`.
+
 ## Agent Environment File
 
 `daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,

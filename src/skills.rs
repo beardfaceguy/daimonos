@@ -117,6 +117,10 @@ fn discover_from(
     global_root: Option<&Path>,
     config: &crate::config::AgentSkillsConfig,
 ) -> Discovery {
+    // WP11 (FR-09, ADR-021): explicit-only runs register no implicit skills.
+    if config.explicit_only {
+        return Discovery::default();
+    }
     let workspace_root = workspace.join(DEFAULT_SKILL_DIR);
     let mut out = Discovery::default();
     if let Some(global_root) = global_root {
@@ -613,6 +617,30 @@ fn activation_envelope_from_skill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WP11 (FR-09, ADR-021): explicit-only discovery registers no implicit skills.
+    #[test]
+    fn explicit_only_discovery_returns_no_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let global = temp.path().join("global-empty");
+        write_skill(
+            &workspace.join(DEFAULT_SKILL_DIR),
+            "demo",
+            "name: demo\ndescription: present",
+            "body",
+        );
+        assert_eq!(
+            discover_in(workspace, &global, &config()).skills.len(),
+            1,
+            "baseline discovery must see the workspace skill"
+        );
+        let mut explicit = config();
+        explicit.explicit_only = true;
+        let found = discover_in(workspace, &global, &explicit);
+        assert!(found.skills.is_empty(), "{:?}", found.skills);
+        assert!(found.all_sources.is_empty());
+    }
 
     fn config() -> crate::config::AgentSkillsConfig {
         crate::config::AgentSkillsConfig::default()

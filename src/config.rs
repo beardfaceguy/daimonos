@@ -145,6 +145,10 @@ pub struct Config {
     /// Pinned at startup and shared across sessions (ADR-022).
     #[serde(skip)]
     pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
+    /// Caller-owned configuration discovery policy (ADR-021, FR-09). Never
+    /// deserialized from a config file; set once at startup from the CLI.
+    #[serde(skip)]
+    pub discovery_policy: crate::discovery_policy::DiscoveryPolicy,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -177,6 +181,9 @@ pub struct AgentSkillsConfig {
     /// Fixed filesystem authority for skill discovery (ADR-022).
     #[serde(skip)]
     pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
+    /// Explicit-only discovery (ADR-021, FR-09): skip every implicit skill root.
+    #[serde(skip)]
+    pub explicit_only: bool,
     pub max_skills: usize,
     pub max_file_bytes: u64,
     pub catalog_max_bytes: usize,
@@ -188,6 +195,7 @@ impl Default for AgentSkillsConfig {
         Self {
             global_dir: None,
             filesystem_authority: None,
+            explicit_only: false,
             max_skills: 128,
             max_file_bytes: 100 * 1024,
             catalog_max_bytes: 16 * 1024,
@@ -2471,6 +2479,41 @@ pub(crate) fn load_confined(
         eprintln!("config: using built-in defaults");
     }
     Ok(Config::default())
+}
+
+/// Explicit-only configuration (ADR-021, FR-09): honour only the caller's
+/// explicit `--config` path. No workspace or user/home candidate is eligible,
+/// and an unreadable or invalid explicit config fails rather than falling back
+/// to another source.
+pub(crate) fn load_explicit_only(
+    explicit: Option<&Path>,
+    quiet_diagnostic_stderr: bool,
+) -> Result<Config, String> {
+    let Some(path) = explicit else {
+        if !quiet_diagnostic_stderr {
+            eprintln!("config: explicit-only mode; using built-in defaults");
+        }
+        return Ok(Config::default());
+    };
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read explicit config {}: {}",
+            path.display(),
+            error.kind()
+        )
+    })?;
+    let mut cfg = toml::from_str::<Config>(&content).map_err(|error| {
+        format!(
+            "invalid explicit config {}: {}",
+            path.display(),
+            error.message()
+        )
+    })?;
+    cfg.explicit_control_paths = true;
+    if !quiet_diagnostic_stderr {
+        eprintln!("config: loaded from {:?}", path);
+    }
+    Ok(cfg)
 }
 
 /// Ordered config-file search candidates, matching `load`'s discovery order:

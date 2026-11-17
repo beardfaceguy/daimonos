@@ -14,6 +14,7 @@ mod config;
 mod confined_ignore;
 mod context_metrics;
 mod coordination;
+mod discovery_policy;
 mod env_file;
 mod evidence;
 mod frontend_state;
@@ -231,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     let caller_agent_env = std::env::var_os("DAIMONOS_AGENT_ENV").map(PathBuf::from);
+    // Explicit-only discovery is pinned before any implicit startup read (ADR-021, FR-09).
+    let explicit_only = cli.explicit_only();
     // Pin the confinement root before implicit startup file discovery (ADR-022).
     let mut filesystem_authority = if cli.confinement_requested() {
         let root = cli.confine_root.as_deref().unwrap_or(&workspace);
@@ -405,7 +408,18 @@ async fn main() -> anyhow::Result<()> {
     // dispatch, so every runtime mode and every later `std::env::var` read sees
     // the same values from one place. The real environment wins; loader-hijack
     // variables are refused. See `env_file`.
-    if let Some(authority) = &filesystem_authority {
+    if explicit_only {
+        eprintln!(
+            "{}",
+            discovery_policy::report_value(&discovery_policy::ignored_sources(
+                &workspace,
+                cli.config.as_deref()
+            ))
+        );
+    }
+    if explicit_only {
+        // D01/D03 (ADR-021, FR-09): explicit-only mode loads no implicit `agent.env`.
+    } else if let Some(authority) = &filesystem_authority {
         env_file::load_confined(
             &workspace,
             authority,
@@ -423,7 +437,20 @@ async fn main() -> anyhow::Result<()> {
 
     let startup_logs_early = cli.verbose || env_requests_mcp_startup_logs();
     let quiet_cfg_stderr = runtime_mode.is_mcp_stdio() && !startup_logs_early;
-    let mut cfg = if let Some(authority) = &filesystem_authority {
+    let mut cfg = if explicit_only {
+        match config::load_explicit_only(cli.config.as_deref(), quiet_cfg_stderr) {
+            Ok(cfg) => cfg,
+            Err(message) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid", "reason": "config_invalid", "message": message
+                    }})
+                );
+                std::process::exit(2);
+            }
+        }
+    } else if let Some(authority) = &filesystem_authority {
         match config::load_confined(
             cli.config.as_deref(),
             &workspace,
@@ -446,6 +473,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         config::load(cli.config.as_deref(), &workspace, quiet_cfg_stderr)
     };
+    cfg.discovery_policy = discovery_policy::DiscoveryPolicy::from_ignore_flag(explicit_only);
+    cfg.agent.skills.explicit_only = explicit_only;
     if let Some(authority) = state_authority {
         if let Err(error) = cfg.apply_state_authority(authority, &workspace) {
             eprintln!(
@@ -748,9 +777,13 @@ async fn main() -> anyhow::Result<()> {
         | None => false,
     };
     if uses_agent_prompt {
-        cfg.prompts.additional_agent_instructions = match if let Some(authority) =
-            &cfg.filesystem_authority
-        {
+        cfg.prompts.additional_agent_instructions = match if explicit_only {
+            prompts::load_agent_instructions_explicit_only(
+                cli.agent_instructions.as_deref(),
+                &workspace,
+            )
+            .await
+        } else if let Some(authority) = &cfg.filesystem_authority {
             prompts::load_agent_instructions_confined(
                 cli.agent_instructions.as_deref(),
                 &workspace,

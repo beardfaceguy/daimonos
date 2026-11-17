@@ -148,6 +148,7 @@ No independent updater/downloader service appeared in the inspected first-party 
 - WP01/WP02 tests replace HOME/XDG with unwritable paths and require all enabled internal writes to stay under explicit state.
 - WP03/WP04/WP14 test linked roots, ancestor substitution, hostile walks, linked nonexistent write targets, and unsupported tool refusal.
 - WP06 tests direct, batch, script, pipeline, lazy activation, plugins, and remote routes against the same effective policy.
+- WP11 (implemented) gates D01–D09 behind `--ignore-config-files`: env files, config, agent instructions, skills, default MCP/Zed settings, ignore files, and file-defined CLI plugins are refused when the option is set, while explicit caller inputs remain honored and each ignored source is reported by path. Verified by `tests/test_configuration_isolation.py` (every recognized kind, a mixed hostile corpus, and the effective-policy report) with per-kind Rust unit tests at the `env_file`/`config`/`prompts`/`skills`/`agent_mcp`/`acp_cmd`/`file_ops`/`session_bootstrap` seams. D10 (live remote model discovery) is out of WP11 scope (WP07/WP20).
 - WP18/WP19 test cooperative stops, process-group teardown, cached/composite accounting, and complete digest failure when the budget is insufficient.
 - WP20 tests the full admitted read catalog while observing DNS, socket/connect, and child attempts from startup through shutdown.
 - Observation must demonstrate zero attempted outbound IP activity, not just failed requests under a disconnected network.
