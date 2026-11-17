@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Startup `cargo` availability probe no longer installs a Rust toolchain. The
+  probe now sets `RUSTUP_AUTO_INSTALL=0`, so inside a project that pins a
+  toolchain via `rust-toolchain.toml` the rustup shim fails fast as
+  "toolchain is not installed" instead of downloading ~615 MB into
+  `$HOME/.rustup` when the toolchain is absent.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The
