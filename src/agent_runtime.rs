@@ -259,9 +259,15 @@ fn enforce_full_schema_contract(cfg: &config::Config, workspace: &Path) {
         &cfg.prompts.resolved_tool_descriptions,
         confined,
     );
-    let entries: Vec<(&str, &serde_json::Value)> = schemas
+    // Native tools are OWNED definitions (S3 / D39): they participate in the
+    // cross-tool collision namespace.
+    let entries: Vec<crate::schema_contract::CatalogSchema> = schemas
         .iter()
-        .map(|schema| (schema.name.as_str(), &schema.input_schema))
+        .map(|schema| crate::schema_contract::CatalogSchema {
+            tool: schema.name.as_str(),
+            schema: &schema.input_schema,
+            owned: true,
+        })
         .collect();
     if let Err(error) = crate::schema_contract::ValidatedToolSchema::validate_catalog(&entries) {
         eprintln!(
@@ -504,7 +510,10 @@ pub async fn run_agent(
     // regardless of whether an agent env file exists on the host.
     let final_output_runtime = match &final_output {
         Some(path) => {
-            let spec = match crate::structured_output::load_control(path) {
+            let spec = match crate::structured_output::load_control(
+                path,
+                config::effective_full_tool_schemas(&cfg),
+            ) {
                 Ok(spec) => spec,
                 Err(startup) => emit_final_output_startup_error(startup),
             };

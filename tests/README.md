@@ -97,3 +97,14 @@ the stripped placeholders), and frontend coverage (MCP server, agent frontend,
 help text; the session-daemon launch identity is covered by Rust unit tests in
 `src/session_bootstrap.rs`). No live API or real credentials. Run:
 `python3 -m pytest tests/test_full_schemas.py -v`.
+
+The r2 supplied-schema cases drive `daimonos agent --final-output` against a
+local scripted model endpoint on both wires (Chat Completions and Messages) and
+record every request body: in full-schema mode a supplied final-answer schema
+with a recursive local reference is refused before any request (exit 20,
+`schema_unusable`), while without the mode the same schema is accepted (exit 0),
+and a non-recursive `$defs`/`$ref` (or `$anchor`) schema is accepted and offered
+to the model deep-equal/unchanged. The metaschema and self-containment checks
+rely on the product's own Draft 2020-12 validator (`src/schema_validation.rs` /
+`src/schema_contract.rs`); no third-party `jsonschema` dependency is added or
+required.

@@ -107,6 +107,22 @@ impl std::fmt::Display for SchemaContractError {
 
 impl std::error::Error for SchemaContractError {}
 
+/// One schema in a composed catalog, tagged by provenance (S3 / integrator
+/// decision D39). `owned` is true for a definition dbunk itself composes
+/// (native tools, worker tools): only owned definition names participate in the
+/// cross-tool collision namespace (ADR-030 "when composing owned definitions").
+/// A supplied (caller-owned final-answer or registered) schema is validated for
+/// self-containment but is NEVER refused because of a definition name.
+pub struct CatalogSchema<'a> {
+    /// The tool the schema belongs to (for error attribution).
+    pub tool: &'a str,
+    /// The full tool input schema to validate.
+    pub schema: &'a Value,
+    /// Whether dbunk owns this definition (participates in the collision
+    /// namespace). Supplied schemas pass `false`.
+    pub owned: bool,
+}
+
 /// A tool schema that has passed the full-schema static gate (ADR-030): it is a
 /// valid, self-contained, non-recursive Draft 2020-12 document. Construction is
 /// the proof; the compiled validator is not retained because the gate only
@@ -158,32 +174,65 @@ impl ValidatedToolSchema {
     /// definition-name collisions (FR-15 R3). The slice order is preserved in
     /// the returned vector.
     pub fn validate_catalog(
-        entries: &[(&str, &Value)],
+        entries: &[CatalogSchema],
     ) -> Result<Vec<ValidatedToolSchema>, SchemaContractError> {
         let mut out = Vec::with_capacity(entries.len());
-        // Owner of each definition name seen so far, so a second tool defining
-        // the same name is rejected rather than silently shadowing it when a
-        // caller combines the schemas (FR-15 R3, ADR-030).
+        // Owner of each OWNED definition name seen so far, so a second owned tool
+        // defining the same name is rejected rather than silently shadowing it
+        // when a caller combines the schemas (FR-15 R3, ADR-030).
         let mut owners: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
-        for (name, schema) in entries {
-            out.push(ValidatedToolSchema::validate(name, schema)?);
+        for entry in entries {
+            let CatalogSchema {
+                tool,
+                schema,
+                owned,
+            } = *entry;
+            out.push(ValidatedToolSchema::validate(tool, schema)?);
+            // D39 / ADR-030: only OWNED definitions share a namespace. A supplied
+            // schema is validated for self-containment above but its definition
+            // names are never recorded or checked, so it is never refused
+            // because of a definition name.
+            if !owned {
+                continue;
+            }
             for def_name in definition_names(schema) {
                 if let Some(first_tool) = owners.get(&def_name) {
-                    if first_tool != name {
+                    if first_tool != tool {
                         return Err(SchemaContractError::DefinitionCollision {
                             name: def_name,
                             first_tool: first_tool.clone(),
-                            second_tool: name.to_string(),
+                            second_tool: tool.to_string(),
                         });
                     }
                 } else {
-                    owners.insert(def_name, name.to_string());
+                    owners.insert(def_name, tool.to_string());
                 }
             }
         }
         Ok(out)
     }
+}
+
+/// WP17 r2 (Gap 1 / D39): recursion-only check for a *supplied* caller-owned
+/// schema (the WP05 `--final-output` final-answer schema, and any other
+/// caller-supplied tool schema) under full-schema mode. ADR-030: caller-owned
+/// worker and final-answer schemas are validated and offered unchanged, yet a
+/// local recursive `$ref` cycle is still refused as `schema_unusable` before any
+/// model request (PM A to Q-FR-15-2).
+///
+/// Only the recursion cycle is checked here, deliberately NOT the cross-tool
+/// definition-name collision: that rule is scoped to OWNED definitions dbunk
+/// composes (integrator decision D39, ADR-030 "when composing owned
+/// definitions"); a supplied schema is never refused because of a definition
+/// name. External references and non-2020-12 validity are already refused on the
+/// WP05 final-output path by [`CompiledSchema::compile`]; this adds only the
+/// cycle check that a 2020-12 compiler accepts on its own.
+pub fn reject_recursive_supplied_schema(
+    tool: &str,
+    schema: &Value,
+) -> Result<(), SchemaContractError> {
+    detect_recursion(tool, schema)
 }
 
 /// The local JSON-pointer referenced by a local `$ref` fragment, or `None` when
@@ -398,7 +447,18 @@ mod tests {
     fn catalog_accepts_distinct_definition_names() {
         let a = json!({ "type": "object", "$defs": { "alpha_id": { "type": "string" } } });
         let b = json!({ "type": "object", "$defs": { "beta_id": { "type": "string" } } });
-        let entries: [(&str, &Value); 2] = [("alpha", &a), ("beta", &b)];
+        let entries = [
+            CatalogSchema {
+                tool: "alpha",
+                schema: &a,
+                owned: true,
+            },
+            CatalogSchema {
+                tool: "beta",
+                schema: &b,
+                owned: true,
+            },
+        ];
         let validated = ValidatedToolSchema::validate_catalog(&entries).expect("distinct names");
         assert_eq!(validated.len(), 2);
     }
@@ -407,7 +467,18 @@ mod tests {
     fn catalog_rejects_colliding_definition_names_across_tools() {
         let a = json!({ "type": "object", "$defs": { "shared": { "type": "string" } } });
         let b = json!({ "type": "object", "$defs": { "shared": { "type": "number" } } });
-        let entries: [(&str, &Value); 2] = [("alpha", &a), ("beta", &b)];
+        let entries = [
+            CatalogSchema {
+                tool: "alpha",
+                schema: &a,
+                owned: true,
+            },
+            CatalogSchema {
+                tool: "beta",
+                schema: &b,
+                owned: true,
+            },
+        ];
         let err = ValidatedToolSchema::validate_catalog(&entries)
             .expect_err("a definition name defined by two tools must be refused");
         assert!(
@@ -415,5 +486,54 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(err.reason(), "schema_unusable");
+    }
+
+    #[test]
+    fn catalog_accepts_supplied_defs_name_colliding_with_owned() {
+        // S3 / integrator decision D39, ADR-030 ("when composing owned
+        // definitions"): the cross-tool definition-name collision rule applies
+        // to OWNED definitions only. A supplied (caller-owned) schema is never
+        // refused because of a definition name, even when its `$defs` name
+        // equals a name an owned tool defines.
+        let owned = json!({ "type": "object", "$defs": { "shared": { "type": "string" } } });
+        let supplied = json!({ "type": "object", "$defs": { "shared": { "type": "number" } } });
+        let entries = [
+            CatalogSchema {
+                tool: "native_tool",
+                schema: &owned,
+                owned: true,
+            },
+            CatalogSchema {
+                tool: "caller_final_answer",
+                schema: &supplied,
+                owned: false,
+            },
+        ];
+        let validated = ValidatedToolSchema::validate_catalog(&entries)
+            .expect("a supplied schema may reuse an owned definition name");
+        assert_eq!(validated.len(), 2);
+    }
+
+    #[test]
+    fn catalog_rejects_two_supplied_sharing_is_not_checked() {
+        // Two supplied schemas sharing a definition name are also never refused
+        // (only owned-vs-owned collisions are): a supplied name is outside the
+        // owned namespace entirely (D39).
+        let a = json!({ "type": "object", "$defs": { "shared": { "type": "string" } } });
+        let b = json!({ "type": "object", "$defs": { "shared": { "type": "number" } } });
+        let entries = [
+            CatalogSchema {
+                tool: "supplied_a",
+                schema: &a,
+                owned: false,
+            },
+            CatalogSchema {
+                tool: "supplied_b",
+                schema: &b,
+                owned: false,
+            },
+        ];
+        ValidatedToolSchema::validate_catalog(&entries)
+            .expect("supplied definition names never collide");
     }
 }

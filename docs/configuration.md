@@ -592,6 +592,19 @@ first model request; and the session daemon carries the mode in its launch
 identity, so an interactive client requesting it cannot silently attach to a
 daemon started without it. Context: ADR-030.
 
+For an agent frontend (agent/chat/ACP/daemon) the option does **not** change the
+tool schemas sent to the model — those are already full and unchanged — so it
+adds only the startup self-contained check; the model request is identical with
+and without it. The three switches are equivalent and all run that same check:
+the `--full-tool-schemas` flag, `DAIMONOS_MCP_FULL_SCHEMAS=1`, and
+`[mcp] full_tool_schemas = true`. The check covers the native tool catalog
+(served, exported, and sent to the model) and the caller-supplied `--final-output`
+final-answer schema, which is accepted and offered unchanged but refused
+(`schema_unusable`, exit 20, final-output error shape) if it contains a local
+recursive reference. The cross-tool definition-name clash rule applies only to
+dbunk-owned definitions; a supplied schema is never refused for a definition
+name. Context: ADR-030.
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,

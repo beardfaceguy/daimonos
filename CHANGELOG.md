@@ -22,6 +22,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `tool-contract`, agent, chat, ACP) and carried in the session-daemon launch
   identity. Default off; terse/lazy serving is unchanged. See
   [ADR-030](docs/adr/030-self-contained-full-schemas.md).
+  - For an agent frontend the option does not change the model request (tool
+    schemas are already full) and adds only the startup self-contained check;
+    the three switches (`--full-tool-schemas`, `DAIMONOS_MCP_FULL_SCHEMAS`,
+    `[mcp] full_tool_schemas`) all run that same check. The check now also covers
+    the caller-supplied `--final-output` final-answer schema: it is offered
+    unchanged but refused as `schema_unusable` (exit 20, final-output error
+    shape) when it contains a local recursive reference. Definition-name clash
+    refusal applies only to dbunk-owned definitions; a supplied schema is never
+    refused for a definition name.
 - **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
   session-free JSON dump of the effective tool contract (contract version,
   effective options, and the effective tools with their schemas), reusing the

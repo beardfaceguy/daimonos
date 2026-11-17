@@ -347,3 +347,298 @@ def test_agent_help_lists_full_tool_schemas_flag(daimonos_binary):
     )
     text = (completed.stdout or "") + (completed.stderr or "")
     assert "--full-tool-schemas" in text
+
+
+# ---------------------------------------------------------------------------
+# WP17 r2 (Gap 1): supplied (caller-owned final-answer) schema cases under the
+# opt-in full-schema mode, driven through a real ``daimonos agent
+# --final-output`` process against a local scripted model endpoint on BOTH
+# wires (Chat Completions and Messages). ADR-030: "Caller-owned worker and
+# final-answer schemas are validated and offered unchanged" and "Detect invalid
+# schemas, external references, and recursion locally as ``schema_unusable``".
+# INTERFACES.md: under final-output mode ``schema_unusable`` uses exit 20 and
+# the final-output error shape.
+#
+# These tests record every model request body, so S2 can assert the final-tool
+# schema offered to the model is deep-equal to the supplied schema (no rewrite).
+# ---------------------------------------------------------------------------
+
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+BOTH_WIRES = pytest.mark.parametrize("wire", ["chat", "messages"])
+
+# A supplied schema with a RECURSIVE local reference: ``$defs/n`` refers to
+# itself. Valid JSON Schema, accepted by a 2020-12 compiler, but unusable in a
+# full-schema tool definition (ADR-030; PM A to Q-FR-15-2).
+RECURSIVE_SUPPLIED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"node": {"$ref": "#/$defs/n"}},
+    "$defs": {
+        "n": {
+            "type": "object",
+            "properties": {"child": {"$ref": "#/$defs/n"}},
+        }
+    },
+}
+
+# A supplied schema with a local ``$defs`` and a NON-recursive ``$ref`` (a leaf
+# referenced once). Self-contained and acyclic: full-schema mode must accept it
+# and offer it to the model unchanged (S2, "offered unchanged").
+NONRECURSIVE_DEFS_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "id": {"$ref": "#/$defs/id"},
+    },
+    "required": ["answer", "id"],
+    "additionalProperties": False,
+    "$defs": {"id": {"type": "string", "minLength": 4}},
+}
+
+
+class _RecordingModelMock:
+    """A local scripted model endpoint that records every request body and
+    answers one ``final_answer`` tool call with ``answer_args``.
+
+    ``wire`` selects the vendor shape: ``chat`` is OpenAI/OpenRouter Chat
+    Completions (SSE; the final tool schema travels in
+    ``tools[].function.parameters``), ``messages`` is Anthropic Messages (SSE;
+    the schema travels in ``tools[].input_schema``). No real credential or live
+    API is used (local fake only).
+    """
+
+    def __init__(self, wire, answer_args):
+        self.wire = wire
+        self.bodies = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                if owner.wire == "chat":
+                    payload = json.dumps({"data": [{
+                        "id": "test/model", "created": 1, "context_length": 100000,
+                        "supported_parameters": ["tools"],
+                        "pricing": {"prompt": "0", "completion": "0"},
+                    }]}).encode()
+                else:
+                    payload = json.dumps({"id": "test/model", "type": "model",
+                                          "display_name": "Test"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def _event(self, name, data):
+                return ("event: " + name + "\ndata: " + json.dumps(data) + "\n\n").encode()
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                try:
+                    owner.bodies.append(json.loads(raw or b"{}"))
+                except (ValueError, TypeError):
+                    owner.bodies.append({})
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    if owner.wire == "chat":
+                        delta = {"role": "assistant", "tool_calls": [{
+                            "index": 0, "id": "final-1", "type": "function",
+                            "function": {"name": "final_answer",
+                                         "arguments": json.dumps(answer_args)},
+                        }]}
+                        chunk = {"choices": [{"index": 0, "delta": delta,
+                                              "finish_reason": "tool_calls"}],
+                                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+                        self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+                        self.wfile.write(b"data: [DONE]\n\n")
+                    else:
+                        blocks = [
+                            self._event("content_block_start", {
+                                "type": "content_block_start", "index": 0,
+                                "content_block": {"type": "tool_use", "id": "final-1",
+                                                  "name": "final_answer", "input": {}}}),
+                            self._event("content_block_delta", {
+                                "type": "content_block_delta", "index": 0,
+                                "delta": {"type": "input_json_delta",
+                                          "partial_json": json.dumps(answer_args)}}),
+                            self._event("message_delta", {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "tool_use"},
+                                "usage": {"output_tokens": 5}}),
+                            self._event("message_stop", {"type": "message_stop"}),
+                        ]
+                        for b in blocks:
+                            self.wfile.write(b)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def port(self):
+        return self.server.server_port
+
+    def final_tool_schema(self):
+        """The schema offered for the ``final_answer`` tool in the last recorded
+        request, read from this wire's tool-list location, or ``None``."""
+        for body in reversed(self.bodies):
+            for tool in body.get("tools", []) or []:
+                if self.wire == "chat":
+                    fn = tool.get("function", {})
+                    if fn.get("name") == "final_answer":
+                        return fn.get("parameters")
+                elif tool.get("name") == "final_answer":
+                    return tool.get("input_schema")
+        return None
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+
+
+def _run_final(daimonos_binary, tmp_path, wire, schema, answer_args, *, full_mode):
+    """Drive ``daimonos agent --final-output`` once with a supplied ``schema``.
+
+    ``full_mode`` inserts the global ``--full-tool-schemas`` flag before the
+    subcommand. Returns ``(completed, posts, recorded_schema)`` captured before
+    the mock is torn down.
+    """
+    provider = "openrouter" if wire == "chat" else "anthropic"
+    mock = _RecordingModelMock(wire, answer_args)
+    try:
+        home = tmp_path / "home"
+        home.mkdir(exist_ok=True)
+        config = tmp_path / "config.toml"
+        config.write_text("[analytics]\nenabled=false\n[acp.mcp]\nenabled=false\n")
+        agent_env = tmp_path / "agent.env"
+        agent_env.write_text("\n".join([
+            f"DAIMONOS_AGENT_PROVIDER={provider}",
+            "DAIMONOS_AGENT_MODEL=test/model",
+            f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{mock.port}",
+            "DAIMONOS_AGENT_API_KEY=synthetic-not-a-real-key",
+            "DAIMONOS_AGENT_APPROVAL_MODE=auto",
+            "DAIMONOS_AGENT_COMPACTION=off", ""]))
+        control = tmp_path / "final_output.json"
+        control.write_text(json.dumps({
+            "schema": schema, "tool_name": "final_answer",
+            "tool_description": "Emit the final structured result.",
+            "corrective_retries": 0}))
+        argv = [daimonos_binary, "--workspace", str(tmp_path), "--config", str(config)]
+        if full_mode:
+            argv += ["--full-tool-schemas"]
+        argv += ["agent", "--final-output", str(control),
+                 "--agent-env", str(agent_env), "--print", "produce the final answer"]
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("DAIMONOS_", "XDG_"))}
+        env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+        return completed, len(mock.bodies), mock.final_tool_schema()
+    finally:
+        mock.close()
+
+
+def _last_json_line(text):
+    lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
+    return json.loads(lines[-1]) if lines else {}
+
+
+@BOTH_WIRES
+def test_s1_full_mode_refuses_recursive_supplied_schema(daimonos_binary, tmp_path, wire):
+    """S1: in full-schema mode a supplied final-answer schema with a recursive
+    local reference is refused BEFORE any model request — exit 20, the
+    final-output error shape, reason ``schema_unusable`` — and the endpoint
+    receives no request (ADR-030 / INTERFACES.md)."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, wire, RECURSIVE_SUPPLIED_SCHEMA,
+        {"node": {"child": {}}}, full_mode=True)
+    assert completed.returncode == 20, (
+        f"recursive supplied schema in full mode must exit 20, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    err = _last_json_line(completed.stderr)
+    assert err.get("reason") == "schema_unusable", f"stderr={completed.stderr}"
+    assert posts == 0, f"a model request was made before refusal (posts={posts})"
+
+
+@BOTH_WIRES
+def test_s1_default_accepts_recursive_supplied_schema(daimonos_binary, tmp_path, wire):
+    """S1 default pin: WITHOUT full-schema mode the same recursive supplied
+    schema is accepted exactly as today (exit 0, one model request). This must
+    pass before and after the S1 production change — WP17 changes nothing
+    outside its opt-in mode."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, wire, RECURSIVE_SUPPLIED_SCHEMA,
+        {"node": {"child": {}}}, full_mode=False)
+    assert completed.returncode == 0, (
+        f"recursive supplied schema must be accepted by default, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"
+
+
+@BOTH_WIRES
+def test_s2_full_mode_offers_nonrecursive_defs_schema_unchanged(daimonos_binary, tmp_path, wire):
+    """S2 ("offered unchanged"): in full-schema mode a supplied schema with a
+    local ``$defs`` and a non-recursive ``$ref`` is accepted (exit 0), and the
+    final-answer tool schema in the recorded model request is deep-equal to the
+    supplied schema — no subset rewriting (ADR-030, ADR-024)."""
+    completed, posts, recorded = _run_final(
+        daimonos_binary, tmp_path, wire, NONRECURSIVE_DEFS_SCHEMA,
+        {"answer": "42", "id": "abcd"}, full_mode=True)
+    assert completed.returncode == 0, (
+        f"non-recursive $defs schema must be accepted in full mode, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"
+    assert recorded == NONRECURSIVE_DEFS_SCHEMA, (
+        f"final-answer schema in the request was rewritten:\n{recorded}")
+
+
+# A supplied schema using a plain-name ``$anchor`` and a ``#anchor`` reference
+# (instead of a JSON-pointer ``$ref``). The S2 direction asks for the same
+# "offered unchanged" assertion on an ``$anchor`` schema *if the WP05 validator
+# accepts it*.
+ANCHOR_SUPPLIED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "id": {"$ref": "#id"},
+    },
+    "required": ["answer", "id"],
+    "additionalProperties": False,
+    "$defs": {"id": {"$anchor": "id", "type": "string", "minLength": 4}},
+}
+
+
+@BOTH_WIRES
+def test_s2_full_mode_offers_anchor_schema_unchanged(daimonos_binary, tmp_path, wire):
+    """S2 ($anchor): the WP05 Draft-2020-12 validator resolves a plain-name
+    ``$anchor`` reference, so full-schema mode accepts an ``$anchor`` supplied
+    schema (exit 0) and offers it to the model deep-equal/unchanged. Recorded
+    here because the direction requested the ``$anchor`` assertion when the
+    validator accepts it; it does."""
+    completed, posts, recorded = _run_final(
+        daimonos_binary, tmp_path, wire, ANCHOR_SUPPLIED_SCHEMA,
+        {"answer": "42", "id": "abcd"}, full_mode=True)
+    assert completed.returncode == 0, (
+        f"$anchor schema must be accepted in full mode, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"
+    assert recorded == ANCHOR_SUPPLIED_SCHEMA, (
+        f"$anchor final-answer schema in the request was rewritten:\n{recorded}")

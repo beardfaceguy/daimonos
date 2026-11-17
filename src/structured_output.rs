@@ -443,7 +443,10 @@ struct FinalOutputControl {
 /// `schema_path` mutual exclusion at startup (exit 2) and compiles the caller
 /// schema once before any provider work. A schema needing external retrieval or
 /// one that is invalid becomes `schema_unusable` (exit 20) with no I/O.
-pub fn load_control(path: &Path) -> Result<FinalOutputSpec, FinalOutputStartupError> {
+pub fn load_control(
+    path: &Path,
+    full_schema_mode: bool,
+) -> Result<FinalOutputSpec, FinalOutputStartupError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         FinalOutputStartupError::config_invalid(format!(
             "final-output control file {}: {e}",
@@ -492,6 +495,29 @@ pub fn load_control(path: &Path) -> Result<FinalOutputSpec, FinalOutputStartupEr
             })?
         }
     };
+    // WP17 r2 (Gap 1, ADR-030): under full-schema mode a supplied final-answer
+    // schema is still offered unchanged, but a local recursive `$ref` cycle is
+    // refused here as `schema_unusable` before any model request, reusing the
+    // schema_contract recursion detector. External references and non-2020-12
+    // validity are already refused by `FinalOutputSpec::compile` below; the
+    // definition-name collision rule is deliberately NOT applied to a supplied
+    // schema (D39). Default off leaves WP05 behavior unchanged.
+    if full_schema_mode {
+        if let Err(err) =
+            crate::schema_contract::reject_recursive_supplied_schema(&control.tool_name, &schema)
+        {
+            return Err(FinalOutputStartupError {
+                exit_code: 20,
+                message: None,
+                json: Some(json!({
+                    "reason": err.reason(),
+                    "validation_errors": [err.to_string()],
+                    "attempts": 0,
+                    "model_requests": 0,
+                })),
+            });
+        }
+    }
     FinalOutputSpec::compile(
         control.tool_name,
         control.tool_description,
@@ -842,7 +868,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let err = match load_control(&path) {
+        let err = match load_control(&path, false) {
             Ok(_) => panic!("expected mutual-exclusion error"),
             Err(e) => e,
         };
@@ -862,7 +888,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let err = match load_control(&path) {
+        let err = match load_control(&path, false) {
             Ok(_) => panic!("expected external-reference error"),
             Err(e) => e,
         };

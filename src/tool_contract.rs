@@ -262,9 +262,15 @@ pub fn validate_self_contained(tools: &[rust_mcp_sdk::schema::Tool]) -> Result<(
             (name, schema)
         })
         .collect();
-    let entries: Vec<(&str, &Value)> = schemas
+    // Native/served tools are OWNED definitions (S3 / D39): they participate in
+    // the cross-tool definition-name collision namespace.
+    let entries: Vec<crate::schema_contract::CatalogSchema> = schemas
         .iter()
-        .map(|(name, schema)| (name.as_str(), schema))
+        .map(|(name, schema)| crate::schema_contract::CatalogSchema {
+            tool: name.as_str(),
+            schema,
+            owned: true,
+        })
         .collect();
     crate::schema_contract::ValidatedToolSchema::validate_catalog(&entries)
         .map(|_| ())
