@@ -1453,6 +1453,13 @@ pub struct McpConfig {
     /// introspection via `[mcp] full_tool_schemas = true` or
     /// `DAIMONOS_MCP_FULL_SCHEMAS=1`.
     pub full_tool_schemas: bool,
+    /// WP17 r6 (FR-15, integrator D53): set ONLY by the global
+    /// `--full-tool-schemas` CLI flag (never from TOML — hence `#[serde(skip)]`).
+    /// When true the flag forces full-schema mode on regardless of the
+    /// `DAIMONOS_MCP_FULL_SCHEMAS` variable, so an explicit flag is never
+    /// silently masked by a false-y env value. This is not a configuration key.
+    #[serde(skip)]
+    pub full_tool_schemas_forced: bool,
     /// Default per-session output verbosity level (vikunja #181): one of
     /// `full` (today's behavior), `compact`, `terse`. Overridable at startup
     /// via `DAIMONOS_MCP_VERBOSITY`; changeable mid-session via the
@@ -1494,6 +1501,7 @@ impl Default for McpConfig {
             client_gone_poll_ms: 250,
             startup_logs: false,
             full_tool_schemas: false,
+            full_tool_schemas_forced: false,
             default_verbosity: Verbosity::Full,
         }
     }
@@ -1694,6 +1702,13 @@ impl CoordinationConfig {
 /// Whether `list_tools` should expose full JSON Schemas for Terse-tier tools.
 /// Env `DAIMONOS_MCP_FULL_SCHEMAS` (`1`/`true`/`yes`/`on`) wins over config.
 pub fn effective_full_tool_schemas(cfg: &Config) -> bool {
+    // WP17 r6 (integrator D53): the global `--full-tool-schemas` flag wins over
+    // the env variable for every value, so an explicit flag is never silently
+    // masked by `DAIMONOS_MCP_FULL_SCHEMAS=0` (or `false`/`off`/empty). Without
+    // the flag the env still wins over the config key (precedence unchanged).
+    if cfg.mcp.full_tool_schemas_forced {
+        return true;
+    }
     if let Ok(raw) = std::env::var("DAIMONOS_MCP_FULL_SCHEMAS") {
         return matches!(
             raw.trim().to_ascii_lowercase().as_str(),
@@ -2851,6 +2866,33 @@ mod tests {
         std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "1");
         assert!(effective_full_tool_schemas(&cfg));
         std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "false");
+        assert!(!effective_full_tool_schemas(&cfg));
+        std::env::remove_var("DAIMONOS_MCP_FULL_SCHEMAS");
+    }
+
+    #[test]
+    fn effective_full_tool_schemas_flag_forces_on_over_env() {
+        // WP17 r6 (integrator D53): the `--full-tool-schemas` flag (recorded as
+        // `full_tool_schemas_forced`) wins over the env variable for every
+        // false-y value; without the flag the env still wins over the config
+        // key. This is the single effective-value chokepoint the dump, the MCP
+        // server, the model-running frontends, and the session-daemon launch
+        // identity (agent_runtime -> BootstrapOptions.full_tool_schemas) all
+        // read, so pinning it here covers every frontend at once.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = Config::default();
+        cfg.mcp.full_tool_schemas_forced = true;
+        for value in ["0", "false", "off", ""] {
+            std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", value);
+            assert!(
+                effective_full_tool_schemas(&cfg),
+                "flag must force full mode on over env {value:?}"
+            );
+        }
+        // Without the flag the env variable still wins over a true config key.
+        cfg.mcp.full_tool_schemas_forced = false;
+        cfg.mcp.full_tool_schemas = true;
+        std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "0");
         assert!(!effective_full_tool_schemas(&cfg));
         std::env::remove_var("DAIMONOS_MCP_FULL_SCHEMAS");
     }

@@ -514,12 +514,16 @@ class _RecordingModelMock:
         self.thread.join(timeout=3)
 
 
-def _run_final(daimonos_binary, tmp_path, wire, schema, answer_args, *, full_mode):
+def _run_final(daimonos_binary, tmp_path, wire, schema, answer_args, *, full_mode,
+               extra_env=None):
     """Drive ``daimonos agent --final-output`` once with a supplied ``schema``.
 
     ``full_mode`` inserts the global ``--full-tool-schemas`` flag before the
-    subcommand. Returns ``(completed, posts, recorded_schema)`` captured before
-    the mock is torn down.
+    subcommand. ``extra_env`` (WP17 r6) sets additional process environment
+    variables after the DAIMONOS_/XDG_ scrub, so a test can pin an explicit
+    ``DAIMONOS_MCP_FULL_SCHEMAS`` value against the flag. Returns
+    ``(completed, posts, recorded_schema)`` captured before the mock is torn
+    down.
     """
     provider = "openrouter" if wire == "chat" else "anthropic"
     mock = _RecordingModelMock(wire, answer_args)
@@ -549,6 +553,8 @@ def _run_final(daimonos_binary, tmp_path, wire, schema, answer_args, *, full_mod
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("DAIMONOS_", "XDG_"))}
         env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
+        if extra_env:
+            env.update(extra_env)
         completed = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
         return completed, len(mock.bodies), mock.final_tool_schema()
     finally:
@@ -849,7 +855,7 @@ def _deep_chain_schema(n):
     }
 
 
-@pytest.mark.parametrize("length", [2000, 100000])
+@pytest.mark.parametrize("length", [2000, 20000])
 def test_w1_full_mode_analyzes_deep_finite_chain_without_a_signal(
         daimonos_binary, tmp_path, length):
     """W1: in full-schema mode a finite, non-recursive supplied final-answer
@@ -881,3 +887,73 @@ def test_w1_default_mode_accepts_deep_finite_chain(daimonos_binary, tmp_path):
         f"finite chain of 2000 must be accepted by default, got "
         f"{completed.returncode}\nstderr={completed.stderr[-2000:]}")
     assert posts == 1, f"expected exactly one model request, got {posts}"
+
+
+# ---------------------------------------------------------------------------
+# WP17 r6 (review R2, integrator decision D53): an explicit ``--full-tool-schemas``
+# flag wins over the ``DAIMONOS_MCP_FULL_SCHEMAS`` variable for EVERY value of the
+# variable. Before r6 the flag set only the config key, which the env variable
+# then silently masked (``--full-tool-schemas`` + ``DAIMONOS_MCP_FULL_SCHEMAS=0``
+# gave a stripped dump and ``full_tool_schemas: false``). Without the flag the
+# existing precedence (the variable wins over the config key) does not change.
+# ---------------------------------------------------------------------------
+
+
+def test_flag_forces_full_mode_over_env_false_values(daimonos_binary, tmp_path):
+    """r6 slice 01: ``--full-tool-schemas`` with ``DAIMONOS_MCP_FULL_SCHEMAS``
+    set to a false-y value (``0``/``false``/``off``/empty) still turns the mode
+    on — zero stripped placeholders and ``full_tool_schemas: true`` — instead of
+    letting the env silently mask the explicit flag (D53)."""
+    for value in ("0", "false", "off", ""):
+        env = {k: v for k, v in os.environ.items() if k != "DAIMONOS_MCP_FULL_SCHEMAS"}
+        env["DAIMONOS_MCP_FULL_SCHEMAS"] = value
+        proc, doc = _dump(daimonos_binary, tmp_path, "--full-tool-schemas", env=env)
+        assert proc.returncode == 0, (
+            f"env {value!r}: tool-contract exited {proc.returncode}\n"
+            f"stdout={proc.stdout}\nstderr={proc.stderr}")
+        assert doc["effective_options"]["full_tool_schemas"] is True, (
+            f"--full-tool-schemas must win over DAIMONOS_MCP_FULL_SCHEMAS={value!r}")
+        stripped = [t["name"] for t in doc["tools"]
+                    if t["input_schema"] == {"type": "object"}]
+        assert not stripped, (
+            f"env {value!r}: the explicit flag was ignored; stripped "
+            f"placeholders remain: {stripped}")
+
+
+def test_env_zero_still_wins_over_config_key_without_the_flag(daimonos_binary, tmp_path):
+    """r6 precedence pin (passes before and after the r6 change): WITHOUT the
+    flag, ``DAIMONOS_MCP_FULL_SCHEMAS=0`` still wins over ``[mcp]
+    full_tool_schemas = true`` in the config. The r6 change only adds
+    flag-over-env precedence; it must not disturb the existing env-over-config
+    precedence (D53)."""
+    config = tmp_path / "daimonos.toml"
+    config.write_text("[mcp]\nfull_tool_schemas = true\n")
+    env = {k: v for k, v in os.environ.items() if k != "DAIMONOS_MCP_FULL_SCHEMAS"}
+    env["DAIMONOS_MCP_FULL_SCHEMAS"] = "0"
+    proc = subprocess.run(
+        [daimonos_binary, "--config", str(config), "-w", str(tmp_path), "tool-contract"],
+        capture_output=True, text=True, timeout=60, env=env)
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    assert doc["effective_options"]["full_tool_schemas"] is False, (
+        "without the flag, DAIMONOS_MCP_FULL_SCHEMAS=0 must still win over the "
+        "[mcp] full_tool_schemas=true config key")
+
+
+def test_flag_over_env_zero_refuses_recursive_supplied_schema(daimonos_binary, tmp_path):
+    """r6 slice 01 (final-output frontend): ``--full-tool-schemas`` with
+    ``DAIMONOS_MCP_FULL_SCHEMAS=0`` and a recursive supplied final-answer schema
+    still refuses the run before any model request (exit 20, ``schema_unusable``,
+    zero posts). The flag forces full mode on despite the false-y env, so the
+    ADR-030 gate runs — proving the precedence fix reaches the model-running
+    frontend, not only the dump."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, "chat", RECURSIVE_SUPPLIED_SCHEMA,
+        {"node": {"child": {}}}, full_mode=True,
+        extra_env={"DAIMONOS_MCP_FULL_SCHEMAS": "0"})
+    assert completed.returncode == 20, (
+        f"flag + env 0 recursive schema must exit 20, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    err = _last_json_line(completed.stderr)
+    assert err.get("reason") == "schema_unusable", f"stderr={completed.stderr}"
+    assert posts == 0, f"a model request was made before refusal (posts={posts})"

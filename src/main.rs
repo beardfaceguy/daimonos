@@ -475,6 +475,10 @@ async fn main() -> anyhow::Result<()> {
     // Context: docs/adr/030-self-contained-full-schemas.md.
     if cli.full_tool_schemas {
         cfg.mcp.full_tool_schemas = true;
+        // WP17 r6 (integrator D53): mark the mode FORCED so the explicit flag
+        // wins over a false-y `DAIMONOS_MCP_FULL_SCHEMAS` value instead of being
+        // silently masked by it (config::effective_full_tool_schemas).
+        cfg.mcp.full_tool_schemas_forced = true;
     }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {

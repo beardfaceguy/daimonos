@@ -561,15 +561,17 @@ By default `list_tools` and the `tool-contract` dump serve a full JSON Schema
 only for the tools whose schema is exposed in the initial tier, and strip the
 rest to `{"type": "object"}` (progressive exposure, to save prefix tokens). The
 opt-in **full-schema mode** instead serves and exports the full, self-contained
-schema for *every* tool (FR-15). Enable it in any of three equivalent ways:
+schema for *every* tool (FR-15). Enable it in any of three ways, which follow a
+fixed precedence: the CLI flag wins over the environment variable, which wins
+over the configuration key.
 
 ```bash
-daimonos --full-tool-schemas tool-contract   # global CLI flag (any subcommand)
+daimonos --full-tool-schemas tool-contract   # global CLI flag — wins over env and config
 # or
-export DAIMONOS_MCP_FULL_SCHEMAS=1            # environment (wins over config)
+export DAIMONOS_MCP_FULL_SCHEMAS=1            # environment — wins over the config key
 # or
 [mcp]
-full_tool_schemas = true                      # daimonos.toml
+full_tool_schemas = true                      # daimonos.toml — lowest precedence
 ```
 
 The mode is purely additive and opt-in: with it off, the terse/lazy placeholder
@@ -595,9 +597,13 @@ daemon started without it. Context: ADR-030.
 For an agent frontend (agent/chat/ACP/daemon) the option does **not** change the
 tool schemas sent to the model — those are already full and unchanged — so it
 adds only the startup self-contained check; the model request is identical with
-and without it. The three switches are equivalent and all run that same check:
-the `--full-tool-schemas` flag, `DAIMONOS_MCP_FULL_SCHEMAS=1`, and
-`[mcp] full_tool_schemas = true`. The check covers the native tool catalog
+and without it. The three switches follow a fixed precedence and all run that
+same check once the mode is on: an explicit `--full-tool-schemas` flag turns the
+mode **on for every value** of `DAIMONOS_MCP_FULL_SCHEMAS` (so a false-y
+variable such as `0`/`false`/`off`/empty cannot silently mask the flag); without
+the flag, `DAIMONOS_MCP_FULL_SCHEMAS` wins over `[mcp] full_tool_schemas = true`
+(a false-y variable disables the mode even when the config key enables it). The
+check covers the native tool catalog
 (served, exported, and sent to the model) and the caller-supplied `--final-output`
 final-answer schema, which is accepted and offered unchanged but refused
 (`schema_unusable`, exit 20, final-output error shape) if it contains a
@@ -633,6 +639,12 @@ document with millions of schema positions exhausts the static-analysis budget
 and is refused `schema_unusable` (exit 20) — never a crash. (A schema whose JSON
 nesting exceeds the JSON parser's own depth limit is rejected by the parser
 before this check runs, in both modes.) Context: ADR-030.
+
+The static-analysis budget is a **fixed internal guard of 10000000 steps**, not
+a configuration key: there is no TOML setting or environment variable to raise
+or lower it. A document that would make the check visit more than that many
+schema positions is refused `schema_unusable` (exit 20) rather than running
+unbounded; every realistic schema stays far below the limit. Context: ADR-030.
 
 ### `[session]` — Daemon-owned agent sessions
 
