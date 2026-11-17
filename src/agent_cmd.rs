@@ -155,6 +155,7 @@ pub async fn run_agent(
             last_call_usage: Default::default(),
             context_overflow: false,
             evidence: Default::default(),
+            worker_lost: false,
         });
     }
 
@@ -203,6 +204,36 @@ pub async fn run_agent(
             })
             .collect()
     };
+    // WP10 (R3, FR-02 req5/req7): after worker discovery and BEFORE the catalog
+    // freeze and the first model request, every worker-scoped (`mcp__…`)
+    // allowlist entry must be served by the frozen catalog. A worker-namespaced
+    // name that no worker serves fails the run at startup (exit 2, naming the
+    // entry) rather than being silently refused later at dispatch. Native and
+    // final-answer names were already validated at parse (main.rs).
+    if let Some(executor) = &worker_executor {
+        if let Some(allowlist) = &cfg.tool_allowlist {
+            let exported: std::collections::HashSet<&str> =
+                tools.iter().map(|tool| tool.name.as_str()).collect();
+            if let Some(unknown) = allowlist.iter().find(|name| {
+                name.starts_with(crate::mcp_bridge::REMOTE_TOOL_PREFIX)
+                    && !exported.contains(name.as_str())
+            }) {
+                // Reap the already-connected workers before failing closed.
+                executor.shutdown().await;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {
+                        "code": "run_configuration_invalid",
+                        "reason": "tool_allowlist_unknown_entry",
+                        "message": format!(
+                            "--tool-allowlist entry '{unknown}' is served by no configured worker"
+                        ),
+                    }})
+                );
+                std::process::exit(2);
+            }
+        }
+    }
     // Outbound MCP servers (#1289): one-shot agent mode reads the Claude-style
     // file named by `[agent.mcp]`. Disabled under worker-only mode, where tool
     // servers come exclusively from the explicit `--worker-config`.

@@ -563,6 +563,15 @@ pub async fn run_agent(
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+    // WP10 (R1, ADR-028): capture the resolved model credential BEFORE the
+    // provider consumes it, so a worker whose explicit env value or argv entry
+    // discloses it can be refused before any worker launches. Default provider:
+    // the agent env `DAIMONOS_AGENT_API_KEY`. Controlled profile (WP07): the
+    // value of its named credential variable.
+    let model_credential: Option<String> = match &controlled_profile {
+        Some(profile) => std::env::var(&profile.spec.credential_env).ok(),
+        None => Some(agent.api_key.clone()),
+    };
     // WP07 (FR-04): when a controlled profile is set it is the SOLE source of
     // the provider/model/credential; every completion routes through the opt-in
     // controlled transport. Otherwise legacy provider construction is unchanged.
@@ -615,6 +624,23 @@ pub async fn run_agent(
         &agent,
         workspace,
     );
+    // WP10 (R1, ADR-028 Decision): refuse a worker whose explicit `env` value or
+    // `args` entry discloses the resolved model credential. Fail-closed BEFORE
+    // any worker launches (discovery happens inside run_agent): exit 2 with a
+    // named reason whose text never contains the credential value.
+    if let (Some(config), Some(credential)) = (&worker_config_runtime, &model_credential) {
+        if let Err(reason) = config.reject_credential_disclosure(std::slice::from_ref(credential)) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "worker_credential_disclosure",
+                    "message": reason,
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
     let args = agent_cmd::AgentCmdArgs {
         task,
         model: Some(effective_model),
@@ -735,11 +761,9 @@ fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static
             // WP10 (FR-05): a lost worker route is a distinct terminal failure.
             // Its recorded exit_code must agree with the process exit the
             // reviewed table assigns (22), not the generic error exit (1).
-            providers::StopReason::Error
-                if r.error_message
-                    .as_deref()
-                    .is_some_and(|m| m.contains(crate::worker_runtime::WORKER_UNAVAILABLE)) =>
-            {
+            // WP10 (R7): decide on the TYPED `worker_lost` flag, never a
+            // substring of `error_message` (which can carry tool/model content).
+            providers::StopReason::Error if r.worker_lost => {
                 (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
             }
             providers::StopReason::Error => ("error", 1),
@@ -761,11 +785,13 @@ fn exit_on_worker_failure(result: &anyhow::Result<agent::AgentResult>) {
             text.contains(crate::worker_runtime::WORKER_UNAVAILABLE)
                 .then_some(text)
         }
-        Ok(run) if run.stop_reason == providers::StopReason::Error => run
-            .error_message
-            .as_deref()
-            .filter(|m| m.contains(crate::worker_runtime::WORKER_UNAVAILABLE))
-            .map(str::to_string),
+        // WP10 (R7): the in-run lost-worker case is identified by the TYPED
+        // `worker_lost` flag, not by substring-matching `error_message`.
+        Ok(run) if run.worker_lost => Some(
+            run.error_message
+                .clone()
+                .unwrap_or_else(|| crate::worker_runtime::WORKER_UNAVAILABLE.to_string()),
+        ),
         Ok(_) => None,
     };
     if let Some(message) = message {
@@ -1772,10 +1798,43 @@ mod tests {
             last_call_usage: Default::default(),
             context_overflow: false,
             evidence: Default::default(),
+            worker_lost: false,
         };
 
         let error = check_agent_result(&result).unwrap_err();
 
         assert!(error.to_string().contains("provider unavailable"));
+    }
+
+    #[test]
+    fn run_terminal_status_uses_typed_worker_lost_not_substring() {
+        // WP10 (R7): the worker-loss exit mapping is decided by the TYPED
+        // `worker_lost` flag, never by a substring of `error_message`. A
+        // generic provider error whose message merely CONTAINS the token must
+        // map to the generic error exit (1), not the worker exit (22).
+        let mk = |worker_lost: bool, msg: &str| agent::AgentResult {
+            messages: Vec::new(),
+            usage: Default::default(),
+            stop_reason: providers::StopReason::Error,
+            error_message: Some(msg.to_string()),
+            last_call_usage: Default::default(),
+            context_overflow: false,
+            evidence: Default::default(),
+            worker_lost,
+        };
+        assert_eq!(
+            run_terminal_status(&Ok(mk(
+                false,
+                "tool RESULT text mentions worker_unavailable"
+            ))),
+            ("error", 1)
+        );
+        assert_eq!(
+            run_terminal_status(&Ok(mk(
+                true,
+                "worker_unavailable: toolside read_note failed"
+            ))),
+            (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
+        );
     }
 }

@@ -1517,7 +1517,27 @@ The control file is JSON:
   path. It conflicts with `--interactive` and `--dry-run` (refused at startup by
   the argument parser), and the `chat`, `acp`, and session-daemon frontends do
   not carry it at all (unexpected-argument error). An entry in `--tool-allowlist`
-  that names a worker-scoped tool (`mcp__…`) is accepted at startup in worker
-  mode; a name no worker serves is still refused at the dispatch boundary.
+  that names a worker-scoped tool (`mcp__…`) is cross-checked after worker
+  discovery and before the first model request: an entry that no worker serves
+  fails the run at startup (exit 2, `run_configuration_invalid`, reason
+  `tool_allowlist_unknown_entry`, naming the entry), never silently later at
+  dispatch. Native and final-answer names are validated earlier at parse.
+- **No credential disclosure.** Beyond the cleared environment, a worker whose
+  explicit `env` value or `args` entry *discloses* the resolved model credential
+  is refused before any worker starts (exit 2, `run_configuration_invalid`,
+  reason `worker_credential_disclosure`). The diagnostic names the worker and
+  the location (an env value, or `args[index]`) but never the credential value.
+- **Launcher.** The cleared-environment launcher (`env`) is resolved by
+  ABSOLUTE path (`/usr/bin/env`, then `/bin/env`), never through an inherited
+  `PATH`. A `command` containing `=` is rejected at parse (it would be misparsed
+  by `env` as an assignment). On a platform that ships no `env` at those paths,
+  credential-free worker execution is unavailable and the launch fails with
+  `worker_unavailable` (exit 22).
+- **Reaping.** Every owned worker child is reaped through the managed lifecycle
+  on every ending (normal, worker-abort, final-output failure): teardown signals
+  the worker's process group `SIGTERM`, waits a bounded grace, then `SIGKILL`s
+  the group — so no worker child (or descendant, e.g. an `unshare` wrapper)
+  outlives the run even when a graceful `shut_down` cannot reap it. On non-Unix
+  platforms reaping relies on the SDK's `kill_on_drop` at process exit.
 
 See ADR-028 and `tests/test_worker_isolation.py`.

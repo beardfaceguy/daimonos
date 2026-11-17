@@ -345,6 +345,11 @@ pub struct AgentResult {
     /// What this turn was observed to do: whether the workspace changed and
     /// whether a verifier passed afterwards (vikunja #1198). Report-only.
     pub evidence: crate::evidence::EvidenceLedger,
+    /// WP10 (R7, ADR-028): the run ended because a required worker route was
+    /// lost (exit, stall, or closed stdio). A TYPED terminal reason so the
+    /// frontend maps the distinct `worker_unavailable` exit (22) WITHOUT
+    /// substring-matching `error_message`, which can carry tool/model content.
+    pub worker_lost: bool,
 }
 
 // --- Pure helpers ---
@@ -1034,6 +1039,7 @@ async fn run_inner(
                     last_call_usage: Usage::default(),
                     context_overflow: false,
                     evidence,
+                    worker_lost: false,
                 };
             }
             state.record_request();
@@ -1229,6 +1235,7 @@ async fn run_inner(
                     last_call_usage: resp.usage,
                     context_overflow: false,
                     evidence,
+                    worker_lost: false,
                 };
             }
         }
@@ -1295,6 +1302,7 @@ async fn run_inner(
                         last_call_usage: resp.usage,
                         context_overflow: resp.context_overflow,
                         evidence,
+                        worker_lost: false,
                     };
                 }
                 TurnClassification::Failure {
@@ -1324,6 +1332,7 @@ async fn run_inner(
                         last_call_usage: resp.usage,
                         context_overflow: resp.context_overflow,
                         evidence,
+                        worker_lost: false,
                     };
                 }
                 TurnClassification::Failure {
@@ -1364,6 +1373,7 @@ async fn run_inner(
                             last_call_usage: resp.usage,
                             context_overflow: resp.context_overflow,
                             evidence,
+                            worker_lost: false,
                         };
                     }
                 },
@@ -1521,6 +1531,7 @@ async fn run_inner(
                     last_call_usage: resp.usage,
                     context_overflow: resp.context_overflow,
                     evidence,
+                    worker_lost: false,
                 };
             }
             StopReason::ToolUse => {
@@ -2282,6 +2293,7 @@ async fn run_inner(
                         last_call_usage: resp.usage,
                         context_overflow: false,
                         evidence,
+                        worker_lost: true,
                     };
                 }
 
@@ -2294,6 +2306,7 @@ async fn run_inner(
                         last_call_usage: resp.usage,
                         context_overflow: false,
                         evidence,
+                        worker_lost: false,
                     };
                 }
 
@@ -2336,6 +2349,7 @@ async fn run_inner(
                                 last_call_usage: resp.usage,
                                 context_overflow: false,
                                 evidence,
+                                worker_lost: false,
                             };
                         }
                     }

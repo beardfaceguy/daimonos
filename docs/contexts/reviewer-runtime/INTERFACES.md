@@ -118,6 +118,7 @@ Required method reservations, with signatures only:
 - `EffectiveToolCatalog::export() -> ToolContractDocument`.
 - `WorkerExecutor::call(name, arguments, context) -> Result<ToolResult, ToolFailure>`.
 - `WorkerExecutor::shutdown() -> Result<(), RunFailure>`.
+- Shipped (WP10 r2) signatures/types, reconciling the reservations above: `WorkerExecutor::call(&self, name: &str, arguments: &Value) -> WorkerDispatch` (no `context`) and `WorkerExecutor::shutdown(&self)` (reaps every owned worker child; no return). Public enum `WorkerDispatch { Served { content, is_error }, NoRoute, Aborted(String) }`. `mcp_bridge` exports `WorkerClient`, `WorkerToolDef { name, description, input_schema }`, and `WorkerCallResult { Served { content, is_error }, Down(String) }`. `WorkerConfig::reject_credential_disclosure(&self, credentials: &[String]) -> Result<(), String>` refuses an explicit worker `env`/`args` disclosure of the model credential before launch (exit 2, `run_configuration_invalid`, reason `worker_credential_disclosure`; a `command` containing `=` is likewise refused at parse). The lost-worker terminal is carried by the typed `AgentResult::worker_lost` flag, not by a substring of `error_message`. Teardown reaps each worker's process group (SIGTERM→grace→SIGKILL) so no child/descendant outlives the run.
 
 The integrator adapts existing `mcp::dispatch_local_tool`, `ops::dispatch_with_progress`, `script::dispatch_tool_by_name`, and pipeline stages.
 Lower plugin and worker routes enforce the same decision. A cached result is not a policy exemption.

@@ -87,6 +87,17 @@ impl WorkerConfig {
                 .filter(|command| !command.is_empty())
                 .ok_or_else(|| format!("worker {name:?}: missing \"command\""))?
                 .to_string();
+            // WP10 (R8, ADR-028): the worker is launched through `env` (which
+            // clears the environment, see mcp_bridge::connect_worker). GNU `env`
+            // reads any leading `NAME=VALUE` argument as an assignment, so a
+            // `command` containing `=` would be misparsed instead of exec'd.
+            // Reject it at parse (exit 2, named) rather than let it fail opaquely
+            // at launch as `worker_unavailable`.
+            if command.contains('=') {
+                return Err(format!(
+                    "worker {name:?}: \"command\" must not contain '='; it is launched through `env`, which would read an '=' as a variable assignment"
+                ));
+            }
             let args = entry
                 .get("args")
                 .map(|value| {
@@ -132,6 +143,42 @@ impl WorkerConfig {
             });
         }
         Ok(WorkerConfig { workers })
+    }
+
+    /// WP10 (R1, ADR-028 Decision): refuse any caller-supplied worker `env`
+    /// value or `args` entry that discloses the resolved model credential.
+    /// The cleared-environment launch already prevents inherited credentials;
+    /// this is the ADR-mandated defense against a caller accidentally forwarding
+    /// the credential through an EXPLICIT override. Fail-closed before any
+    /// worker starts. The returned reason names the worker and the location
+    /// (an env value, or `args[index]`) but NEVER the credential value or the
+    /// env key, so the diagnostic is safe to print and log. An empty credential
+    /// matches nothing.
+    pub fn reject_credential_disclosure(&self, credentials: &[String]) -> Result<(), String> {
+        let secrets: Vec<&str> = credentials
+            .iter()
+            .map(String::as_str)
+            .filter(|secret| !secret.is_empty())
+            .collect();
+        if secrets.is_empty() {
+            return Ok(());
+        }
+        let discloses = |text: &str| secrets.iter().any(|secret| text.contains(secret));
+        for spec in &self.workers {
+            if spec.env.values().any(|value| discloses(value)) {
+                return Err(format!(
+                    "worker {:?}: an explicit env value discloses the model credential; a worker environment must not carry it",
+                    spec.name
+                ));
+            }
+            if let Some(index) = spec.args.iter().position(|arg| discloses(arg)) {
+                return Err(format!(
+                    "worker {:?}: args[{index}] discloses the model credential; a worker argv must not carry it",
+                    spec.name
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -337,5 +384,56 @@ mod tests {
                 .unwrap_err()
                 .contains("env")
         );
+    }
+
+    #[test]
+    fn parse_rejects_command_with_equals() {
+        // WP10 (R8): a `command` containing `=` is misparsed by `env` as an
+        // assignment, so it is refused at parse with a named reason (exit 2).
+        let err = WorkerConfig::parse(r#"{"workers":{"a":{"command":"FOO=bar"}}}"#).unwrap_err();
+        assert!(err.contains("command"), "{err}");
+        assert!(err.contains('='), "{err}");
+    }
+
+    #[test]
+    fn reject_credential_disclosure_catches_env_and_args_without_leaking() {
+        let doc = r#"{"workers":{
+            "leaky": {"command":"/bin/x","env":{"TOKEN":"prefix-SECRET-suffix"}},
+            "clean": {"command":"/bin/y","env":{"PATH":"/usr/bin"}}
+        }}"#;
+        let config = WorkerConfig::parse(doc).unwrap();
+        let secret = "SECRET".to_string();
+        let err = config
+            .reject_credential_disclosure(std::slice::from_ref(&secret))
+            .unwrap_err();
+        // Names the worker and that it is an env disclosure, but NEVER the value.
+        assert!(err.contains("leaky"), "{err}");
+        assert!(
+            !err.contains("SECRET"),
+            "reason must not leak the credential: {err}"
+        );
+        assert!(
+            !err.contains("prefix"),
+            "reason must not leak the value: {err}"
+        );
+
+        // argv disclosure is caught and located by index.
+        let argdoc = r#"{"workers":{"a":{"command":"/bin/x","args":["--ok","--key=SECRET"]}}}"#;
+        let argconfig = WorkerConfig::parse(argdoc).unwrap();
+        let argerr = argconfig
+            .reject_credential_disclosure(std::slice::from_ref(&secret))
+            .unwrap_err();
+        assert!(argerr.contains("args[1]"), "{argerr}");
+        assert!(!argerr.contains("SECRET"), "{argerr}");
+
+        // A clean config and an empty credential both pass.
+        let clean = r#"{"workers":{"a":{"command":"/bin/x","env":{"PATH":"/usr/bin"}}}}"#;
+        let cleancfg = WorkerConfig::parse(clean).unwrap();
+        assert!(cleancfg
+            .reject_credential_disclosure(std::slice::from_ref(&secret))
+            .is_ok());
+        assert!(cleancfg
+            .reject_credential_disclosure(&[String::new()])
+            .is_ok());
     }
 }

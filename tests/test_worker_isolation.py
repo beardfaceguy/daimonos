@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -44,6 +45,30 @@ record = os.environ.get("WORKER_RECORD")
 if record:
     with open(record, "w") as f:
         json.dump({"env": dict(os.environ)}, f)
+# AC-05.2 no-network proof: when the caller wraps this worker in a network
+# namespace (e.g. `unshare -Urn`), a connect to the model endpoint address must
+# fail. The outcome is written to WORKER_NETCHECK so the test can assert it from
+# outside. Only exercised when both vars are set.
+_target = os.environ.get("NETCHECK_TARGET")
+_tfile = os.environ.get("NETCHECK_TARGET_FILE")
+if _tfile and not _target:
+    try:
+        with open(_tfile) as _tf:
+            _target = _tf.read().strip()
+    except OSError:
+        _target = None
+_netout = os.environ.get("WORKER_NETCHECK")
+if _target and _netout:
+    import socket
+    _host, _, _port = _target.rpartition(":")
+    try:
+        _s = socket.create_connection((_host, int(_port)), 2)
+        _s.close()
+        _result = "connected"
+    except OSError as _e:
+        _result = "failed: %s" % _e
+    with open(_netout, "w") as _f:
+        _f.write(_result)
 calls_path = os.environ.get("WORKER_CALLS")
 
 def log_call(name):
@@ -91,12 +116,66 @@ def main():
                 sys.stdout.flush()
                 os._exit(1)
             send({"jsonrpc": "2.0", "id": mid, "result": {
-                "content": [{"type": "text", "text": "note: hello from the worker"}],
+                "content": [{"type": "text", "text": os.environ.get(
+                    "WORKER_NOTE_TEXT", "note: hello from the worker")}],
                 "isError": False,
             }})
         elif mid is not None:
             send({"jsonrpc": "2.0", "id": mid,
                   "error": {"code": -32601, "message": "method not found"}})
+
+main()
+'''
+
+
+# A worker that both (a) keeps running after its stdin closes (a NON-daemon
+# thread outlives `main()`) and (b) spawns a long-lived GRANDCHILD in its own
+# process group. The SDK's `kill_on_drop` reaps only the DIRECT child at process
+# exit; the grandchild orphans to init and survives unless teardown reaps the
+# whole process GROUP (R6 — a stalled `shut_down` must still terminate the
+# child and its descendants). No signal handler is installed, so SIGTERM/SIGKILL
+# ends them.
+WORKER_STUBBORN_SRC = r'''
+import json, os, subprocess, sys, threading, time
+
+_marker = os.environ.get("GRANDCHILD_MARKER", "wp10-stubborn-grandchild")
+subprocess.Popen([sys.executable, "-c",
+                  "import time\nwhile True:\n    time.sleep(3600)", _marker])
+
+def _idle():
+    while True:
+        time.sleep(3600)
+
+threading.Thread(target=_idle, daemon=False).start()
+
+TOOLS = [{"name": "read_note", "description": "note",
+          "inputSchema": {"type": "object", "properties": {}}}]
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+
+def main():
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        msg = json.loads(line); mid = msg.get("id"); method = msg.get("method")
+        if method == "initialize":
+            pv = msg.get("params", {}).get("protocolVersion", "2025-06-18")
+            send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": pv,
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "stubborn-worker", "version": "1.0.0"}}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+        elif method == "tools/call":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                  "content": [{"type": "text", "text": "ok"}], "isError": False}})
+        elif mid is not None:
+            send({"jsonrpc": "2.0", "id": mid,
+                  "error": {"code": -32601, "message": "no"}})
 
 main()
 '''
@@ -202,9 +281,14 @@ class _MockChat:
 
 
 def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
-         audit_path=None, read_only=False, task="do the work"):
+         audit_path=None, read_only=False, task="do the work",
+         final_output=None, extra_config="", port_file=None):
     mock = _MockChat(turns)
     try:
+        if port_file is not None:
+            # Publish the model endpoint to the worker (which runs under `env -i`
+            # and cannot see the host env) BEFORE daimonos launches it.
+            port_file.write_text("127.0.0.1:%d" % mock.port)
         home = tmp_path / "home"
         home.mkdir(exist_ok=True)
         # Workspace (evidence) is a subdir so state/audit destinations live
@@ -215,7 +299,8 @@ def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
         state.mkdir(exist_ok=True)
         os.chmod(state, 0o700)
         config = tmp_path / "config.toml"
-        config.write_text("[analytics]\nenabled=false\n[acp.mcp]\nenabled=false\n")
+        config.write_text(
+            "[analytics]\nenabled=false\n[acp.mcp]\nenabled=false\n" + extra_config)
         agent_env = tmp_path / "agent.env"
         agent_env.write_text("\n".join([
             "DAIMONOS_AGENT_PROVIDER=openrouter",
@@ -237,6 +322,8 @@ def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
         argv += ["agent"]
         if worker_config is not None:
             argv += ["--worker-config", str(worker_config)]
+        if final_output is not None:
+            argv += ["--final-output", str(final_output)]
         argv += ["--agent-env", str(agent_env), "--print", task]
         # The credential is a real env var of the MODEL-SIDE process, so clearing
         # it for the worker is a meaningful guarantee (AC-05.1), plus a second
@@ -417,3 +504,233 @@ def test_missing_worker_aborts_without_local_fallback(daimonos_binary, tmp_path)
     # A required worker that cannot launch exits 22 (no local fallback).
     assert completed.returncode == 22, completed.stderr
     assert "worker_unavailable" in (completed.stdout + completed.stderr)
+
+
+# --- r2 review fixes (R1-R8) -------------------------------------------------
+
+FINAL_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _write_final_control(tmp_path, tool_name="final_answer"):
+    control = tmp_path / "final.json"
+    control.write_text(json.dumps({
+        "schema": FINAL_SCHEMA, "tool_name": tool_name,
+        "tool_description": "Emit the final structured result.",
+        "corrective_retries": 0}))
+    return control
+
+
+def _worker_survivors(needle):
+    """PIDs whose /proc cmdline contains `needle` — used to prove, via the
+    process table, that no owned worker child outlives the run (R6)."""
+    survivors = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if needle in cmd:
+            survivors.append(pid)
+    return survivors
+
+
+def test_r1_worker_env_disclosing_credential_is_refused(daimonos_binary, tmp_path):
+    # ADR-028: an explicit worker `env` value that discloses the model credential
+    # is refused BEFORE the worker starts (exit 2), and the diagnostic never
+    # contains the credential value.
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER_SRC)
+    record = tmp_path / "worker_env.json"
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"toolside": {
+        "command": sys.executable,
+        "args": [str(script)],
+        "env": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "WORKER_RECORD": str(record),
+                "PROVIDER_KEY": CREDENTIAL},
+    }}}))
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config)
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "run_configuration_invalid" in completed.stderr
+    assert "worker_credential_disclosure" in completed.stderr
+    # No worker launched: its startup record was never written.
+    assert not record.exists(), "a worker launched despite credential disclosure"
+    # The credential value never appears in the diagnostic.
+    assert CREDENTIAL not in (completed.stdout + completed.stderr)
+
+
+def test_r1_worker_args_disclosing_credential_is_refused(daimonos_binary, tmp_path):
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER_SRC)
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"toolside": {
+        "command": sys.executable,
+        "args": [str(script), "--api-key=" + CREDENTIAL],
+        "env": {"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    }}}))
+    completed = _run(daimonos_binary, tmp_path, [DONE], worker_config=config)
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "worker_credential_disclosure" in completed.stderr
+    assert CREDENTIAL not in (completed.stdout + completed.stderr)
+
+
+def test_ac_05_2_worker_proves_no_network_in_namespace(daimonos_binary, tmp_path):
+    # AC-05.2 no-network leg: the worker is launched inside a user+net namespace
+    # with no network (`unshare -Urn`); the fake model endpoint is reachable only
+    # from the model side. The complete run succeeds AND the worker proves it has
+    # no network (a connect to the endpoint from inside the namespace fails).
+    unshare = shutil.which("unshare")
+    if unshare is None:
+        pytest.skip("unshare not available on host")
+    probe = subprocess.run([unshare, "-Urn", "true"], capture_output=True)
+    if probe.returncode != 0:
+        pytest.skip("host cannot create an unprivileged user+net namespace: "
+                    + probe.stderr.decode("utf-8", "replace").strip())
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER_SRC)
+    calls = tmp_path / "worker_calls.txt"
+    netcheck = tmp_path / "worker_netcheck.txt"
+    target_file = tmp_path / "endpoint.txt"
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"toolside": {
+        "command": unshare,
+        "args": ["-Urn", sys.executable, str(script)],
+        "env": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "WORKER_CALLS": str(calls),
+                "WORKER_NETCHECK": str(netcheck),
+                "NETCHECK_TARGET_FILE": str(target_file),
+                "PYTHONCOERCECLOCALE": "0"},
+    }}}))
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config, port_file=target_file)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "read_note" in calls.read_text().split()
+    assert netcheck.exists(), "worker did not record its network check"
+    result = netcheck.read_text()
+    assert result.startswith("failed"), (
+        "worker reached the model endpoint from inside its namespace: " + result)
+
+
+def test_r3_unknown_worker_allowlist_entry_fails_at_startup(daimonos_binary, tmp_path):
+    # FR-02 req5/req7: after discovery, a worker-scoped allowlist entry that no
+    # worker serves fails the run at startup (exit 2), naming the entry.
+    config, _, _ = _write_worker(tmp_path)
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config,
+                     allowlist=["mcp__toolside__read_note", "mcp__ghost__missing"])
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "run_configuration_invalid" in completed.stderr
+    assert "tool_allowlist_unknown_entry" in completed.stderr
+    assert "mcp__ghost__missing" in completed.stderr
+
+
+def test_r4_final_only_run_dispatches_nothing_to_worker(daimonos_binary, tmp_path):
+    # PM FR-05 / checkpoint: with --final-output AND --worker-config, a run in
+    # which the model calls only the final-answer tool ends model-side, is
+    # validated and emitted on stdout, and dispatches NOTHING to a worker nor
+    # records anything under the `worker` route.
+    config, _, calls = _write_worker(tmp_path)
+    control = _write_final_control(tmp_path)
+    audit = tmp_path / "state" / "audit.jsonl"
+    final = {"id": "f1", "name": "final_answer", "args": {"answer": "42"}}
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [final]}],
+                     worker_config=config, final_output=control, audit_path=audit)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    emitted = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert emitted == {"answer": "42"}, completed.stdout
+    # Nothing dispatched to a worker.
+    served = calls.read_text().split() if calls.exists() else []
+    assert served == [], served
+    events = [json.loads(line) for line in audit.read_text().splitlines() if line.strip()]
+    worker_calls = [e for e in events
+                    if e.get("kind") == "tool_call" and e.get("route") == "worker"]
+    assert worker_calls == [], worker_calls
+
+
+def test_r6_no_worker_child_survives_normal_abort_or_final_failure(daimonos_binary, tmp_path):
+    config, _, _ = _write_worker(tmp_path)
+    script = str(tmp_path / "worker.py")
+    # Normal run.
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config)
+    assert completed.returncode == 0, completed.stderr
+    assert _worker_survivors(script) == [], "worker survived a normal run"
+    # Worker-abort run (exit 22).
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [CRASH_CALL]}, DONE],
+                     worker_config=config)
+    assert completed.returncode == 22, completed.stderr
+    assert _worker_survivors(script) == [], "worker survived an aborted run"
+    # Final-output failure (final answer missing a required field).
+    control = _write_final_control(tmp_path)
+    bad_final = {"id": "f1", "name": "final_answer", "args": {}}
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [bad_final]}],
+                     worker_config=config, final_output=control)
+    assert completed.returncode != 0, completed.stdout
+    assert _worker_survivors(script) == [], "worker survived a final-output failure"
+
+
+def test_r6_stalled_worker_is_force_reaped(daimonos_binary, tmp_path):
+    # A worker that ignores stdin closure (a non-daemon thread outlives main)
+    # must still be terminated by teardown: a `shut_down` that cannot reap it
+    # gracefully force-kills its process group.
+    script = tmp_path / "stubborn.py"
+    script.write_text(WORKER_STUBBORN_SRC)
+    marker = str(script) + "-grandchild"
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"stub": {
+        "command": sys.executable, "args": [str(script)],
+        "env": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "GRANDCHILD_MARKER": marker,
+                "PYTHONCOERCECLOCALE": "0"}}}}))
+    stub_call = {"id": "c1", "name": "mcp__stub__read_note"}
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [stub_call]}, DONE],
+                     worker_config=config, extra_config="shutdown_timeout_secs = 2\n")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    # Neither the stalled worker nor its grandchild (in the worker's process
+    # group) may outlive the run; teardown force-reaps the whole group.
+    assert _worker_survivors(str(script)) == [], (
+        "a stalled worker survived teardown; shut_down did not reap it")
+    assert _worker_survivors(marker) == [], (
+        "a worker descendant survived teardown; the process group was not reaped")
+
+
+def test_r7_worker_result_text_with_token_does_not_exit_22(daimonos_binary, tmp_path):
+    # A worker tool RESULT whose text merely contains the word `worker_unavailable`
+    # must NOT be misread as a lost worker: the run ends normally (exit 0). The
+    # worker-loss exit mapping keys on a TYPED terminal reason, not this substring.
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER_SRC)
+    calls = tmp_path / "calls.txt"
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"toolside": {
+        "command": sys.executable, "args": [str(script)],
+        "env": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "WORKER_CALLS": str(calls),
+                "WORKER_NOTE_TEXT": "status: worker_unavailable observed in a tool result",
+                "PYTHONCOERCECLOCALE": "0"}}}}))
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "read_note" in calls.read_text().split()
+
+
+def test_r8_command_with_equals_is_refused_at_parse(daimonos_binary, tmp_path):
+    # ADR-028: a `command` containing `=` would be misparsed by the `env`
+    # launcher; it is refused at parse (exit 2), not left to fail opaquely as
+    # worker_unavailable (exit 22).
+    config = tmp_path / "wc.json"
+    config.write_text(json.dumps({"workers": {"toolside": {
+        "command": "FOO=bar", "env": {}}}}))
+    completed = _run(daimonos_binary, tmp_path, [DONE], worker_config=config)
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "run_configuration_invalid" in completed.stderr
+    assert "command" in completed.stderr

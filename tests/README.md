@@ -110,3 +110,5 @@ fail-closed control-file validation (exit 2). The no-network container leg
 (AC-05.2) and the WP09 capability-probe leg are integration merge items — the
 pure-stdlib worker makes no outbound connection. Run:
 `python3 -m pytest tests/test_worker_isolation.py -v`.
+
+- `test_worker_isolation.py` (WP10 r2): adds credential-disclosure refusal (R1), the no-network namespace leg via `unshare -Urn` (AC-05.2, skipped if the host cannot create a user+net namespace), post-discovery allowlist validation (R3), the `--final-output`+`--worker-config` final-only case (R4), process-table reaping incl. a stalled worker + descendant (R6), typed lost-worker terminal (R7), and `command`-with-`=` refusal (R8).

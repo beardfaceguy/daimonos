@@ -1159,6 +1159,11 @@ fn client_details() -> InitializeRequestParams {
 pub struct WorkerClient {
     name: String,
     client: Arc<ClientRuntime>,
+    /// PIDs of the worker's launched child process(es), captured at connect so
+    /// a stalled teardown can still reap them (R6). Empty on non-Linux, where
+    /// PID discovery via `/proc` is unavailable (teardown then relies on the
+    /// SDK's `kill_on_drop` alone; see docs/configuration.md).
+    child_pids: Vec<u32>,
 }
 
 /// A worker's discovered tool, before namespacing into the exported catalog.
@@ -1214,14 +1219,22 @@ impl WorkerClient {
         }
     }
 
-    /// Bounded teardown: shut the client down and reap the stdio child. The
-    /// caller's budget bounds us; a slow child is detached to keep reaping.
+    /// Bounded teardown that GUARANTEES reaping (R6, ADR-028). First ask the
+    /// SDK to shut down (it cancels the transport, closing the worker's stdin
+    /// so a well-behaved worker exits on EOF). The SDK keeps the child handle in
+    /// an internal `wait` task and `shut_down` only closes stdio, so a worker
+    /// that ignores stdin closure would survive; after a bounded grace we
+    /// force-kill the worker's process group (the SDK spawns each child with
+    /// `process_group(0)`, so `pgid == pid`), which also reaps any descendant
+    /// such as an `unshare` wrapper. No owned worker child outlives the run.
     pub async fn shutdown(&self, timeout: Duration) {
         let client = Arc::clone(&self.client);
         let mut task = tokio::spawn(async move {
             let _ = client.shut_down().await;
         });
         let _ = tokio::time::timeout(timeout, &mut task).await;
+        #[cfg(unix)]
+        reap_worker_children(&self.child_pids, timeout).await;
     }
 }
 
@@ -1232,6 +1245,103 @@ impl WorkerClient {
 /// caller-controlled settings only: pass an absolute `command`, or include
 /// `PATH` in `env`. Discovery (initialize + tools/list) is bounded by
 /// `init_timeout`.
+/// The direct child process ids of the current process, read from `/proc`
+/// (Linux). Used to identify a worker's launched child (the SDK does not expose
+/// the `Child`) so a stalled teardown can still reap it through the OS.
+#[cfg(target_os = "linux")]
+fn direct_child_pids() -> HashSet<u32> {
+    let me = std::process::id();
+    let mut children = HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return children;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|rest| rest.trim().parse::<u32>().ok());
+        if parent == Some(me) {
+            children.insert(pid);
+        }
+    }
+    children
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn direct_child_pids() -> HashSet<u32> {
+    // No portable /proc PPid scan; teardown relies on the SDK's kill_on_drop.
+    HashSet::new()
+}
+
+#[cfg(not(unix))]
+fn direct_child_pids() -> HashSet<u32> {
+    HashSet::new()
+}
+
+/// Reap each owned worker child through the managed-process lifecycle: the SDK
+/// `shut_down` only cancels the reader (it does NOT close the child's stdin
+/// while the client Arc is still held), so a graceful stdin-EOF exit is not
+/// guaranteed. Signal the worker's process group `SIGTERM`, wait a bounded
+/// `grace` for it to exit, then `SIGKILL` the group (and the pid as a fallback)
+/// if it stalls. Targeting the group (the SDK sets `process_group(0)`, so
+/// `pgid == pid`) also reaps any descendant such as an `unshare` wrapper. This
+/// is the same SIGTERM→grace→SIGKILL discipline as `managed_process::terminate`
+/// and GUARANTEES no owned worker child outlives the run. `kill(pid, 0)` probes
+/// liveness without delivering a signal.
+#[cfg(unix)]
+async fn reap_worker_children(pids: &[u32], grace: Duration) {
+    for &pid in pids {
+        let Ok(signed) = i32::try_from(pid) else {
+            continue;
+        };
+        if unsafe { libc::kill(signed, 0) } != 0 {
+            continue; // already gone
+        }
+        unsafe { libc::kill(-signed, libc::SIGTERM) };
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(signed, 0) } != 0 {
+                break; // exited on SIGTERM
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if unsafe { libc::kill(signed, 0) } == 0 {
+            unsafe {
+                libc::kill(-signed, libc::SIGKILL);
+                libc::kill(signed, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Resolve the `env` launcher by ABSOLUTE path (R8): the worker launcher is
+/// never found through an inherited `PATH`. Returns the first of the standard
+/// POSIX locations that exists. On a platform that ships `env` elsewhere (or
+/// not at all), worker-only execution is unavailable and the launch fails as
+/// `worker_unavailable` with this reason (documented in docs/configuration.md).
+fn env_launcher() -> Result<&'static str, String> {
+    for path in ["/usr/bin/env", "/bin/env"] {
+        if std::path::Path::new(path).exists() {
+            return Ok(path);
+        }
+    }
+    Err(
+        "no `env` launcher found at /usr/bin/env or /bin/env; credential-free \
+         worker execution requires a POSIX `env` supporting `-i`"
+            .to_string(),
+    )
+}
+
 pub async fn connect_worker(
     name: &str,
     command: &str,
@@ -1256,8 +1366,9 @@ pub async fn connect_worker(
     // absolute paths (no `=`), so the first non-assignment arg is the command.
     wrapped.push(command.to_string());
     wrapped.extend(args.iter().cloned());
+    let launcher = env_launcher().map_err(|reason| format!("worker '{name}': {reason}"))?;
     let transport = StdioTransport::create_with_server_launch(
-        "env".to_string(),
+        launcher.to_string(),
         wrapped,
         None,
         TransportOptions::default(),
@@ -1272,6 +1383,11 @@ pub async fn connect_worker(
         message_observer: None,
     });
     let deadline = tokio::time::Instant::now() + init_timeout;
+    // Snapshot direct children before the handshake spawns the worker child
+    // (inside `client.start()`); the post-handshake difference is this worker's
+    // launched pid(s). connect_worker is called sequentially per worker, so the
+    // difference is unambiguous. Used only for guaranteed reaping (R6).
+    let before_children = direct_child_pids();
     // reject_daimonos = false: the worker IS allowed to be a daimonos instance
     // (Route 1). The handshake only initializes and lists tools.
     let tools = match handshake(&client, deadline, false).await {
@@ -1290,10 +1406,15 @@ pub async fn connect_worker(
             input_schema: serde_json::to_value(&tool.input_schema).unwrap_or(Value::Null),
         })
         .collect();
+    let child_pids: Vec<u32> = direct_child_pids()
+        .difference(&before_children)
+        .copied()
+        .collect();
     Ok((
         WorkerClient {
             name: name.to_string(),
             client,
+            child_pids,
         },
         defs,
     ))
