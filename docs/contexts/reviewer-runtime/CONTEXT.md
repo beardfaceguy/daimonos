@@ -6,6 +6,7 @@ Date: 2026-11-03
 - **State root:** Caller-owned location for internal artifacts. It is not permission to relocate explicit tool writes.
 - **Confinement root:** Fixed run-scoped boundary for authorized filesystem access. `set_cwd` does not change it.
 - **Working directory:** Mutable session base for relative paths. With confinement enabled, the filesystem authority enforces the confinement root for every operation.
+- **No-follow:** Independent option (`--no-follow-symlinks`) that reports a symbolic link and its literal target text without opening or walking through it. Orthogonal to confinement; the two may be combined.
 - **Effective catalog:** The definitions actually selected after registration, workspace checks, policy, tier, and schema mode.
 - **Terminal call:** A designated final-answer call intercepted on the model side rather than executed as a tool.
 - **Corrective retry:** A new model request after a failed ending. Ordinary evidence turns do not consume it.

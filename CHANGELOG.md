@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **`--no-follow-symlinks`.** Independent no-follow filesystem policy (FR-12,
+  ADR-022): every symlink is reported as a link with its literal target text and
+  is never read or walked through, including intermediate directory links and
+  links named as a tool/walk scope. Combines with `--confine-paths`; default off
+  leaves behavior unchanged.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The

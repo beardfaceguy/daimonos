@@ -102,6 +102,32 @@ ignore files outside the root are not read. Confined glob patterns with a parent
 component after a wildcard are refused. Procfs symlink stat does not expose
 target text.
 
+## No-follow symbolic links
+
+`--no-follow-symlinks` reports symbolic links as links and never reads or walks
+through them. It is independent of confinement: it can be used alone, and it
+can be combined with `--confine-paths` or `--confine-root`. When the option is
+absent, behaviour is unchanged (links inside the root resolve normally).
+
+With the option on, a `read_file` of any path containing a symlink component
+— the final element or an intermediate directory — is refused with the
+`symlink_refused` code and the link's literal, unresolved target text in the
+`target` field. The target is never opened or resolved, so no linked content is
+returned. Walks for `ls`, `search`, `glob`, and `find` list a link as a link
+but do not descend into it.
+
+No-follow is enforced through the same fixed-root filesystem authority as
+confinement (`openat2`/procfs on Linux; it fails closed when those are
+unavailable), so selecting it pins resolution to the workspace root and shares
+confined mode's startup requirements. `git_read` reads git objects rather than
+the filesystem, so a stored tree symlink is already reported as a `120000`
+blob whose content is the literal target text, without resolving through it.
+Operator configuration readers (skills, prompts, the agent environment file,
+editor configuration, and ignore files) follow links by design even under
+no-follow, because they read the operator's own startup files rather than
+workspace evidence presented to the model.
+See ADR-022 and `FilesystemAuthority` in `src/path_policy.rs`.
+
 ## Agent Environment File
 
 `daimonos agent`, `daimonos chat`, and `daimonos acp` use a separate,

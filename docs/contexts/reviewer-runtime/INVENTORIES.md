@@ -2,6 +2,7 @@
 
 Date: 2026-10-29
 Status: Source inventory complete for review. Enforcement is not implemented.
+Implemented: WP14 no-follow enforcement (FR-12) is landed on `FilesystemAuthority` (reads refuse symlink components with target text; confined walks do not traverse links).
 Base: `859194c8cc3aa736e6539db14af6bd370f325e7c`.
 Authority: Accepted ADRs 021–032 and the sealed PM inputs in the [package plan](../../handoffs/2026-10-28-dbunk-remaining-work.md).
 Contracts: [INTERFACES.md](INTERFACES.md). Public names and mechanisms there await G0 review.

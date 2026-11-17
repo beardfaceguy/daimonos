@@ -183,7 +183,9 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
         op.n.unwrap_or(session.cfg.search.default_find_max as i64)
             .max(1) as usize;
     let result = tokio::task::spawn_blocking(move || {
-        let start = authority.open_read(&root)?;
+        // WP14: honor no-follow for the explicit scope so a symlink named as
+        // the find root is refused with its target, never walked through.
+        let start = authority.open_read_policy(&root)?;
         let only_file = start
             .metadata()
             .is_ok_and(|metadata| metadata.is_file())
@@ -197,6 +199,8 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
             &scan_root,
             WalkOptions {
                 include_hidden: false,
+                // WP14: no-follow never walks through links.
+                follow_symlinks: !authority.no_follow(),
                 ..WalkOptions::default()
             },
         )?;
