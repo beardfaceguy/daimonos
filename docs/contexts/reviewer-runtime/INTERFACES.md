@@ -293,6 +293,7 @@ Do not present generic `anyhow` text as the machine-readable contract.
 
 Exit 2 includes detailed reason codes: `state_unusable`, `state_overlaps_workspace`, `workspace_write_forbidden`, `state_mode_unsupported`, `unknown_tool`, `tool_name_collision`,
 `filesystem_policy_unsupported`, `offline_profile_incompatible`, `model_profile_incomplete`, and `schema_unusable` before a request.
+WP09 (capability probe) adds three exit-2 reasons under the same `run_configuration_invalid` code: `capability_probe_requires_final_output` and `capability_probe_requires_model_profile` (the probe flag is present but `--final-output` / `--model-profile` is missing), and `capability_probe_payload_invalid` (the caller's minimal payload is an unreadable file, invalid JSON, or fails the final-answer schema — refused locally before any request).
 `state_mode_unsupported` is a temporary WP01 refusal for frontends whose state is not yet relocated. WP02 removes that limitation as it adds support.
 `workspace_write_forbidden` is the WP04 startup refusal when an internal writer's destination resolves inside the workspace under `--workspace-read-only`; it reuses the one FR-07 spelling for both the startup (exit-2) reason and the tool-refusal code below, so operators see a single name for every prohibited workspace write.
 Under final-output mode, `schema_unusable` uses exit 20 and the required final-output error shape instead.

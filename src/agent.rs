@@ -1220,16 +1220,49 @@ async fn run_inner(
         // failure ends the run before the next model request (fail-closed).
         if let Some(audit) = &config.audit {
             let obs = provider.take_controlled_observation();
-            let _ = audit.record_model_request(
-                audit_model_seq,
-                obs.as_ref().and_then(|o| o.http_status),
-                obs.as_ref().map(|o| o.retry_index).unwrap_or(0),
-                false,
-                Some(resp.usage.input),
-                Some(resp.usage.output),
-                obs.as_ref().and_then(|o| o.wire),
-            );
-            audit_model_seq += 1;
+            let wire = obs.as_ref().and_then(|o| o.wire);
+            // WP09 (G6): record EVERY HTTP attempt the controlled transport made
+            // for this completion (INTERFACES.md: "Record every attempted
+            // request"). A caller `request_retries` lets one completion retry
+            // inside the transport; each attempt becomes one `model_request`
+            // with its own status and zero-based retry index. The completion's
+            // usage is carried on the final attempt only; earlier attempts have
+            // none. A non-controlled provider exposes no attempts, so it still
+            // records exactly one request (the prior behavior).
+            match obs.as_ref() {
+                Some(o) if !o.attempts.is_empty() => {
+                    let last_idx = o.attempts.len() - 1;
+                    for (i, att) in o.attempts.iter().enumerate() {
+                        let (input, output) = if i == last_idx {
+                            (Some(resp.usage.input), Some(resp.usage.output))
+                        } else {
+                            (None, None)
+                        };
+                        let _ = audit.record_model_request(
+                            audit_model_seq,
+                            att.http_status,
+                            att.retry_index,
+                            false,
+                            input,
+                            output,
+                            wire,
+                        );
+                        audit_model_seq += 1;
+                    }
+                }
+                _ => {
+                    let _ = audit.record_model_request(
+                        audit_model_seq,
+                        obs.as_ref().and_then(|o| o.http_status),
+                        obs.as_ref().map(|o| o.retry_index).unwrap_or(0),
+                        false,
+                        Some(resp.usage.input),
+                        Some(resp.usage.output),
+                        wire,
+                    );
+                    audit_model_seq += 1;
+                }
+            }
             if audit.poisoned() {
                 return AgentResult {
                     messages,

@@ -324,10 +324,23 @@ _INVALID_ARGS = {"content": [{"type": "tool_use", "id": "t1", "name": FINAL_TOOL
                               "input": {"verdict": 42}}],
                  "stop_reason": "tool_use",
                  "usage": {"input_tokens": 1, "output_tokens": 1}}
+# A text (reasoning) block ALONGSIDE the single valid final call (R3, req 16).
+_TEXT_PLUS_FINAL = {"content": [
+    {"type": "text", "text": "Here is my verdict."},
+    {"type": "tool_use", "id": "t1", "name": FINAL_TOOL,
+     "input": {"verdict": "supported"}}],
+    "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}}
+# A valid final call whose verdict DIFFERS from the suggested probe payload (R7,
+# ADR-027: no byte-for-byte equality with the suggested payload is demanded).
+_FINAL_DIFFERENT = {"content": [{"type": "tool_use", "id": "t1", "name": FINAL_TOOL,
+                                 "input": {"verdict": "a-different-valid-value"}}],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}}
 
 _BODIES = {
     "final_ok": _FINAL_OK, "text_only": _TEXT_ONLY, "wrong_tool": _WRONG_TOOL,
     "two_calls": _TWO_CALLS, "invalid_args": _INVALID_ARGS,
+    "text_plus_final": _TEXT_PLUS_FINAL, "final_different": _FINAL_DIFFERENT,
 }
 
 
@@ -372,6 +385,9 @@ class ProbeEndpoint:
                 self._record("POST")
                 if owner.mode == "503":
                     self._send(503, b"{}")
+                    return
+                if owner.mode == "400":
+                    self._send(400, b"{}")
                     return
                 if owner.mode == "307":
                     self._send(307, b"{}",
@@ -796,3 +812,155 @@ def test_g5_unset_credential_same_error_with_or_without_probe(daimonos_binary, t
     assert CRED_ENV in (without_probe.stderr + without_probe.stdout)
     assert with_ep.requests == [], with_ep.requests
     assert without_ep.requests == [], without_ep.requests
+
+
+# ==========================================================================
+# r3 reviewer findings R2-R7. See DIRECTION.md (run wp09-20261117-r3) and the
+# reviewer report wp09-e36f108/review-wp09.md Findings section. These close the
+# MINOR test gaps around the "exactly the same tool definitions" clause (R2),
+# the "text/reasoning alongside the call is allowed" clause (R3), the
+# tool-definition / HTTP-400 endpoint-rejection case (R4), and the "no
+# byte-for-byte equality with the suggested payload" clause (R7).
+# ==========================================================================
+
+
+def test_r2_probe_tools_equal_first_loop_request_tools(daimonos_binary, tmp_path):
+    # Req 15 / ADR-027: the probe offers EXACTLY the tool definitions the run
+    # will offer. Both the probe and the first loop request reach the same fake
+    # endpoint; assert their `tools` arrays are equal (names AND schemas), so a
+    # regression that offered the model a different catalog in the probe than in
+    # the run would be caught.
+    endpoint = ProbeEndpoint("final_ok")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    posts = endpoint.posts
+    assert len(posts) >= 2, posts  # [0] = probe, [1] = first loop request
+    probe_tools = posts[0]["body"]["tools"]
+    loop_tools = posts[1]["body"]["tools"]
+    by_name = lambda t: t["name"]
+    assert sorted(probe_tools, key=by_name) == sorted(loop_tools, key=by_name), \
+        (probe_tools, loop_tools)
+
+
+def test_r3_probe_text_block_alongside_final_call_passes(daimonos_binary, tmp_path):
+    # Req 16 / ADR-027: a probe response carrying a text (reasoning) block
+    # ALONGSIDE the single valid final-answer call is a pass (exit 0); the text
+    # beside the sole final call is allowed.
+    endpoint = ProbeEndpoint("text_plus_final")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_r4_probe_http_400_is_endpoint_error_and_one_request(daimonos_binary, tmp_path):
+    # Req 17 / ADR-027: an endpoint error (including a tool-definition rejection
+    # surfaced as HTTP 400) yields the distinct model_unsupported exit (21) with
+    # reason `endpoint_error` and exactly one request (no retry).
+    endpoint = ProbeEndpoint("400")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url)
+    finally:
+        endpoint.close()
+    assert result.returncode == 21, result.stderr + result.stdout
+    assert len(endpoint.posts) == 1, endpoint.posts
+    blob = result.stderr + result.stdout
+    assert "model_unsupported" in blob, blob
+    assert "endpoint_error" in blob, blob
+
+
+def test_r7_valid_but_different_payload_passes(daimonos_binary, tmp_path):
+    # ADR-027: a probe response whose valid final call carries a verdict that
+    # DIFFERS from the suggested payload yet still validates against the schema
+    # is a pass (exit 0). The probe demands schema validity, not byte equality
+    # with the suggested payload.
+    endpoint = ProbeEndpoint("final_different")
+    try:
+        result = _run_probe(daimonos_binary, tmp_path, endpoint_url=endpoint.url)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+# ==========================================================================
+# r3 G6 (integrator, from the r2 diff). INTERFACES.md: "Record every attempted
+# request." The WP07 controlled transport may retry inside ONE completion
+# (`request_retries`), but r2's single `ControlledObservation` kept only the
+# last attempt, so a retried controlled request produced a single
+# `model_request` audit record. G6: the audit must record EVERY attempt.
+# ==========================================================================
+
+
+class SequenceEndpoint:
+    """Fake Messages endpoint that answers a fixed SEQUENCE of HTTP statuses,
+    one per request in order (repeating the last for any extra), so a single
+    controlled completion that the transport retries can be observed
+    attempt-by-attempt. A 200 carries the valid final-answer body; any other
+    status carries an empty JSON body."""
+
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.requests = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length:
+                    self.rfile.read(length)
+                idx = len(owner.requests)
+                status = owner.statuses[min(idx, len(owner.statuses) - 1)]
+                owner.requests.append(status)
+                payload = json.dumps(_FINAL_OK).encode() if status == 200 else b"{}"
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=3)
+
+
+def test_g6_controlled_retries_record_every_attempt(daimonos_binary, tmp_path):
+    # request_retries=2 against an endpoint answering 503, 503, 200: the one
+    # controlled completion makes three HTTP attempts, so the audit must hold
+    # THREE model_request records with retry_index 0,1,2 and the three statuses
+    # 503,503,200 (not a single record of the last attempt).
+    endpoint = SequenceEndpoint([503, 503, 200])
+    audit = tmp_path / "state" / "audit.jsonl"
+    try:
+        result = _run_controlled(daimonos_binary, tmp_path, endpoint_url=endpoint.url,
+                                 request_retries=2, audit_path=audit)
+    finally:
+        endpoint.close()
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert endpoint.requests == [503, 503, 200], endpoint.requests
+    events = _read_events(audit)
+    reqs = [e for e in events if e.get("kind") == "model_request"]
+    assert len(reqs) == 3, reqs
+    assert [r["retry_index"] for r in reqs] == [0, 1, 2], reqs
+    assert [r["http_status"] for r in reqs] == [503, 503, 200], reqs
+    assert all(r["wire"] == "messages" for r in reqs), reqs

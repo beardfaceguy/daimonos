@@ -602,6 +602,24 @@ pub struct ControlledObservation {
     pub http_status: Option<u16>,
     pub retry_index: u32,
     pub wire: Option<&'static str>,
+    /// WP09 (G6): one record per HTTP attempt this completion made, in order.
+    /// INTERFACES.md requires the audit to "Record every attempted request",
+    /// and a caller `request_retries` lets one completion retry inside
+    /// [`controlled_send`]; the single scalar fields above hold only the final
+    /// attempt, so this carries each attempt's status and zero-based index for
+    /// the agent loop to record as one `model_request` apiece. The probe (one
+    /// forced attempt) reads the scalar fields and ignores this.
+    pub attempts: Vec<ControlledAttempt>,
+}
+
+/// WP09 (G6): one controlled HTTP attempt's wire-level metadata — its
+/// zero-based retry index and the HTTP status it received (absent on a
+/// transport/timeout fault before any status). Carries no body, header, or
+/// credential.
+#[derive(Debug, Clone)]
+pub struct ControlledAttempt {
+    pub retry_index: u32,
+    pub http_status: Option<u16>,
 }
 
 // === WP07: controlled model transport (ADR-025, FR-04 requirements 1-13) ===
@@ -1022,6 +1040,12 @@ pub async fn controlled_send(
         let result = match with_deadline("controlled response headers", req.timeout, sent).await {
             Ok(r) => r,
             Err(timeout) => {
+                // WP09 (G6): a timed-out attempt is still an attempt; it has no
+                // HTTP status.
+                obs.attempts.push(ControlledAttempt {
+                    retry_index: attempt,
+                    http_status: None,
+                });
                 last = timeout;
                 continue;
             }
@@ -1042,12 +1066,23 @@ pub async fn controlled_send(
                 } else {
                     format!("controlled network error: {e}")
                 };
+                // WP09 (G6): a transport-fault attempt reached no HTTP status.
+                obs.attempts.push(ControlledAttempt {
+                    retry_index: attempt,
+                    http_status: None,
+                });
                 last = LlmResponse::retryable_error(msg);
                 continue;
             }
         };
         let status = resp.status();
         obs.http_status = Some(status.as_u16());
+        // WP09 (G6): record this attempt's HTTP status (covers the redirect,
+        // success, retryable, and fatal branches below).
+        obs.attempts.push(ControlledAttempt {
+            retry_index: attempt,
+            http_status: Some(status.as_u16()),
+        });
         if status.is_redirection() {
             // No redirect is followed and the body is never re-sent to another
             // host; a 3xx is a terminal endpoint error (FR-04 req 12).
