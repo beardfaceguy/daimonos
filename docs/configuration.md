@@ -122,6 +122,10 @@ unavailable), so selecting it pins resolution to the workspace root and shares
 confined mode's startup requirements. `git_read` reads git objects rather than
 the filesystem, so a stored tree symlink is already reported as a `120000`
 blob whose content is the literal target text, without resolving through it.
+Operator configuration readers (skills, prompts, the agent environment file,
+editor configuration, and ignore files) follow links by design even under
+no-follow, because they read the operator's own startup files rather than
+workspace evidence presented to the model.
 See ADR-022 and `FilesystemAuthority` in `src/path_policy.rs`.
 
 ## Agent Environment File

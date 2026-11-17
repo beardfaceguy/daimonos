@@ -696,7 +696,9 @@ async fn dispatch_tool_inner(
             let previous = session.cwd.display().to_string();
             let new_cwd = session.resolve_path(&path);
             if let Some(authority) = &session.authority {
-                let authorized = match authority.open_read(&new_cwd) {
+                // WP14 (FR-12): refuse re-pinning cwd through a symlink
+                // component under no-follow instead of silently resolving it.
+                let authorized = match authority.open_read_policy(&new_cwd) {
                     Ok(authorized) => authorized,
                     Err(error) => {
                         return response_to_result(
@@ -1228,8 +1230,10 @@ fn passes_session_context_check(session: &Session, name: &str) -> bool {
 /// workspace-scoped paths before changing the live session.
 fn apply_reroot(session: &mut Session, new_root: PathBuf) -> bool {
     if let Some(authority) = &session.authority {
+        // WP14 (FR-12): refuse re-rooting through a symlink component under
+        // no-follow; the link is not silently resolved.
         let allowed = authority
-            .open_read(&new_root)
+            .open_read_policy(&new_root)
             .ok()
             .and_then(|entry| entry.metadata().ok())
             .is_some_and(|metadata| metadata.is_dir());
@@ -1631,8 +1635,10 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
             let detected: Vec<_> = markers
                 .into_iter()
                 .filter_map(|(file, language)| {
+                    // WP14 (FR-12): a symlinked marker must not satisfy
+                    // project-type detection under no-follow.
                     authority
-                        .open_read(&authority.root().join(file))
+                        .open_read_policy(&authority.root().join(file))
                         .ok()
                         .map(|_| language)
                 })
@@ -1640,7 +1646,10 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
             if !detected.is_empty() {
                 hints.push(format!("Project type: {}", detected.join(", ")));
             }
-            if authority.open_read(&authority.root().join(".git")).is_ok() {
+            if authority
+                .open_read_policy(&authority.root().join(".git"))
+                .is_ok()
+            {
                 hints.push("VCS: git".to_string());
             }
             if let Ok(walk) = authority.walk(
@@ -1649,7 +1658,8 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
                     max_depth: Some(0),
                     include_hidden: false,
                     skip_dirs: &["target", "node_modules"],
-                    ..Default::default()
+                    // WP14 (FR-12): never descend through a link under no-follow.
+                    follow_symlinks: !authority.no_follow(),
                 },
             ) {
                 let mut dirs: Vec<_> = walk
@@ -2440,6 +2450,29 @@ mod tests {
     fn pick_workspace_root_none_when_no_valid_root() {
         let roots = vec![root("https://example.com"), root("file:///no/such/dir/q")];
         assert_eq!(pick_workspace_root(&roots), None);
+    }
+
+    #[tokio::test]
+    async fn apply_reroot_no_follow_refuses_symlinked_root() {
+        use crate::config::Config;
+        // WP14 R3: set_root (apply_reroot) must not re-root onto a path whose
+        // component is a symlink under no-follow; the link is refused, not
+        // silently resolved, so the live workspace is preserved.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("realdir")).unwrap();
+        std::os::unix::fs::symlink("realdir", root.path().join("linkdir")).unwrap();
+        let mut cfg = Config::default();
+        let mut authority =
+            crate::path_policy::FilesystemAuthority::confined(root.path(), cfg.fs_limits())
+                .unwrap();
+        authority.set_no_follow(true);
+        cfg.filesystem_authority = Some(Arc::new(authority));
+        let root_canon = root.path().canonicalize().unwrap();
+        let mut session = Session::new(root_canon.clone(), Arc::new(cfg));
+        let before = session.workspace.clone();
+        let accepted = apply_reroot(&mut session, root_canon.join("linkdir"));
+        assert!(!accepted, "set_root followed a symlink under no-follow");
+        assert_eq!(session.workspace, before, "workspace must be preserved");
     }
 
     #[tokio::test]

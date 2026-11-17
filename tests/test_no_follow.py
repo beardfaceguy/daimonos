@@ -374,3 +374,70 @@ def test_no_follow_stat_through_link_is_fail_closed(daimonos_factory, tmp_path):
     # No target metadata (file type/size) or content is disclosed through the link.
     assert '"type": "file"' not in json.dumps(result)
     assert "STAT_TARGET_SENTINEL" not in json.dumps(result)
+
+
+# --- R2: workspace-info project/VCS detection (MCP server instructions) must
+#     not probe through links under no-follow. A symlinked marker file or a
+#     symlinked `.git` does not satisfy project-type/VCS detection, and a
+#     top-level symlinked directory is reported as a link (never listed as a
+#     traversable dir, never descended). A real marker still detects, proving
+#     the detection pipeline runs. ---
+
+
+def test_no_follow_workspace_info_does_not_follow_symlinked_markers(
+    daimonos_factory, tmp_path
+):
+    import re
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # Real marker that MUST still be detected (proves detection runs).
+    (workspace / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    # Symlinked Rust marker: target is a real in-root file; must NOT detect Rust.
+    realconf = workspace / "realconf"
+    realconf.mkdir()
+    (realconf / "Cargo.toml").write_text("[package]\nname = 'y'\n")
+    (workspace / "Cargo.toml").symlink_to("realconf/Cargo.toml")
+    # Symlinked VCS dir: must NOT yield "VCS: git".
+    (workspace / "realgit").mkdir()
+    (workspace / ".git").symlink_to("realgit", target_is_directory=True)
+    # Top-level real dir vs symlinked dir.
+    (workspace / "realdir").mkdir()
+    (workspace / "linkdir").symlink_to("realdir", target_is_directory=True)
+
+    client = daimonos_factory(
+        workspace,
+        args=["--state-dir", str(_state(tmp_path)), "--no-follow-symlinks"],
+    )
+    instructions = client.instructions
+    # Detection pipeline runs: the real marker is found.
+    assert "Python" in instructions, instructions
+    # Symlinked markers are refused, not followed.
+    assert "Rust (Cargo)" not in instructions, instructions
+    assert "VCS: git" not in instructions, instructions
+    # A symlinked top-level directory is not listed as a traversable dir.
+    match = re.search(r"^Top-level dirs: (.*)$", instructions, re.M)
+    listed = match.group(1) if match else ""
+    assert "realdir" in listed, instructions
+    assert "linkdir" not in listed, instructions
+
+
+# --- R3: re-pinning the working directory (set_cwd) or the workspace root
+#     (set_root / client roots) onto a path with a symlink component must be
+#     refused under no-follow, not silently resolved through the link. ---
+
+
+def test_no_follow_set_cwd_through_symlink_refused(daimonos_factory, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "realdir").mkdir()
+    (workspace / "linkdir").symlink_to("realdir", target_is_directory=True)
+    client = daimonos_factory(
+        workspace,
+        args=["--state-dir", str(_state(tmp_path)), "--no-follow-symlinks"],
+    )
+    result = client.call_tool("set_cwd", {"path": "linkdir"})
+    assert result.get("isError") is True, result
+    error = json.loads(result["content"][0]["text"])
+    assert error["code"] == "symlink_refused"
+    assert error["target"] == "realdir"
