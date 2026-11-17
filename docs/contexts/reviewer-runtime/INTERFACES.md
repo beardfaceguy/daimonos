@@ -136,6 +136,8 @@ Breaking argument/result/name changes require a contract major bump. Document ch
 Static native export starts no model session. Explicit worker definitions can require worker discovery before export and serving.
 Both paths apply identical selection and validation. A network-dependent discovery request is refused in an offline process.
 
+Implementation status (WP15, `dbunk/wp15-tool-contract`): implemented and tested. `src/tool_contract.rs` holds `EffectiveToolCatalog` (`freeze`/`export`/`to_json`) and `ToolContractDocument`; the `daimonos tool-contract` command prints the deterministic dump session-free. The dump reuses the live serving pipeline (`tools::tool_definitions`, `initial_exposed_tools`, the context/confinement filter, `render_list_tool`), so the exported array equals `tools/list` for the same inputs. `CONTRACT_VERSION` is `1.0.0`, reported over MCP initialization in `_meta["io.daimonos/tool-contract-version"]` (stdio and socket) and tracked in `docs/tool-contract-changelog.md`. Note for I: when WP06 merges, apply its `ToolPolicy` filter to both serving and `freeze()` so the dump continues to equal serving; the binary-version contract and WP12 source identity are deliberately untouched here.
+
 ## Structured final output and controlled requests
 
 WP05 owns `src/structured_output.rs` and the reusable `src/schema_validation.rs` (both new): `FinalOutputSpec`, `FinalOutputState`, and `FinalAttemptFailure`.

@@ -56,6 +56,7 @@ mod session_timeline;
 mod skills;
 mod snapshot;
 mod state_root;
+mod tool_contract;
 mod tool_descriptions;
 mod tool_facade;
 mod tool_output;
@@ -744,7 +745,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Agent(args)) => !args.dry_run,
         Some(Command::Chat(args)) => !args.list,
         Some(Command::Acp(_) | Command::SessionDaemon(_)) => true,
-        Some(Command::Session(_) | Command::Mcp(_) | Command::McpConfig(_) | Command::Daemon)
+        Some(
+            Command::Session(_)
+            | Command::Mcp(_)
+            | Command::McpConfig(_)
+            | Command::Daemon
+            | Command::ToolContract,
+        )
         | None => false,
     };
     if uses_agent_prompt {
@@ -874,6 +881,25 @@ async fn main() -> anyhow::Result<()> {
             command: Some(cli::McpCommand::Auth { command }),
             ..
         })) => mcp_oauth::run_command(command, &cfg.acp.mcp).await,
+        Some(Command::ToolContract) => {
+            // WP15 (FR-13): session-free deterministic dump of the effective
+            // tool contract. Reuses the serving catalog, starts no model run or
+            // session store. Context: docs/adr/029-effective-tool-contract.md.
+            let inputs = tool_contract::EffectiveInputs::from_config(&cfg, &workspace);
+            match tool_contract::EffectiveToolCatalog::freeze(&inputs) {
+                Ok(catalog) => {
+                    println!("{}", catalog.to_json());
+                    Ok(())
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"error":{"code":"run_configuration_invalid","reason":error.code,"message":error.message}})
+                    );
+                    std::process::exit(error.exit_code);
+                }
+            }
+        }
         Some(Command::Mcp(_) | Command::Daemon) | None => {
             run_tool_service(
                 runtime_mode,
@@ -1047,7 +1073,8 @@ async fn run_tool_service(
         | RuntimeMode::SessionDaemon
         | RuntimeMode::McpConfig
         | RuntimeMode::McpAuth
-        | RuntimeMode::Stats => {
+        | RuntimeMode::Stats
+        | RuntimeMode::ToolContract => {
             unreachable!("early-return runtime reached service dispatch")
         }
     }
