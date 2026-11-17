@@ -1219,14 +1219,21 @@ impl WorkerClient {
         }
     }
 
-    /// Bounded teardown that GUARANTEES reaping (R6, ADR-028). First ask the
-    /// SDK to shut down (it cancels the transport, closing the worker's stdin
-    /// so a well-behaved worker exits on EOF). The SDK keeps the child handle in
-    /// an internal `wait` task and `shut_down` only closes stdio, so a worker
-    /// that ignores stdin closure would survive; after a bounded grace we
-    /// force-kill the worker's process group (the SDK spawns each child with
-    /// `process_group(0)`, so `pgid == pid`), which also reaps any descendant
-    /// such as an `unshare` wrapper. No owned worker child outlives the run.
+    /// Bounded teardown (R6, ADR-028). First ask the SDK to shut down (it
+    /// cancels the transport, closing the worker's stdin so a well-behaved
+    /// worker exits on EOF). The SDK keeps the child handle in an internal
+    /// `wait` task and `shut_down` only closes stdio, so a worker that ignores
+    /// stdin closure would survive; after a bounded grace we force-kill the
+    /// worker's process group (the SDK spawns each child with `process_group(0)`,
+    /// so `pgid == pid`), which also reaps any descendant such as an `unshare`
+    /// wrapper.
+    ///
+    /// On LINUX this GUARANTEES no owned worker child outlives the run: the
+    /// child PIDs are discovered via `/proc` and the process group is reaped.
+    /// On other platforms `child_pids` is empty (no `/proc` PID scan), so
+    /// teardown falls back to the SDK's `kill_on_drop`, which reaps only the
+    /// direct child — a descendant such as an `unshare` wrapper may survive
+    /// (the same platform caveat `docs/configuration.md` records).
     pub async fn shutdown(&self, timeout: Duration) {
         let client = Arc::clone(&self.client);
         let mut task = tokio::spawn(async move {

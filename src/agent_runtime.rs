@@ -790,18 +790,18 @@ fn run_terminal_status(result: &anyhow::Result<agent::AgentResult>) -> (&'static
 /// returning the operator-facing message when it is. TWO shapes map here: the
 /// in-run TYPED `worker_lost` flag (never a substring of `error_message`, which
 /// can carry tool/model content), and an initialization `Err` that `run_agent`
-/// returns carrying our OWN `worker_unavailable` prefix (a value we construct,
-/// not model content). This is the SINGLE classifier shared by
+/// returns as the TYPED `worker_runtime::WorkerInitError` (R1) — DOWNCAST here,
+/// never matched by a substring of the anyhow message, so an unrelated error
+/// whose text merely contains the token is NOT a worker verdict. This is the
+/// SINGLE classifier shared by
 /// `run_terminal_status` (the audit `run_end`) and `exit_on_worker_failure`
 /// (the process exit), so the recorded exit_code and the process code always
 /// agree on the reviewed `worker_unavailable` exit 22.
 fn worker_failure(result: &anyhow::Result<agent::AgentResult>) -> Option<String> {
     match result {
-        Err(error) => {
-            let text = error.to_string();
-            text.contains(crate::worker_runtime::WORKER_UNAVAILABLE)
-                .then_some(text)
-        }
+        Err(error) => error
+            .downcast_ref::<crate::worker_runtime::WorkerInitError>()
+            .map(|typed| typed.to_string()),
         Ok(run) if run.worker_lost => Some(
             run.error_message
                 .clone()
@@ -1880,6 +1880,35 @@ mod tests {
                 true,
                 "worker_unavailable: toolside read_note failed"
             ))),
+            (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
+        );
+    }
+
+    #[test]
+    fn worker_init_failure_is_typed_not_message_substring() {
+        // WP10 (R1): a worker INITIALIZATION failure is carried as a TYPED
+        // error (`WorkerInitError`) that the terminal classifier downcasts; it
+        // is never matched by a substring of an arbitrary anyhow message. A
+        // generic `Err` whose text merely CONTAINS the token must map to the
+        // generic error exit (1), never the worker exit (22).
+        let untyped: anyhow::Result<agent::AgentResult> = Err(anyhow::anyhow!(
+            "provider said worker_unavailable mid-stream"
+        ));
+        assert!(worker_failure(&untyped).is_none());
+        assert_eq!(run_terminal_status(&untyped), ("error", 1));
+
+        // The TYPED init error IS a worker verdict (exit 22), keeping the
+        // reviewed `worker_unavailable: <detail>` operator message.
+        let typed: anyhow::Result<agent::AgentResult> =
+            Err(anyhow::Error::new(crate::worker_runtime::WorkerInitError {
+                message: "toolside discovery failed".to_string(),
+            }));
+        assert_eq!(
+            worker_failure(&typed).as_deref(),
+            Some("worker_unavailable: toolside discovery failed")
+        );
+        assert_eq!(
+            run_terminal_status(&typed),
             (crate::worker_runtime::WORKER_UNAVAILABLE, 22)
         );
     }

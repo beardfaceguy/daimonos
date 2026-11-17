@@ -190,10 +190,13 @@ pub async fn run_agent(
         {
             Ok(executor) => Some(Arc::new(executor)),
             Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "{}: {error}",
-                    crate::worker_runtime::WORKER_UNAVAILABLE
-                ));
+                // WP10 (R1, ADR-028): carry the worker-init failure as a TYPED
+                // error so `agent_runtime::worker_failure` downcasts it (the
+                // `Err`-path analogue of the `Ok`-path `worker_lost` flag),
+                // never classifying it by a substring of the message.
+                return Err(anyhow::Error::new(crate::worker_runtime::WorkerInitError {
+                    message: error.to_string(),
+                }));
             }
         }
     } else {

@@ -209,6 +209,27 @@ pub enum WorkerDispatch {
 /// stable so dbunk can recognize the failure class (ADR-028, FR-05 req 6).
 pub const WORKER_UNAVAILABLE: &str = "worker_unavailable";
 
+/// Typed terminal error returned by `agent_cmd::run_agent` when the required
+/// worker could not be INITIALIZED (launch/handshake/discovery failed). Carried
+/// as a TYPED error — the `Err`-path analogue of the `Ok`-path `worker_lost`
+/// flag — so the terminal classifier (`agent_runtime::worker_failure`)
+/// DOWNCASTS it rather than matching the `worker_unavailable` substring of an
+/// arbitrary anyhow message, which could otherwise mis-classify an unrelated
+/// error and exit 22 (R1, ADR-028). Its `Display` keeps the reviewed
+/// `worker_unavailable: <detail>` operator message.
+#[derive(Debug)]
+pub struct WorkerInitError {
+    pub message: String,
+}
+
+impl std::fmt::Display for WorkerInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{WORKER_UNAVAILABLE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for WorkerInitError {}
+
 /// The audit `route` value for a call served by (or refused for) a worker, so
 /// AC-05.3 can confirm no tool ran in the model-side process.
 pub const WORKER_ROUTE: &str = "worker";

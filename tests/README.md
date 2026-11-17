@@ -112,3 +112,4 @@ pure-stdlib worker makes no outbound connection. Run:
 `python3 -m pytest tests/test_worker_isolation.py -v`.
 
 - `test_worker_isolation.py` (WP10 r2): adds credential-disclosure refusal (R1), the no-network namespace leg via `unshare -Urn` (AC-05.2, skipped if the host cannot create a user+net namespace), post-discovery allowlist validation (R3), the `--final-output`+`--worker-config` final-only case (R4), process-table reaping incl. a stalled worker + descendant (R6), typed lost-worker terminal (R7), and `command`-with-`=` refusal (R8).
+- `test_worker_isolation.py` (WP10 r5): the AC-05.2 network-isolation leg requires a host that can create an unprivileged user and network namespace (`unshare -Urn`) and is skipped on hosts that cannot; because the plan's final gate treats a skipped mandatory acceptance check as a blocker, this skip is NOT a pass and the gate must run on a userns-capable host.
