@@ -542,3 +542,231 @@ def test_config_registered_tool_can_be_allowlisted(daimonos_binary, tmp_path):
     assert proc.returncode == 0, (proc.returncode, proc.stderr)
     report = _effective_report(proc.stderr)
     assert report is not None and "mytool" in report, proc.stderr
+
+
+# =====================================================================
+# Run r3 review fixes (second independent review, commit 5ef5e05).
+# R1 (MAJOR): the model-facing catalog on the chat/ACP/interactive/session
+#   frontends was NOT filtered by an active `--tool-allowlist` (only
+#   `agent --print` filtered). The fix is a single source filter in
+#   `tool_facade::active_schemas_for_policy`, so every frontend offers only
+#   allowlisted tools. These tests drive a real frontend process against a
+#   local fake provider that RECORDS the `tools` array of the model request and
+#   asserts it equals the allowlist (ADR-023 served==dispatched).
+# R2 (MAJOR): the `execute_script` tool DESCRIPTION embedded the full,
+#   unfiltered Starlark signature dump on every agent-family frontend
+#   (including `agent --print`). Under an active allowlist the block must list
+#   only allowlisted Starlark tools.
+import os as _os_r3
+import threading as _threading_r3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+_R3_DONE = "R3_ALLOWLIST_AGENT_DONE"
+
+
+class _RecordingProvider:
+    """Local fake OpenAI-compatible (`openrouter`) endpoint that RECORDS the
+    `tools` offered in each model request, then finishes the turn immediately
+    with an assistant stop message. No network, no real credential."""
+
+    def __init__(self):
+        self.requested_tools = []  # per-POST list of OpenAI tool dicts
+        self.post_count = 0
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                payload = json.dumps({"data": [{"id": "test/model",
+                    "context_length": 100000, "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "0", "completion": "0"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                owner.post_count += 1
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                owner.requested_tools.append(body.get("tools") or [])
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                frame = {"choices": [{"index": 0,
+                    "delta": {"role": "assistant", "content": _R3_DONE},
+                    "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+                try:
+                    self.wfile.write(("data: " + json.dumps(frame) + "\n\n").encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = _threading_r3.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def port(self):
+        return self.server.server_port
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+
+    def offered_tool_names(self, which=0):
+        assert self.requested_tools, "no model request was recorded"
+        return {t["function"]["name"] for t in self.requested_tools[which]}
+
+    def offered_description(self, name, which=0):
+        assert self.requested_tools, "no model request was recorded"
+        for t in self.requested_tools[which]:
+            if t["function"]["name"] == name:
+                return t["function"].get("description", "")
+        return None
+
+
+def _r3_env(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    env = {k: v for k, v in _os_r3.environ.items() if not k.startswith("DAIMONOS_")}
+    env.update({
+        "HOME": str(home),
+        "XDG_STATE_HOME": str(home / "state"),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "TMPDIR": str(tmp_path / "tmp"),
+        "DAIMONOS_KGL_AUTOINDEX": "0",
+    })
+    return env
+
+
+def _r3_agent_env(tmp_path, provider, allowed):
+    """Agent env pointing at the recording provider. `allowed` is the legacy
+    agent-env allowed_commands (dispatch restriction); it does not shape the
+    offered catalog, which is filtered by the explicit --tool-allowlist."""
+    path = tmp_path / "rec-agent.env"
+    path.write_text("\n".join([
+        "DAIMONOS_AGENT_PROVIDER=openrouter",
+        "DAIMONOS_AGENT_MODEL=test/model",
+        f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{provider.port}/v1",
+        "DAIMONOS_AGENT_API_KEY=synthetic-not-a-real-key-R3",
+        "DAIMONOS_AGENT_APPROVAL_MODE=auto",
+        "DAIMONOS_AGENT_COMPACTION=off",
+        "DAIMONOS_AGENT_MODELS_DISCOVER=off",
+        f"DAIMONOS_AGENT_ALLOWED_COMMANDS={allowed}",
+        "",
+    ]))
+    return path
+
+
+R3_LIST = ["read_file", "search", "ls"]
+
+
+def _drive_acp_prompt(daimonos_binary, tmp_path, provider, allowlist, allowed):
+    """Drive a real `daimonos acp` process through initialize -> session/new ->
+    session/prompt so it builds its model-facing catalog and issues one model
+    request, which the recording provider captures. ACP is JSON-RPC over stdio
+    (deterministic, no pty)."""
+    from conftest import DaimonosClient, _terminate
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    agent_env = _r3_agent_env(tmp_path, provider, allowed)
+    env = _r3_env(tmp_path)
+    command = [daimonos_binary, "--workspace", str(workspace),
+               "--tool-allowlist", str(allowlist),
+               "acp", "--agent-env", str(agent_env)]
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env,
+    )
+    try:
+        client = DaimonosClient(process, str(workspace))
+        init = client.send_raw({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {},
+                       "clientInfo": {"name": "pytest", "version": "1"}}})
+        assert "result" in init, init
+        created = client.send_raw({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": str(workspace), "mcpServers": []}})
+        assert "sessionId" in created.get("result", {}), created
+        sid = created["result"]["sessionId"]
+        client.send_raw({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": sid,
+                       "prompt": [{"type": "text", "text": "hi"}]}})
+    finally:
+        if process.poll() is None:
+            _terminate(process)
+    return process
+
+
+def test_acp_offers_only_the_allowlist(daimonos_binary, tmp_path):
+    """R1 (MAJOR) / AC-02.3: with `--tool-allowlist` active, the ACP frontend
+    offers the model EXACTLY the allowlisted tools (recorded model request),
+    not the full catalog. Before the single-source fix the ACP catalog was
+    unfiltered."""
+    allowlist = _write_allowlist(tmp_path, R3_LIST)
+    provider = _RecordingProvider()
+    try:
+        _drive_acp_prompt(daimonos_binary, tmp_path, provider, allowlist,
+                          allowed="read_file,search,ls")
+    finally:
+        provider.close()
+    assert provider.post_count >= 1, "ACP issued no model request"
+    assert provider.offered_tool_names() == set(R3_LIST), provider.offered_tool_names()
+
+
+def test_agent_print_offers_only_the_allowlist(daimonos_binary, tmp_path):
+    """R1 regression: `agent --print` (dbunk's frontend) must keep offering the
+    model exactly the allowlist after the per-frontend retain is removed in
+    favor of the single source filter."""
+    allowlist = _write_allowlist(tmp_path, R3_LIST)
+    provider = _RecordingProvider()
+    try:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent_env = _r3_agent_env(tmp_path, provider, allowed="read_file,search,ls")
+        env = _r3_env(tmp_path)
+        cmd = [daimonos_binary, "--workspace", str(workspace),
+               "--tool-allowlist", str(allowlist),
+               "agent", "--print", "--agent-env", str(agent_env), "hi"]
+        completed = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=90, env=env)
+    finally:
+        provider.close()
+    assert completed.returncode == 0, completed.stderr
+    assert provider.post_count >= 1, completed.stderr
+    assert provider.offered_tool_names() == set(R3_LIST), provider.offered_tool_names()
+
+
+def test_execute_script_description_lists_only_allowlisted_signatures(daimonos_binary, tmp_path):
+    """R2 (MAJOR) / ADR-023: under an active allowlist, the `execute_script`
+    tool DESCRIPTION's embedded Starlark signature block must list only
+    allowlisted tools. With `execute_script` and `read_file` on the list, the
+    recorded `execute_script` description contains `def read_file(` but not
+    `def write_file(` (an unlisted tool)."""
+    names = ["read_file", "search", "execute_script"]
+    allowlist = _write_allowlist(tmp_path, names)
+    provider = _RecordingProvider()
+    try:
+        _drive_acp_prompt(daimonos_binary, tmp_path, provider, allowlist,
+                          allowed="read_file,search")
+    finally:
+        provider.close()
+    assert provider.post_count >= 1, "ACP issued no model request"
+    desc = provider.offered_description("execute_script")
+    assert desc is not None, provider.offered_tool_names()
+    assert "def read_file(" in desc, desc
+    assert "def write_file(" not in desc, desc
+    assert "def exec(" not in desc, desc

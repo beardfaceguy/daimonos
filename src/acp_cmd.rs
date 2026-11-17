@@ -1679,8 +1679,11 @@ fn build_agent_config(
     // naturally opt-in: a single-entry chain has no successor to advance to.
     failover_models: Vec<String>,
     confined: bool,
+    // FR-02 (WP06, ADR-023) R1: filter the ACP catalog by the explicit
+    // allowlist at the single source; unrestricted => legacy behavior.
+    policy: &crate::run_policy::ToolPolicy,
 ) -> AgentConfig {
-    let tools = agent_tools(workspace, descriptions, &bridge, confined);
+    let tools = agent_tools(workspace, descriptions, &bridge, confined, policy);
     let diff_stash: DiffStash = Arc::new(StdMutex::new(HashMap::new()));
     AgentConfig {
         system: Some(system_prompt),
@@ -1759,9 +1762,12 @@ fn agent_tools(
     descriptions: &crate::tool_descriptions::ToolDescriptions,
     bridge: &McpBridge,
     confined: bool,
+    // FR-02 (WP06, ADR-023) R1: the ACP session offers the model only
+    // allowlisted tools (filtered at the single source); unrestricted => legacy.
+    policy: &crate::run_policy::ToolPolicy,
 ) -> Vec<ToolSchema> {
     let mut tools: Vec<ToolSchema> =
-        tool_facade::active_schemas_for_policy(workspace, descriptions, confined)
+        tool_facade::active_schemas_for_policy(workspace, descriptions, confined, policy)
             .into_iter()
             .map(|s| ToolSchema {
                 name: s.name,
@@ -1769,7 +1775,15 @@ fn agent_tools(
                 input_schema: s.input_schema,
             })
             .collect();
-    tools.extend(bridge.tools().iter().cloned());
+    // FR-02 R1: forwarded remote tools obey the same allowlist (listing ==
+    // dispatchable set); a no-op with no explicit list.
+    tools.extend(
+        bridge
+            .tools()
+            .iter()
+            .filter(|t| policy.allows(&t.name))
+            .cloned(),
+    );
     tools
 }
 
@@ -2489,6 +2503,9 @@ async fn build_session_handle(
             &session_workspace,
             descriptions,
             cfg.filesystem_authority.is_some(),
+            // Collision detection against forwarded MCP names needs the FULL
+            // native catalog, independent of any --tool-allowlist.
+            &crate::run_policy::ToolPolicy::unrestricted(),
         )
         .into_iter()
         .map(|s| s.name)
@@ -2549,6 +2566,7 @@ async fn build_session_handle(
         Arc::clone(&bridge_slot),
         state.models.clone(),
         cfg.filesystem_authority.is_some(),
+        &crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref()),
     );
     let acp_session_key = session_id.to_string();
     let tool_session = build_acp_tool_session(
@@ -2691,6 +2709,9 @@ async fn refresh_live_mcp_bridge(
             &handle.core.cwd,
             descriptions,
             cfg.filesystem_authority.is_some(),
+            // Collision detection needs the FULL native catalog, independent of
+            // any --tool-allowlist.
+            &crate::run_policy::ToolPolicy::unrestricted(),
         )
         .into_iter()
         .map(|schema| schema.name)
@@ -2711,6 +2732,8 @@ async fn refresh_live_mcp_bridge(
         descriptions,
         &new_bridge,
         cfg.filesystem_authority.is_some(),
+        // FR-02 R1: re-filter the live-refreshed catalog by the allowlist.
+        &crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref()),
     ));
     let old_bridge = {
         let mut bridge = handle.bridge.write().await;
