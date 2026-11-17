@@ -667,10 +667,14 @@ async fn main() -> anyhow::Result<()> {
         // `mcp__{worker}__{tool}` scheme. Those names are not in the native
         // catalog and are only known after worker discovery (which happens in
         // the agent loop builder, not here). Accept worker-namespaced entries
-        // at startup; a name that no worker actually serves is still refused at
-        // the dispatch boundary (WorkerExecutor returns NoRoute -> the reviewed
-        // tool_not_allowed code), so the allowlist stays fail-closed for
-        // native names while remaining usable for caller-supplied worker tools.
+        // at startup; after discovery `agent_cmd::run_agent` (r4, D38) validates
+        // EVERY allowlist entry against the frozen catalog of the run (the
+        // discovered worker tools, plus the final-answer tool when
+        // `--final-output` is set) and ends the run at startup (exit 2,
+        // `tool_allowlist_unknown_entry`, naming the entry) before the first
+        // model request if any entry — a worker-scoped name no worker serves, OR
+        // a native name such as `read_file` that dispatches to nothing in worker
+        // mode — names no tool of the run. The allowlist stays fail-closed.
         let mut worker_mode = false;
         // R7 (ADR-023 effective catalog): config-registered custom local tools
         // are dispatchable names too, so an allowlist that names one must not

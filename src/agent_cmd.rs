@@ -199,7 +199,12 @@ pub async fn run_agent(
     } else {
         None
     };
-    let mut tools: Vec<ToolSchema> = if let Some(executor) = &worker_executor {
+    // WP10 r4 (L1, ADR-028): the FULL worker-discovered catalog, before the
+    // allowlist policy narrows it. The allowlist is validated against this
+    // frozen set (below), and the model-facing catalog is this set filtered by
+    // the policy at a single point, so no frontend offers a tool the allowlist
+    // does not name (the WP06 MAJOR defect class).
+    let worker_catalog: Vec<ToolSchema> = if let Some(executor) = &worker_executor {
         executor.tools()
     } else {
         schemas
@@ -211,20 +216,29 @@ pub async fn run_agent(
             })
             .collect()
     };
-    // WP10 (R3, FR-02 req5/req7): after worker discovery and BEFORE the catalog
-    // freeze and the first model request, every worker-scoped (`mcp__…`)
-    // allowlist entry must be served by the frozen catalog. A worker-namespaced
-    // name that no worker serves fails the run at startup (exit 2, naming the
-    // entry) rather than being silently refused later at dispatch. Native and
-    // final-answer names were already validated at parse (main.rs).
+    // WP10 r4 (L2, integrator decision D38): after worker discovery and BEFORE
+    // the catalog freeze and the first model request, EVERY allowlist entry
+    // must name a tool of the frozen catalog of this run — the worker-discovered
+    // tools, plus the final-answer tool when `--final-output` is set. In worker
+    // mode a native name such as `read_file` names no tool of the run and must
+    // end the run at startup (exit 2, naming the entry), not be silently
+    // dropped from the offered catalog and left to look empty. (Before r4 only
+    // `mcp__…` entries were checked here; native names passed at parse because
+    // they are in the native catalog, but they dispatch to nothing in worker
+    // mode.)
     if let Some(executor) = &worker_executor {
         if let Some(allowlist) = &cfg.tool_allowlist {
-            let exported: std::collections::HashSet<&str> =
-                tools.iter().map(|tool| tool.name.as_str()).collect();
-            if let Some(unknown) = allowlist.iter().find(|name| {
-                name.starts_with(crate::mcp_bridge::REMOTE_TOOL_PREFIX)
-                    && !exported.contains(name.as_str())
-            }) {
+            let mut frozen: std::collections::HashSet<&str> = worker_catalog
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            if let Some(spec) = &args.final_output {
+                frozen.insert(spec.tool_name());
+            }
+            if let Some(unknown) = allowlist
+                .iter()
+                .find(|name| !frozen.contains(name.as_str()))
+            {
                 // Reap the already-connected workers before failing closed.
                 executor.shutdown().await;
                 // D33/K1 (ADR-026): this refusal is decided only AFTER a side
@@ -235,7 +249,7 @@ pub async fn run_agent(
                 // (`run_configuration_invalid`, exit 2) before the process exits
                 // with the same code (`exit_on_config_invalid`).
                 let message =
-                    format!("--tool-allowlist entry '{unknown}' is served by no configured worker");
+                    format!("--tool-allowlist entry '{unknown}' names no tool of the worker run");
                 return Ok(AgentResult {
                     messages: Vec::new(),
                     usage: Default::default(),
@@ -253,6 +267,19 @@ pub async fn run_agent(
             }
         }
     }
+    // WP10 r4 (L1): the model-facing worker catalog is the discovered set
+    // filtered by the allowlist policy at this single point. With no explicit
+    // allowlist `policy.allows` is always true (the full worker catalog, the
+    // unchanged default). In non-worker mode `schemas` was already filtered at
+    // its single source (`active_schemas_for_policy`), so pass it through.
+    let mut tools: Vec<ToolSchema> = if worker_executor.is_some() {
+        worker_catalog
+            .into_iter()
+            .filter(|t| policy.allows(&t.name))
+            .collect()
+    } else {
+        worker_catalog
+    };
     // Outbound MCP servers (#1289): one-shot agent mode reads the Claude-style
     // file named by `[agent.mcp]`. Disabled under worker-only mode, where tool
     // servers come exclusively from the explicit `--worker-config`.

@@ -215,6 +215,11 @@ class _MockChat:
     def __init__(self, turns):
         self._turns = list(turns)
         self._index = 0
+        # WP10 r4 (L1): keep every model request body so a test can assert the
+        # exact tool catalog offered to the model (the WP06 MAJOR defect class:
+        # a frontend offering a tool the allowlist does not name). The server
+        # runs in THIS test process, so the list is readable after the run.
+        self.requests = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -236,7 +241,11 @@ class _MockChat:
                 self.wfile.write(payload)
 
             def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                _raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                try:
+                    owner.requests.append(json.loads(_raw) if _raw else {})
+                except (ValueError, TypeError):
+                    owner.requests.append({})
                 index = min(owner._index, len(owner._turns) - 1)
                 owner._index += 1
                 t = owner._turns[index]
@@ -280,9 +289,14 @@ class _MockChat:
         self.thread.join(timeout=3)
 
 
+def _offered_tool_names(body):
+    """Tool names a Chat Completions request offered the model (WP10 r4 L1)."""
+    return [t.get("function", {}).get("name") for t in body.get("tools", [])]
+
+
 def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
          audit_path=None, read_only=False, task="do the work",
-         final_output=None, extra_config="", port_file=None):
+         final_output=None, extra_config="", port_file=None, offers_out=None):
     mock = _MockChat(turns)
     try:
         if port_file is not None:
@@ -334,6 +348,9 @@ def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
                    DAIMONOS_AGENT_API_KEY=CREDENTIAL, SECRET_TOKEN=CREDENTIAL)
         completed = subprocess.run(argv, capture_output=True, text=True,
                                    timeout=120, env=env)
+        if offers_out is not None:
+            for body in mock.requests:
+                offers_out.append(_offered_tool_names(body))
         return completed
     finally:
         mock.close()
@@ -822,3 +839,93 @@ def test_k3_worker_init_failure_records_matching_run_end(daimonos_binary, tmp_pa
     assert len(run_end) == 1, events
     assert run_end[0].get("status") == "worker_unavailable", run_end
     assert run_end[0].get("exit_code") == 22, run_end
+
+
+# --- r4 L1/L2: the offered catalog passes the policy filter; the allowlist is
+#     validated against the frozen catalog of the run ---------------------------
+
+
+def test_r4_offered_catalog_equals_allowlist(daimonos_binary, tmp_path):
+    # L1 (WP06 MAJOR class): the worker serves two tools; the allowlist names
+    # one. Every recorded model request must offer EXACTLY the allowlist, never
+    # a tool the allowlist does not name.
+    config, _, _ = _write_worker(tmp_path)
+    offers = []
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config,
+                     allowlist=["mcp__toolside__read_note"], offers_out=offers)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert offers, "no model request was recorded"
+    for offered in offers:
+        assert set(offered) == {"mcp__toolside__read_note"}, offered
+
+
+def test_r4_offered_catalog_without_allowlist_is_every_worker_tool(
+        daimonos_binary, tmp_path):
+    # L1 unchanged leg: with no explicit allowlist the offered catalog is every
+    # worker-discovered tool (the policy admits all names).
+    config, _, _ = _write_worker(tmp_path)
+    offers = []
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config, offers_out=offers)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert offers, "no model request was recorded"
+    for offered in offers:
+        assert set(offered) == {"mcp__toolside__read_note",
+                                "mcp__toolside__crash"}, offered
+
+
+def test_r4_offered_catalog_with_final_output_equals_list(daimonos_binary, tmp_path):
+    # L1 with --final-output: the offered catalog equals the allowlist, which
+    # includes the final-answer tool (required on the list) and the one named
+    # worker tool, but NOT the unlisted worker tool.
+    config, _, _ = _write_worker(tmp_path)
+    control = _write_final_control(tmp_path)
+    final = {"id": "f1", "name": "final_answer", "args": {"answer": "42"}}
+    offers = []
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [final]}],
+                     worker_config=config, final_output=control,
+                     allowlist=["final_answer", "mcp__toolside__read_note"],
+                     offers_out=offers)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert offers, "no model request was recorded"
+    for offered in offers:
+        assert set(offered) == {"final_answer", "mcp__toolside__read_note"}, offered
+
+
+def test_r4_native_allowlist_name_in_worker_mode_fails_at_startup(
+        daimonos_binary, tmp_path):
+    # L2 (integrator decision D38): after worker discovery every allowlist entry
+    # must name a tool of the FROZEN catalog of the run (the worker tools, plus
+    # the final-answer tool when --final-output is set). In worker mode a native
+    # name such as `read_file` names no tool of the run. It must end the run with
+    # exit 2 via the typed verdict (run_configuration_invalid,
+    # tool_allowlist_unknown_entry, naming the entry), with run_end 2 when
+    # --audit-path is set, BEFORE the first model request.
+    config, _, _ = _write_worker(tmp_path)
+    audit = tmp_path / "state" / "audit.jsonl"
+    offers = []
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
+                     worker_config=config, audit_path=audit,
+                     allowlist=["read_file"], offers_out=offers)
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "run_configuration_invalid" in completed.stderr
+    assert "tool_allowlist_unknown_entry" in completed.stderr
+    assert "read_file" in completed.stderr
+    # Before the first model request: no request was ever recorded.
+    assert offers == [], offers
+    events = [json.loads(line) for line in audit.read_text().splitlines()
+              if line.strip()]
+    run_end = [e for e in events if e.get("kind") == "run_end"]
+    assert len(run_end) == 1, events
+    assert run_end[0].get("status") == "run_configuration_invalid", run_end
+    assert run_end[0].get("exit_code") == 2, run_end
+
+
+def test_r4_native_allowlist_name_without_worker_is_unchanged(
+        daimonos_binary, tmp_path):
+    # D38 is worker-mode only: without --worker-config a native allowlist name
+    # (read_file) names a dispatchable tool and the run proceeds unchanged.
+    completed = _run(daimonos_binary, tmp_path, [DONE], allowlist=["read_file"])
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "done" in completed.stdout
