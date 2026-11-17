@@ -63,6 +63,12 @@ pub enum SchemaContractError {
     /// cannot resolve inside the document (integrator decision D41, fail
     /// closed). Refused without any fetch; the detail names the reference.
     UnresolvableReference { tool: String, detail: String },
+    /// Two schema positions declare the same resource identifier (`$id`
+    /// resolving to one URI) or the same anchor (`$anchor`/`$dynamicAnchor`
+    /// under one base URI) at different locations. The static index refuses to
+    /// replace an entry (integrator decision D46 rule 2): a reference would be
+    /// ambiguous, so the document is unusable. The detail names the duplicate.
+    DuplicateIdentifier { tool: String, detail: String },
     /// Two tools define a `$defs`/`definitions` entry under the same name, which
     /// would clash when a caller combines the schemas (FR-15 R3).
     DefinitionCollision {
@@ -100,6 +106,10 @@ impl std::fmt::Display for SchemaContractError {
             SchemaContractError::UnresolvableReference { tool, detail } => write!(
                 f,
                 "tool `{tool}` schema has a reference that cannot be resolved inside the document: {detail}"
+            ),
+            SchemaContractError::DuplicateIdentifier { tool, detail } => write!(
+                f,
+                "tool `{tool}` schema declares a duplicate identifier: {detail}"
             ),
             SchemaContractError::DefinitionCollision {
                 name,
@@ -280,8 +290,12 @@ struct SchemaIndex {
 
 impl SchemaIndex {
     /// Index every resource (`$id`), anchor (`$anchor`/`$dynamicAnchor`), and
-    /// node base URI in `root`.
-    fn build(root: &Value) -> SchemaIndex {
+    /// node base URI in `root`, visiting only the JSON positions that are
+    /// schemas (integrator decision D46). An identifier found in DATA
+    /// (`const`/`enum`/`default`/`examples`) is never indexed; an unknown
+    /// keyword is read conservatively (fail closed). The index never replaces
+    /// an entry: a duplicate `$id`/anchor at a second location is refused.
+    fn build(tool: &str, root: &Value) -> Result<SchemaIndex, SchemaContractError> {
         let mut idx = SchemaIndex {
             resources: std::collections::BTreeMap::new(),
             anchors: std::collections::BTreeMap::new(),
@@ -291,45 +305,241 @@ impl SchemaIndex {
         // A root without `$id` resolves document-local pointers against the
         // empty default base.
         idx.resources.insert(String::new(), String::new());
-        idx.walk(root, String::new(), String::new());
-        idx
+        // The document root is always a schema position.
+        idx.index_schema(tool, root, String::new(), String::new())?;
+        Ok(idx)
     }
 
-    fn walk(&mut self, node: &Value, base: String, pointer: String) {
+    /// Record one resource `$id`, refusing a second `$id` that resolves to a
+    /// URI already claimed at a different location (D46 rule 2, never replace).
+    fn insert_resource(
+        &mut self,
+        tool: &str,
+        uri: String,
+        pointer: String,
+    ) -> Result<(), SchemaContractError> {
+        if let Some(existing) = self.resources.get(&uri) {
+            if existing != &pointer {
+                return Err(SchemaContractError::DuplicateIdentifier {
+                    tool: tool.to_string(),
+                    detail: format!("`$id` `{uri}` is declared at both #{existing} and #{pointer}"),
+                });
+            }
+        }
+        self.resources.insert(uri, pointer);
+        Ok(())
+    }
+
+    /// Record one `$anchor`, refusing a second anchor with the same base URI
+    /// and name at a different location (D46 rule 2, never replace).
+    fn insert_anchor(
+        &mut self,
+        tool: &str,
+        base: String,
+        name: String,
+        pointer: String,
+    ) -> Result<(), SchemaContractError> {
+        let key = (base, name);
+        if let Some(existing) = self.anchors.get(&key) {
+            if existing != &pointer {
+                return Err(SchemaContractError::DuplicateIdentifier {
+                    tool: tool.to_string(),
+                    detail: format!(
+                        "anchor `{}` under base `{}` is declared at both #{existing} and #{pointer}",
+                        key.1, key.0
+                    ),
+                });
+            }
+        }
+        self.anchors.insert(key, pointer);
+        Ok(())
+    }
+
+    /// Record one `$dynamicAnchor`, refusing a duplicate (D46 rule 2). It also
+    /// answers a lexical plain-name `$ref` (fallback into `anchors`, a
+    /// convenience index that is not re-checked for duplication here).
+    fn insert_dynamic_anchor(
+        &mut self,
+        tool: &str,
+        base: String,
+        name: String,
+        pointer: String,
+    ) -> Result<(), SchemaContractError> {
+        let key = (base, name);
+        if let Some(existing) = self.dynamic_anchors.get(&key) {
+            if existing != &pointer {
+                return Err(SchemaContractError::DuplicateIdentifier {
+                    tool: tool.to_string(),
+                    detail: format!(
+                        "dynamic anchor `{}` under base `{}` is declared at both #{existing} and #{pointer}",
+                        key.1, key.0
+                    ),
+                });
+            }
+        }
+        self.dynamic_anchors.insert(key.clone(), pointer.clone());
+        self.anchors.entry(key).or_insert(pointer);
+        Ok(())
+    }
+
+    /// Index the identifiers a schema object declares (`$id`/`$anchor`/
+    /// `$dynamicAnchor`) and record its node base URI; return the base URI in
+    /// force inside it.
+    fn index_identifiers(
+        &mut self,
+        tool: &str,
+        map: &serde_json::Map<String, Value>,
+        base: String,
+        pointer: &str,
+    ) -> Result<String, SchemaContractError> {
+        let mut cur_base = base;
+        if let Some(Value::String(id)) = map.get("$id") {
+            let (id_nofrag, _) = split_fragment(id);
+            cur_base = resolve_uri(&cur_base, id_nofrag);
+            self.insert_resource(tool, cur_base.clone(), pointer.to_string())?;
+        }
+        self.node_base.insert(pointer.to_string(), cur_base.clone());
+        if let Some(Value::String(a)) = map.get("$anchor") {
+            self.insert_anchor(tool, cur_base.clone(), a.clone(), pointer.to_string())?;
+        }
+        if let Some(Value::String(d)) = map.get("$dynamicAnchor") {
+            self.insert_dynamic_anchor(tool, cur_base.clone(), d.clone(), pointer.to_string())?;
+        }
+        Ok(cur_base)
+    }
+
+    /// Index a SCHEMA position (D46 typed traversal). Only schema children are
+    /// descended as schemas; data keywords are skipped; unknown keywords are
+    /// read conservatively.
+    fn index_schema(
+        &mut self,
+        tool: &str,
+        node: &Value,
+        base: String,
+        pointer: String,
+    ) -> Result<(), SchemaContractError> {
+        let Value::Object(map) = node else {
+            return Ok(());
+        };
+        let cur_base = self.index_identifiers(tool, map, base, &pointer)?;
+        for (key, value) in map {
+            let child = format!("{pointer}/{}", escape_token(key));
+            match classify_keyword(key) {
+                KeywordKind::Reference | KeywordKind::Data => {}
+                KeywordKind::Schema => self.index_schema(tool, value, cur_base.clone(), child)?,
+                KeywordKind::SchemaArray => {
+                    self.index_schema_array(tool, value, cur_base.clone(), &child)?
+                }
+                KeywordKind::SchemaMap => {
+                    self.index_schema_map(tool, value, cur_base.clone(), &child)?
+                }
+                KeywordKind::Items => {
+                    if value.is_array() {
+                        self.index_schema_array(tool, value, cur_base.clone(), &child)?
+                    } else {
+                        self.index_schema(tool, value, cur_base.clone(), child)?
+                    }
+                }
+                KeywordKind::Dependencies => {
+                    self.index_dependencies(tool, value, cur_base.clone(), &child)?
+                }
+                KeywordKind::Other => {
+                    self.index_conservative(tool, value, cur_base.clone(), child)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Index every element of an array-of-schemas keyword as a schema.
+    fn index_schema_array(
+        &mut self,
+        tool: &str,
+        value: &Value,
+        base: String,
+        pointer: &str,
+    ) -> Result<(), SchemaContractError> {
+        if let Value::Array(items) = value {
+            for (i, item) in items.iter().enumerate() {
+                self.index_schema(tool, item, base.clone(), format!("{pointer}/{i}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Index every value of a map-from-names-to-schemas keyword as a schema.
+    /// Each key is a NAME, never a keyword.
+    fn index_schema_map(
+        &mut self,
+        tool: &str,
+        value: &Value,
+        base: String,
+        pointer: &str,
+    ) -> Result<(), SchemaContractError> {
+        if let Value::Object(entries) = value {
+            for (name, sub) in entries {
+                self.index_schema(
+                    tool,
+                    sub,
+                    base.clone(),
+                    format!("{pointer}/{}", escape_token(name)),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Index the legacy `dependencies` keyword: each value is a subschema OR an
+    /// array of required-property names (not a schema).
+    fn index_dependencies(
+        &mut self,
+        tool: &str,
+        value: &Value,
+        base: String,
+        pointer: &str,
+    ) -> Result<(), SchemaContractError> {
+        if let Value::Object(entries) = value {
+            for (name, sub) in entries {
+                if sub.is_object() {
+                    self.index_schema(
+                        tool,
+                        sub,
+                        base.clone(),
+                        format!("{pointer}/{}", escape_token(name)),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Conservative index walk of a value under an UNKNOWN keyword (fail closed,
+    /// D46): descend into every key/element and still record any `$id`/anchor
+    /// found, so an identifier hidden under a keyword the check does not model
+    /// is never silently ignored.
+    fn index_conservative(
+        &mut self,
+        tool: &str,
+        node: &Value,
+        base: String,
+        pointer: String,
+    ) -> Result<(), SchemaContractError> {
         match node {
             Value::Object(map) => {
-                let mut cur_base = base;
-                if let Some(Value::String(id)) = map.get("$id") {
-                    let (id_nofrag, _) = split_fragment(id);
-                    cur_base = resolve_uri(&cur_base, id_nofrag);
-                    self.resources.insert(cur_base.clone(), pointer.clone());
-                }
-                self.node_base.insert(pointer.clone(), cur_base.clone());
-                if let Some(Value::String(a)) = map.get("$anchor") {
-                    self.anchors
-                        .insert((cur_base.clone(), a.clone()), pointer.clone());
-                }
-                if let Some(Value::String(d)) = map.get("$dynamicAnchor") {
-                    self.dynamic_anchors
-                        .insert((cur_base.clone(), d.clone()), pointer.clone());
-                    // A `$dynamicAnchor` also answers a lexical plain-name `$ref`.
-                    self.anchors
-                        .entry((cur_base.clone(), d.clone()))
-                        .or_insert_with(|| pointer.clone());
-                }
+                let cur_base = self.index_identifiers(tool, map, base, &pointer)?;
                 for (key, value) in map {
                     let child = format!("{pointer}/{}", escape_token(key));
-                    self.walk(value, cur_base.clone(), child);
+                    self.index_conservative(tool, value, cur_base.clone(), child)?;
                 }
             }
             Value::Array(items) => {
                 for (i, item) in items.iter().enumerate() {
-                    let child = format!("{pointer}/{i}");
-                    self.walk(item, base.clone(), child);
+                    self.index_conservative(tool, item, base.clone(), format!("{pointer}/{i}"))?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Resolve one reference found at `pointer` to a canonical target pointer
@@ -617,106 +827,234 @@ fn compose_uri(
 /// through it is cached so a shared (diamond) definition is visited once,
 /// keeping a DAG linear.
 fn detect_recursion(tool: &str, root: &Value) -> Result<(), SchemaContractError> {
-    let index = SchemaIndex::build(root);
-    let mut on_path: BTreeSet<String> = BTreeSet::new();
-    let mut acyclic: BTreeSet<String> = BTreeSet::new();
-    let mut steps: usize = 0;
-    expand(
+    let index = SchemaIndex::build(tool, root)?;
+    let mut search = CycleSearch {
         tool,
-        &index,
+        index: &index,
         root,
-        root,
-        "",
-        &mut on_path,
-        &mut acyclic,
-        &mut steps,
-    )
+        on_path: BTreeSet::new(),
+        acyclic: BTreeSet::new(),
+        steps: 0,
+    };
+    // The document root is a schema position (D46 typed traversal).
+    search.schema(root, "")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn expand(
-    tool: &str,
-    index: &SchemaIndex,
-    root: &Value,
-    node: &Value,
-    pointer: &str,
-    on_path: &mut BTreeSet<String>,
-    acyclic: &mut BTreeSet<String>,
-    steps: &mut usize,
-) -> Result<(), SchemaContractError> {
-    *steps += 1;
-    if *steps > MAX_ANALYSIS_STEPS {
-        return Err(SchemaContractError::Invalid {
-            tool: tool.to_string(),
-            detail: "schema is too large to analyze statically".to_string(),
-        });
+/// How a keyword's value is traversed inside a schema object (JSON Schema
+/// 2020-12), per integrator decision D46 rule 1. A reference keyword has a
+/// meaning only in a schema position; a data keyword is never followed; an
+/// unknown keyword is read conservatively (fail closed). This classification is
+/// written from the 2020-12 keyword vocabulary (core, applicator, unevaluated,
+/// and the legacy `definitions`/`dependencies`/`additionalItems` forms).
+enum KeywordKind {
+    /// `$ref` / `$dynamicRef`: a reference edge.
+    Reference,
+    /// `const` / `enum` / `default` / `examples`: DATA, never a schema.
+    Data,
+    /// Value is a single subschema.
+    Schema,
+    /// Value is an array of subschemas.
+    SchemaArray,
+    /// Value is a map from names to subschemas.
+    SchemaMap,
+    /// `items`: an array value is an array of subschemas; otherwise a single
+    /// subschema.
+    Items,
+    /// `dependencies`: a map from names to (subschema | array of names).
+    Dependencies,
+    /// Any other keyword: read conservatively (fail closed).
+    Other,
+}
+
+/// Classify one object key as a 2020-12 schema keyword (D46 rule 1). Only used
+/// when the key is a KEYWORD (a direct child of a schema object); inside a
+/// name->schema map each key is a NAME and is never classified.
+fn classify_keyword(key: &str) -> KeywordKind {
+    match key {
+        "$ref" | "$dynamicRef" => KeywordKind::Reference,
+        "const" | "enum" | "default" | "examples" => KeywordKind::Data,
+        "not"
+        | "if"
+        | "then"
+        | "else"
+        | "contains"
+        | "additionalProperties"
+        | "propertyNames"
+        | "unevaluatedItems"
+        | "unevaluatedProperties"
+        | "contentSchema"
+        | "additionalItems" => KeywordKind::Schema,
+        "allOf" | "anyOf" | "oneOf" | "prefixItems" => KeywordKind::SchemaArray,
+        "items" => KeywordKind::Items,
+        "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
+            KeywordKind::SchemaMap
+        }
+        "dependencies" => KeywordKind::Dependencies,
+        _ => KeywordKind::Other,
     }
-    match node {
-        Value::Object(map) => {
-            // Reference edges at this node: a static `$ref` and a `$dynamicRef`
-            // (treated as an edge to its `$dynamicAnchor`, T1.3).
-            let mut edges: Vec<(&str, bool)> = Vec::new();
-            if let Some(Value::String(reference)) = map.get("$ref") {
-                edges.push((reference, false));
-            }
-            if let Some(Value::String(reference)) = map.get("$dynamicRef") {
-                edges.push((reference, true));
-            }
-            for (reference, dynamic) in edges {
-                match index.resolve(root, pointer, reference, dynamic) {
-                    RefEdge::To(target) => {
-                        if on_path.contains(&target) {
-                            return Err(SchemaContractError::Recursive {
-                                tool: tool.to_string(),
-                                pointer: format!("#{target}"),
-                            });
-                        }
-                        if !acyclic.contains(&target) {
-                            if let Some(target_node) = root.pointer(&target) {
-                                on_path.insert(target.clone());
-                                expand(
-                                    tool,
-                                    index,
-                                    root,
-                                    target_node,
-                                    &target,
-                                    on_path,
-                                    acyclic,
-                                    steps,
-                                )?;
-                                on_path.remove(&target);
-                                acyclic.insert(target);
-                            }
-                        }
-                    }
-                    // Fail closed (integrator D41): a reference the WP05
-                    // validator accepted that we cannot resolve inside the
-                    // document is refused, named, and never fetched.
-                    RefEdge::Unresolvable(detail) => {
-                        return Err(SchemaContractError::UnresolvableReference {
-                            tool: tool.to_string(),
-                            detail,
+}
+
+/// Depth-first cycle search over one document's reference graph (ADR-030),
+/// carrying the active reference path and a cache of fully-explored acyclic
+/// targets so a shared (diamond) definition is visited once. The structural
+/// descent is typed (D46): only schema positions are followed as schemas, data
+/// keywords are skipped, and an unknown keyword is walked conservatively.
+struct CycleSearch<'a> {
+    tool: &'a str,
+    index: &'a SchemaIndex,
+    root: &'a Value,
+    /// Reference targets currently on the active path (a hop back to one is a
+    /// cycle).
+    on_path: BTreeSet<String>,
+    /// Targets fully explored with no cycle through them (diamond cache).
+    acyclic: BTreeSet<String>,
+    /// Static-analysis step budget guard.
+    steps: usize,
+}
+
+impl<'a> CycleSearch<'a> {
+    fn bump(&mut self) -> Result<(), SchemaContractError> {
+        self.steps += 1;
+        if self.steps > MAX_ANALYSIS_STEPS {
+            return Err(SchemaContractError::Invalid {
+                tool: self.tool.to_string(),
+                detail: "schema is too large to analyze statically".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Follow the `$ref`/`$dynamicRef` edges at one object node, detecting a
+    /// cycle and recursing into each (schema) target.
+    fn follow_edges(
+        &mut self,
+        map: &serde_json::Map<String, Value>,
+        pointer: &str,
+    ) -> Result<(), SchemaContractError> {
+        let mut edges: Vec<(String, bool)> = Vec::new();
+        if let Some(Value::String(reference)) = map.get("$ref") {
+            edges.push((reference.clone(), false));
+        }
+        if let Some(Value::String(reference)) = map.get("$dynamicRef") {
+            edges.push((reference.clone(), true));
+        }
+        for (reference, dynamic) in edges {
+            match self.index.resolve(self.root, pointer, &reference, dynamic) {
+                RefEdge::To(target) => {
+                    if self.on_path.contains(&target) {
+                        return Err(SchemaContractError::Recursive {
+                            tool: self.tool.to_string(),
+                            pointer: format!("#{target}"),
                         });
                     }
+                    if !self.acyclic.contains(&target) {
+                        if let Some(target_node) = self.root.pointer(&target) {
+                            self.on_path.insert(target.clone());
+                            // A reference target is always a schema position.
+                            self.schema(target_node, &target)?;
+                            self.on_path.remove(&target);
+                            self.acyclic.insert(target);
+                        }
+                    }
+                }
+                // Fail closed (integrator D41): a reference the WP05 validator
+                // accepted that we cannot resolve inside the document is
+                // refused, named, and never fetched.
+                RefEdge::Unresolvable(detail) => {
+                    return Err(SchemaContractError::UnresolvableReference {
+                        tool: self.tool.to_string(),
+                        detail,
+                    });
                 }
             }
-            for (key, value) in map {
-                if key == "$ref" || key == "$dynamicRef" {
-                    continue;
-                }
-                let child = format!("{pointer}/{}", escape_token(key));
-                expand(tool, index, root, value, &child, on_path, acyclic, steps)?;
-            }
-            Ok(())
         }
-        Value::Array(items) => {
+        Ok(())
+    }
+
+    /// Search a SCHEMA position (D46 typed traversal).
+    fn schema(&mut self, node: &Value, pointer: &str) -> Result<(), SchemaContractError> {
+        self.bump()?;
+        let Value::Object(map) = node else {
+            return Ok(());
+        };
+        self.follow_edges(map, pointer)?;
+        for (key, value) in map {
+            let child = format!("{pointer}/{}", escape_token(key));
+            match classify_keyword(key) {
+                KeywordKind::Reference | KeywordKind::Data => {}
+                KeywordKind::Schema => self.schema(value, &child)?,
+                KeywordKind::SchemaArray => self.schema_array(value, &child)?,
+                KeywordKind::SchemaMap => self.schema_map(value, &child)?,
+                KeywordKind::Items => {
+                    if value.is_array() {
+                        self.schema_array(value, &child)?
+                    } else {
+                        self.schema(value, &child)?
+                    }
+                }
+                KeywordKind::Dependencies => self.dependencies(value, &child)?,
+                KeywordKind::Other => self.conservative(value, &child)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Search every element of an array-of-schemas keyword as a schema.
+    fn schema_array(&mut self, value: &Value, pointer: &str) -> Result<(), SchemaContractError> {
+        if let Value::Array(items) = value {
             for (i, item) in items.iter().enumerate() {
-                let child = format!("{pointer}/{i}");
-                expand(tool, index, root, item, &child, on_path, acyclic, steps)?;
+                self.schema(item, &format!("{pointer}/{i}"))?;
             }
-            Ok(())
         }
-        _ => Ok(()),
+        Ok(())
+    }
+
+    /// Search every value of a map-from-names-to-schemas keyword as a schema.
+    fn schema_map(&mut self, value: &Value, pointer: &str) -> Result<(), SchemaContractError> {
+        if let Value::Object(entries) = value {
+            for (name, sub) in entries {
+                self.schema(sub, &format!("{pointer}/{}", escape_token(name)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Search the legacy `dependencies` keyword: only its subschema values.
+    fn dependencies(&mut self, value: &Value, pointer: &str) -> Result<(), SchemaContractError> {
+        if let Value::Object(entries) = value {
+            for (name, sub) in entries {
+                if sub.is_object() {
+                    self.schema(sub, &format!("{pointer}/{}", escape_token(name)))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Conservative search of a value under an UNKNOWN keyword (fail closed,
+    /// D46): descend every key/element and still follow any `$ref`/`$dynamicRef`
+    /// found, so a cycle hidden under a keyword the check does not model is
+    /// still refused.
+    fn conservative(&mut self, node: &Value, pointer: &str) -> Result<(), SchemaContractError> {
+        self.bump()?;
+        match node {
+            Value::Object(map) => {
+                self.follow_edges(map, pointer)?;
+                for (key, value) in map {
+                    if key == "$ref" || key == "$dynamicRef" {
+                        continue;
+                    }
+                    self.conservative(value, &format!("{pointer}/{}", escape_token(key)))?;
+                }
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    self.conservative(item, &format!("{pointer}/{i}"))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -1041,24 +1379,23 @@ mod tests {
 
     #[test]
     fn fail_closed_refuses_reference_it_cannot_resolve_in_document() {
-        // T2 / integrator decision D41 (fail closed): the WP05 validator accepts
-        // this schema — the `$ref`-shaped object is the *data* value of a
-        // `const` keyword, not a reference — but the recursion detector walks
-        // the document structurally and meets a `#/...` it cannot resolve in
-        // the document. Rather than guess or fetch, full-schema mode refuses it
-        // as `schema_unusable` and names the reference. (This is a deliberate
-        // over-approximation in the safe direction; see issues-wp17.md.)
+        // T2 / integrator decision D41 (fail closed), as amended by D46: a
+        // reference keyword has meaning only in a SCHEMA position. The detector
+        // no longer treats a `$ref`-shaped object that is the DATA of a `const`
+        // / `enum` / `default` / `examples` keyword as a reference (defect A).
+        // The fail-closed branch still guards a reference in a real schema
+        // position that the WP05 validator accepted but that the detector
+        // cannot resolve inside the document: it is refused as `schema_unusable`
+        // and named, never fetched or guessed. Exercised at the detector seam
+        // (`detect_recursion`) because a real schema-position `$ref` that does
+        // not resolve is refused earlier by the WP05 compiler on the public
+        // path, so the detector's fail-closed branch is otherwise unobservable.
         let schema = json!({
             "type": "object",
-            "properties": {
-                "y": { "const": { "$ref": "#/does/not/exist" } }
-            }
+            "properties": { "x": { "$ref": "#/does/not/exist" } }
         });
-        // Precondition: the WP05 validator accepts it (const data is not a ref).
-        crate::schema_validation::CompiledSchema::compile(&schema)
-            .expect("WP05 validator accepts a const whose data looks like a $ref");
-        let err = ValidatedToolSchema::validate("failclosed", &schema)
-            .expect_err("an unresolvable reference must be refused, not fetched or guessed");
+        let err = detect_recursion("failclosed", &schema)
+            .expect_err("an unresolvable schema-position reference must be refused");
         assert!(
             matches!(err, SchemaContractError::UnresolvableReference { .. }),
             "{err:?}"
@@ -1163,5 +1500,284 @@ mod tests {
         ];
         ValidatedToolSchema::validate_catalog(&entries)
             .expect("supplied definition names never collide");
+    }
+
+    // -----------------------------------------------------------------------
+    // WP17 r4 (integrator decision D46): typed traversal. A reference keyword
+    // has meaning only in a SCHEMA position; `const`/`enum`/`default`/
+    // `examples` hold DATA and are never followed; an unknown keyword is read
+    // conservatively (fail closed); the index never replaces an entry.
+    // -----------------------------------------------------------------------
+
+    // V1 (defect A, false refusal fixed): a `$ref`-shaped object that is the
+    // DATA value of a known data keyword is NOT a reference and must not make
+    // the schema recursive or unresolvable.
+
+    #[test]
+    fn v1_accepts_const_holding_a_ref_shaped_object() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "y": { "const": { "$ref": "#" } } }
+        });
+        ValidatedToolSchema::validate("c", &schema)
+            .expect("const DATA that looks like a $ref is not a reference");
+    }
+
+    #[test]
+    fn v1_accepts_enum_holding_a_ref_shaped_object() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "y": { "enum": [{ "$ref": "#" }] } }
+        });
+        ValidatedToolSchema::validate("e", &schema)
+            .expect("enum DATA that looks like a $ref is not a reference");
+    }
+
+    #[test]
+    fn v1_accepts_default_holding_a_ref_shaped_object() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "y": { "type": "object", "default": { "$ref": "#" } } }
+        });
+        ValidatedToolSchema::validate("d", &schema)
+            .expect("default DATA that looks like a $ref is not a reference");
+    }
+
+    #[test]
+    fn v1_accepts_examples_holding_a_ref_shaped_object() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "y": { "type": "object", "examples": [{ "$ref": "#" }] } }
+        });
+        ValidatedToolSchema::validate("x", &schema)
+            .expect("examples DATA that looks like a $ref is not a reference");
+    }
+
+    #[test]
+    fn v1_accepts_const_holding_an_unresolvable_ref_shaped_object() {
+        // Data, so the `#/nowhere` it contains is never resolved: accepted.
+        let schema = json!({
+            "type": "object",
+            "properties": { "y": { "const": { "$ref": "#/nowhere" } } }
+        });
+        ValidatedToolSchema::validate("c", &schema)
+            .expect("an unresolvable $ref inside const DATA is not a reference");
+    }
+
+    #[test]
+    fn v1_accepts_default_holding_an_external_ref_shaped_object() {
+        // Data, so the `other.json` it contains is never treated as external.
+        let schema = json!({
+            "type": "object",
+            "properties": { "y": { "type": "object", "default": { "$ref": "other.json" } } }
+        });
+        ValidatedToolSchema::validate("d", &schema)
+            .expect("an external-looking $ref inside default DATA is not a reference");
+    }
+
+    // V2 (defect B, false accept fixed): the schema IS recursive and must be
+    // refused even though a decoy `$id`/`$anchor` sits in DATA; a genuine
+    // duplicate identifier in two schema positions is refused and named.
+
+    #[test]
+    fn v2_refuses_recursive_id_cycle_despite_decoy_default_id_data() {
+        // `$defs/n` declares `$id` X and refers to X (self-recursive). A sibling
+        // property carries `default: {"$id": X}` — DATA. The data `$id` must not
+        // be indexed and must not mask the real resource, so the X -> X cycle is
+        // still refused (before r4 the data `$id` replaced the real entry and
+        // the schema was falsely accepted).
+        let schema = json!({
+            "type": "object",
+            "properties": { "node": { "$ref": "#/$defs/n" } },
+            "$defs": {
+                "n": {
+                    "$id": "https://example.com/n",
+                    "type": "object",
+                    "properties": {
+                        "loop": { "$ref": "https://example.com/n" },
+                        "decoy": { "type": "object", "default": { "$id": "https://example.com/n" } }
+                    }
+                }
+            }
+        });
+        let err = ValidatedToolSchema::validate("idb", &schema)
+            .expect_err("a cycle through an embedded $id must be refused despite a decoy");
+        assert!(
+            matches!(err, SchemaContractError::Recursive { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn v2_refuses_recursive_anchor_cycle_despite_decoy_default_anchor_data() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "node": { "$ref": "#/$defs/n" } },
+            "$defs": {
+                "n": {
+                    "$anchor": "node",
+                    "type": "object",
+                    "properties": {
+                        "loop": { "$ref": "#node" },
+                        "decoy": { "type": "object", "default": { "$anchor": "node" } }
+                    }
+                }
+            }
+        });
+        let err = ValidatedToolSchema::validate("anb", &schema)
+            .expect_err("a cycle through an $anchor must be refused despite a decoy");
+        assert!(
+            matches!(err, SchemaContractError::Recursive { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn v2_refuses_duplicate_id_in_two_schema_positions_and_names_it() {
+        // Two real schema positions declare the same resolved `$id`: the index
+        // refuses to replace the first entry (D46 rule 2) and the detail names
+        // the duplicate. Exercised at the detector seam because the WP05
+        // compiler may already reject a duplicate `$id`; here we pin that the
+        // detector's index also refuses it and names the URI.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": { "$id": "https://example.com/dup", "type": "string" },
+                "b": { "$id": "https://example.com/dup", "type": "number" }
+            }
+        });
+        let err = detect_recursion("dup", &schema)
+            .expect_err("a duplicate $id in two schema positions must be refused");
+        assert_eq!(err.reason(), "schema_unusable");
+        assert!(
+            err.to_string().contains("https://example.com/dup"),
+            "detail must name the duplicate identifier: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_accepts_same_anchor_name_in_two_resources_with_different_ids() {
+        // The same anchor name under two DIFFERENT base URIs is two distinct
+        // anchors, not a duplicate: it still passes (keyed by base URI + name).
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": { "$id": "https://example.com/a", "$anchor": "node", "type": "string" },
+                "b": { "$id": "https://example.com/b", "$anchor": "node", "type": "number" }
+            }
+        });
+        detect_recursion("two", &schema)
+            .expect("the same anchor name in two resources is not a duplicate");
+    }
+
+    // V3 (guard, must pass before AND after r4): a recursive PROPERTY/DEFINITION
+    // whose NAME equals a data keyword is still refused (the name is a NAME in a
+    // name->schema map, never a keyword), and a cycle routed through every
+    // schema keyword of D46 rule 1 is refused.
+
+    #[test]
+    fn v3_refuses_recursive_property_named_like_a_data_keyword() {
+        for name in ["const", "enum", "default", "examples", "x-meta"] {
+            let schema = json!({
+                "type": "object",
+                "properties": { name: { "$ref": "#/$defs/n" } },
+                "$defs": {
+                    "n": { "properties": { "next": { "$ref": "#/$defs/n" } } }
+                }
+            });
+            let err = ValidatedToolSchema::validate("named", &schema).unwrap_err();
+            assert!(
+                matches!(err, SchemaContractError::Recursive { .. }),
+                "a recursive property named `{name}` must be refused: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_refuses_recursive_definition_named_like_a_data_keyword() {
+        for name in ["const", "enum", "default", "examples", "x-meta"] {
+            // A `$defs` entry NAMED like a data keyword, self-recursive.
+            let schema = json!({
+                "properties": { "start": { "$ref": format!("#/$defs/{name}") } },
+                "$defs": { name: { "properties": { "n": { "$ref": format!("#/$defs/{name}") } } } }
+            });
+            let err = ValidatedToolSchema::validate("defnamed", &schema).unwrap_err();
+            assert!(
+                matches!(err, SchemaContractError::Recursive { .. }),
+                "a recursive $defs entry named `{name}` must be refused: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_refuses_a_cycle_through_every_schema_keyword() {
+        // Table written from JSON Schema 2020-12 (core + applicator + unevaluated
+        // + legacy forms D46 rule 1 names), NOT copied from the production list.
+        // For each schema keyword, `$defs/n` references itself THROUGH that
+        // keyword; the detector must refuse the n -> n cycle.
+        //
+        // kind: 0 = single subschema, 1 = array of subschemas, 2 = map
+        // name->subschema, 3 = `dependencies` (map name->subschema | names).
+        let self_ref = json!({ "$ref": "#/$defs/n" });
+        let cases: &[(&str, u8)] = &[
+            // single subschema
+            ("not", 0),
+            ("if", 0),
+            ("then", 0),
+            ("else", 0),
+            ("items", 0),
+            ("contains", 0),
+            ("additionalProperties", 0),
+            ("propertyNames", 0),
+            ("unevaluatedItems", 0),
+            ("unevaluatedProperties", 0),
+            ("contentSchema", 0),
+            ("additionalItems", 0),
+            // array of subschemas
+            ("allOf", 1),
+            ("anyOf", 1),
+            ("oneOf", 1),
+            ("prefixItems", 1),
+            ("items", 1),
+            // map name->subschema
+            ("properties", 2),
+            ("patternProperties", 2),
+            ("$defs", 2),
+            ("definitions", 2),
+            ("dependentSchemas", 2),
+            // dependencies (schema form)
+            ("dependencies", 3),
+        ];
+        for (keyword, kind) in cases {
+            let body = match kind {
+                0 => json!({ *keyword: self_ref.clone() }),
+                1 => json!({ *keyword: [self_ref.clone()] }),
+                _ => json!({ *keyword: { "sub": self_ref.clone() } }),
+            };
+            let schema = json!({
+                "properties": { "start": { "$ref": "#/$defs/n" } },
+                "$defs": { "n": body }
+            });
+            let err = detect_recursion("kw", &schema).unwrap_err();
+            assert!(
+                matches!(err, SchemaContractError::Recursive { .. }),
+                "a cycle through `{keyword}` must be refused: {err:?}"
+            );
+        }
+    }
+
+    // V4: an unknown keyword is read conservatively (fail closed), so a
+    // reference under it keeps the schema refused.
+
+    #[test]
+    fn v4_unknown_keyword_with_a_real_ref_stays_refused() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" } },
+            "x-meta": { "$ref": "#" }
+        });
+        let err = ValidatedToolSchema::validate("xm", &schema)
+            .expect_err("a reference under an unknown keyword is read conservatively");
+        assert_eq!(err.reason(), "schema_unusable");
     }
 }

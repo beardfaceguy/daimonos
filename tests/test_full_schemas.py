@@ -718,3 +718,100 @@ def test_t3_default_accepts_recursive_supplied_schema_by_form(
         f"recursive supplied schema (via {form}) must be accepted by default, got "
         f"{completed.returncode}\nstderr={completed.stderr}")
     assert posts == 1, f"expected exactly one model request, got {posts}"
+
+
+# ---------------------------------------------------------------------------
+# WP17 r4 (integrator decision D46): typed traversal. A reference keyword has
+# meaning only in a SCHEMA position. A supplied final-answer schema whose data
+# (``const``) merely looks like a ``$ref`` is NOT recursive and is accepted and
+# offered unchanged (defect A). A schema that IS recursive through an embedded
+# ``$id`` is refused even when a decoy ``$id`` sits in data (defect B). Both are
+# driven through a real ``daimonos agent --final-output`` process on both wires.
+# ---------------------------------------------------------------------------
+
+# Defect A at the process level: a property's ``const`` holds a ``$ref``-shaped
+# object. It is DATA, not a reference, so the schema is self-contained and must
+# be accepted in full-schema mode and offered to the model unchanged.
+CONST_DATA_SUPPLIED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "marker": {"const": {"$ref": "#"}},
+    },
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+# Defect B at the process level: ``$defs/n`` declares an embedded ``$id`` and
+# refers to it (self-recursive), while a sibling property carries
+# ``default: {"$id": X}`` as DATA. The data ``$id`` must not mask the real
+# resource, so the schema is refused before any model request.
+ID_DECOY_RECURSIVE_SUPPLIED_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {"node": {"$ref": "#/$defs/n"}},
+    "$defs": {
+        "n": {
+            "$id": "https://daimonos.test/n",
+            "type": "object",
+            "properties": {
+                "loop": {"$ref": "https://daimonos.test/n"},
+                "decoy": {"type": "object", "default": {"$id": "https://daimonos.test/n"}},
+            },
+        }
+    },
+}
+
+
+@BOTH_WIRES
+def test_v5_full_mode_accepts_const_data_ref_and_offers_it_unchanged(
+    daimonos_binary, tmp_path, wire
+):
+    """V5 (defect A): a supplied final-answer schema whose ``const`` DATA looks
+    like a ``$ref`` is NOT recursive. In full-schema mode it is accepted (exit
+    0, one model request) and the final-answer tool schema in the recorded
+    request is deep-equal to the supplied schema — the data is not followed and
+    the schema is offered unchanged (ADR-030; integrator D46)."""
+    completed, posts, recorded = _run_final(
+        daimonos_binary, tmp_path, wire, CONST_DATA_SUPPLIED_SCHEMA,
+        {"answer": "42"}, full_mode=True)
+    assert completed.returncode == 0, (
+        f"const-data supplied schema must be accepted in full mode, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"
+    assert recorded == CONST_DATA_SUPPLIED_SCHEMA, (
+        f"const-data final-answer schema in the request was rewritten:\n{recorded}")
+
+
+@BOTH_WIRES
+def test_v5_full_mode_refuses_recursive_id_despite_decoy_default_data(
+    daimonos_binary, tmp_path, wire
+):
+    """V5 (defect B): a supplied final-answer schema that IS recursive through an
+    embedded ``$id`` is refused before any model request in full-schema mode —
+    exit 20, reason ``schema_unusable`` — even though a decoy ``$id`` sits in a
+    ``default`` DATA value. The endpoint receives no request (ADR-030; D46)."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, wire, ID_DECOY_RECURSIVE_SUPPLIED_SCHEMA,
+        {"node": {}}, full_mode=True)
+    assert completed.returncode == 20, (
+        f"recursive $id (with decoy data) in full mode must exit 20, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    err = _last_json_line(completed.stderr)
+    assert err.get("reason") == "schema_unusable", f"stderr={completed.stderr}"
+    assert posts == 0, f"a model request was made before refusal (posts={posts})"
+
+
+@BOTH_WIRES
+def test_v5_default_mode_accepts_recursive_id_despite_decoy(daimonos_binary, tmp_path, wire):
+    """V5 default pin: WITHOUT full-schema mode the same recursive-``$id`` schema
+    is accepted exactly as today (exit 0, one model request). WP17 changes
+    nothing outside its opt-in mode."""
+    completed, posts, _ = _run_final(
+        daimonos_binary, tmp_path, wire, ID_DECOY_RECURSIVE_SUPPLIED_SCHEMA,
+        {"node": {}}, full_mode=False)
+    assert completed.returncode == 0, (
+        f"recursive $id schema must be accepted by default, got "
+        f"{completed.returncode}\nstderr={completed.stderr}")
+    assert posts == 1, f"expected exactly one model request, got {posts}"

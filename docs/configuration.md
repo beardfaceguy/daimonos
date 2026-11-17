@@ -612,6 +612,17 @@ closed). The cross-tool definition-name clash rule applies only to
 Daimonos-owned definitions; a supplied schema is never refused for a definition
 name. Context: ADR-030.
 
+The check reads **schema positions only**. A reference keyword (`$ref`,
+`$dynamicRef`) has a meaning only in a schema; a `$ref`-shaped object that is the
+value of a data keyword (`const`, `enum`, `default`, `examples`) is data, not a
+reference, so it is not followed and such a schema is accepted and offered
+unchanged. A reference under a keyword the check does not recognize is read
+conservatively (fail closed), so a cycle hidden there is still refused. If two
+schema positions declare the same `$id` (resolving to one URI) or the same
+anchor (one base URI and name), the document is refused `schema_unusable` with
+the duplicate named: the static index never silently replaces an identifier.
+Context: ADR-030.
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,

@@ -37,6 +37,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
     inside the document is refused `schema_unusable` and named, never fetched
     (fail closed). Definition-name clash refusal applies only to Daimonos-owned
     definitions; a supplied schema is never refused for a definition name.
+  - The self-contained check reads *schema positions only*: a `$ref`-shaped
+    object that is the data of a `const`/`enum`/`default`/`examples` keyword is
+    not a reference, so it is not followed and such a schema is accepted and
+    offered unchanged; a reference under a keyword the check does not recognize
+    is read conservatively (fail closed); and two schema positions declaring the
+    same `$id` or anchor are refused as `schema_unusable` with the duplicate
+    named (the static index never silently replaces an identifier).
 - **Tool contract (FR-13).** `daimonos tool-contract` prints a deterministic,
   session-free JSON dump of the effective tool contract (contract version,
   effective options, and the effective tools with their schemas), reusing the

@@ -118,3 +118,14 @@ URI/anchor resolution and the fail-closed (D41) refusal of an unresolvable
 in-document reference are proven at the `src/schema_contract.rs` unit seam
 (decoded JSON-pointer, `$anchor`, `$dynamicRef`/`$dynamicAnchor`, and `$id`-named
 `$ref`), still with no third-party dependency.
+
+The r4 cases pin the typed-traversal fix (integrator decision D46): a supplied
+final-answer schema whose `const` *data* merely looks like a `$ref` is NOT
+recursive — it is accepted in full-schema mode and offered to the model
+unchanged — while a schema that IS recursive through an embedded `$id` is
+refused (exit 20, `schema_unusable`, zero requests) even when a decoy `$id`
+sits in a `default` data value, with the default-mode accept pins alongside.
+The keyword classification (reference vs data vs schema-position vs unknown)
+and the duplicate-`$id`/anchor refusal are proven at the
+`src/schema_contract.rs` unit seam, including a table that routes a cycle
+through every 2020-12 schema keyword.
