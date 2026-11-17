@@ -67,10 +67,17 @@ pub fn active_schemas_for_policy(
                     &|name| policy.allows(name),
                 ));
             }
+            // WP16 (FR-14): the owned path annotation is a *caller-facing* schema
+            // mark (the `tool-contract` dump, `tools/list`, `get_tool_schema`). It
+            // is deliberately NOT applied here: this catalog becomes the tool
+            // schemas sent to the model endpoint, which FR-15 requires be
+            // preserved unchanged and which may reject an unknown keyword. ADR-029
+            // scopes the mark to serving/export and does not start a model run.
+            let input_schema = descriptions.schema_with_parameters(t.name, &t.schema);
             NeutralToolSchema {
                 name: t.name.to_string(),
                 description,
-                input_schema: descriptions.schema_with_parameters(t.name, &t.schema),
+                input_schema,
             }
         })
         .collect()
@@ -174,6 +181,27 @@ mod tests {
         .expect("execute_script schema");
         assert!(schema.description.contains("def read_file("));
         assert!(!schema.description.contains("def write_file("));
+    }
+
+    /// WP16 (FR-14, I3/D28): the agent-facing catalog is the tool schemas sent
+    /// to the model endpoint, so it must NOT carry the owned `x-daimonos-path`
+    /// mark (FR-15 preserves supplied schemas; a strict endpoint may reject an
+    /// unknown keyword). The absence on the wire is proven end-to-end by the
+    /// process test `tests/test_path_annotations.py::
+    /// test_model_request_omits_owned_path_annotation` on both wires; the mark
+    /// lives only in the served/exported catalog (`tool-contract` dump,
+    /// `tools/list`, `get_tool_schema`).
+    #[test]
+    fn active_schemas_do_not_carry_owned_path_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let schemas = default_schemas(dir.path());
+        let read_file = schemas
+            .iter()
+            .find(|s| s.name == "read_file")
+            .expect("read_file schema");
+        assert!(read_file.input_schema["properties"]["path"]
+            .get(crate::path_annotations::PATH_ANNOTATION_KEY)
+            .is_none());
     }
 
     #[test]

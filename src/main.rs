@@ -30,6 +30,7 @@ mod mcp_config_cmd;
 mod mcp_oauth;
 mod observability;
 mod ops;
+mod path_annotations;
 mod path_policy;
 mod paths;
 mod pipeline_cache;
@@ -43,6 +44,7 @@ mod remote_gateway;
 mod run_audit;
 mod run_policy;
 mod safety;
+mod schema_contract;
 mod schema_validation;
 mod script;
 mod session;
@@ -61,6 +63,7 @@ mod skills;
 mod snapshot;
 mod state_root;
 mod structured_output;
+mod tool_contract;
 mod tool_descriptions;
 mod tool_facade;
 mod tool_output;
@@ -814,6 +817,15 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     }
+    // WP17 (FR-15): the global `--full-tool-schemas` flag forces full,
+    // self-contained schema serving/export on for this run, equivalent to
+    // `[mcp] full_tool_schemas = true`. Additive: the config and
+    // `DAIMONOS_MCP_FULL_SCHEMAS` env seam still apply; the flag only turns the
+    // mode on. Default off preserves the legacy stripped/terse/lazy serving.
+    // Context: docs/adr/030-self-contained-full-schemas.md.
+    if cli.full_tool_schemas {
+        cfg.mcp.full_tool_schemas = true;
+    }
     if cli.confinement_requested() {
         if let Some(name) = cfg.tools.keys().min() {
             eprintln!(
@@ -1096,7 +1108,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Agent(args)) => !args.dry_run,
         Some(Command::Chat(args)) => !args.list,
         Some(Command::Acp(_) | Command::SessionDaemon(_)) => true,
-        Some(Command::Session(_) | Command::Mcp(_) | Command::McpConfig(_) | Command::Daemon)
+        Some(
+            Command::Session(_)
+            | Command::Mcp(_)
+            | Command::McpConfig(_)
+            | Command::Daemon
+            | Command::ToolContract,
+        )
         | None => false,
     };
     if uses_agent_prompt {
@@ -1133,8 +1151,16 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut observability_runtime =
         observability::ObservabilityRuntime::initialize(&observability_config);
+    // WP15 (FR-13): the session-free `tool-contract` dump must create no state
+    // artifacts, including the secure log file. Suppress file logging for it,
+    // mirroring how observability is disabled outside agent modes above.
+    // Context: docs/adr/029-effective-tool-contract.md.
+    let mut logging_config = cfg.logging.clone();
+    if matches!(runtime_mode, RuntimeMode::ToolContract) {
+        logging_config.enabled = false;
+    }
     let _logging_guard = match logging::init(
-        &cfg.logging,
+        &logging_config,
         observability_runtime.tracer(),
         cfg.state_authority.is_some(),
     ) {
@@ -1226,6 +1252,25 @@ async fn main() -> anyhow::Result<()> {
             command: Some(cli::McpCommand::Auth { command }),
             ..
         })) => mcp_oauth::run_command(command, &cfg.acp.mcp).await,
+        Some(Command::ToolContract) => {
+            // WP15 (FR-13): session-free deterministic dump of the effective
+            // tool contract. Reuses the serving catalog, starts no model run or
+            // session store. Context: docs/adr/029-effective-tool-contract.md.
+            let inputs = tool_contract::EffectiveInputs::from_config(&cfg, &workspace);
+            match tool_contract::EffectiveToolCatalog::freeze(&inputs) {
+                Ok(catalog) => {
+                    println!("{}", catalog.to_json());
+                    Ok(())
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"error":{"code":"run_configuration_invalid","reason":error.code,"message":error.message}})
+                    );
+                    std::process::exit(error.exit_code);
+                }
+            }
+        }
         Some(Command::Mcp(_) | Command::Daemon) | None => {
             run_tool_service(
                 runtime_mode,
@@ -1399,7 +1444,8 @@ async fn run_tool_service(
         | RuntimeMode::SessionDaemon
         | RuntimeMode::McpConfig
         | RuntimeMode::McpAuth
-        | RuntimeMode::Stats => {
+        | RuntimeMode::Stats
+        | RuntimeMode::ToolContract => {
             unreachable!("early-return runtime reached service dispatch")
         }
     }

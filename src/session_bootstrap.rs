@@ -50,6 +50,10 @@ pub struct BootstrapOptions<'a> {
     pub max_frame_bytes: usize,
     pub timeout: Duration,
     pub retry_interval: Duration,
+    /// WP17 (FR-15): serve/export full self-contained schemas in the daemon.
+    /// Part of the launch identity so a frontend requesting it cannot silently
+    /// attach to a daemon launched without it.
+    pub full_tool_schemas: bool,
 }
 
 pub struct BootstrapConnection {
@@ -227,6 +231,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
         args.push(OsString::from("--agent-env"));
         args.push(path.as_os_str().to_owned());
     }
+    if options.full_tool_schemas {
+        args.push(OsString::from("--full-tool-schemas"));
+    }
     args
 }
 
@@ -276,6 +283,9 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
         digest.update(provider.as_bytes());
     }
     digest.update([0_u8]);
+    if options.full_tool_schemas {
+        digest.update(b"full-tool-schemas\0");
+    }
     format!("{:x}", digest.finalize())
 }
 
@@ -380,6 +390,7 @@ mod tests {
             max_frame_bytes: 1024,
             timeout: Duration::from_secs(1),
             retry_interval: Duration::from_millis(1),
+            full_tool_schemas: false,
         }
     }
 
@@ -434,6 +445,47 @@ mod tests {
             Path::new("/agent.env"),
         );
         second.state_dir = Some(Path::new("/state/two"));
+        assert_ne!(
+            bootstrap_fingerprint(&first),
+            bootstrap_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn daemon_args_include_full_tool_schemas_when_requested() {
+        let mut opts = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        assert!(!daemon_args(&opts)
+            .iter()
+            .any(|a| a == "--full-tool-schemas"));
+        opts.full_tool_schemas = true;
+        assert!(daemon_args(&opts)
+            .iter()
+            .any(|a| a == "--full-tool-schemas"));
+    }
+
+    #[test]
+    fn bootstrap_fingerprint_changes_with_full_tool_schemas() {
+        // WP17 (FR-15): the full-schema mode is part of the daemon launch
+        // identity, so an interactive frontend requesting it cannot silently
+        // attach to a daemon launched without it (frontend coverage rule).
+        let first = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        let mut second = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        second.full_tool_schemas = true;
         assert_ne!(
             bootstrap_fingerprint(&first),
             bootstrap_fingerprint(&second)

@@ -253,6 +253,55 @@ fn spawn_tui_controller(
     )
 }
 
+/// WP17 (FR-15): enforce the self-contained full-schema contract before any
+/// model request on a model-running frontend (ADR-030). When the opt-in
+/// full-schema mode is on, validate the model-facing tool catalog offline; an
+/// unusable schema (external reference, recursion, invalid 2020-12, or a
+/// cross-tool definition-name collision) refuses the run with reason
+/// `schema_unusable` (exit 2) *before* the first request, so no frontend
+/// silently ignores the option. Default off makes this a no-op, leaving the
+/// terse/lazy frontends unchanged. Context:
+/// docs/adr/030-self-contained-full-schemas.md.
+fn enforce_full_schema_contract(cfg: &config::Config, workspace: &Path) {
+    if !config::effective_full_tool_schemas(cfg) {
+        return;
+    }
+    let confined = cfg.filesystem_authority.is_some();
+    // Merge of WP06 and WP17 (#1575): `active_schemas_for_policy` takes the tool
+    // allowlist policy since WP06. This check validates the catalog that the
+    // frontend offers the model, so it builds the policy the same way as the
+    // frontends do (`ToolPolicy::from_config`). A tool that the allowlist
+    // removes is not offered, and it is not validated here.
+    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+    let schemas = crate::tool_facade::active_schemas_for_policy(
+        workspace,
+        &cfg.prompts.resolved_tool_descriptions,
+        confined,
+        &policy,
+    );
+    // Native tools are OWNED definitions (S3 / D39): they participate in the
+    // cross-tool collision namespace.
+    let entries: Vec<crate::schema_contract::CatalogSchema> = schemas
+        .iter()
+        .map(|schema| crate::schema_contract::CatalogSchema {
+            tool: schema.name.as_str(),
+            schema: &schema.input_schema,
+            owned: true,
+        })
+        .collect();
+    if let Err(error) = crate::schema_contract::ValidatedToolSchema::validate_catalog(&entries) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "code": "run_configuration_invalid",
+                "reason": error.reason(),
+                "message": error.to_string()
+            }})
+        );
+        std::process::exit(2);
+    }
+}
+
 pub async fn run_agent(
     args: AgentArgs,
     workspace: &Path,
@@ -261,6 +310,7 @@ pub async fn run_agent(
     explicit_config_path: Option<PathBuf>,
     explicit_agent_instructions: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    enforce_full_schema_contract(&cfg, workspace);
     let AgentArgs {
         task,
         interactive,
@@ -423,6 +473,9 @@ pub async fn run_agent(
                 retry_interval: std::time::Duration::from_millis(
                     cfg.session.bootstrap_retry_interval_ms,
                 ),
+                // WP17 (FR-15): carry the full-schema mode into the daemon launch
+                // identity so an attach cannot silently downgrade it.
+                full_tool_schemas: crate::config::effective_full_tool_schemas(&cfg),
             },
         )
         .await?;
@@ -523,7 +576,10 @@ pub async fn run_agent(
     // regardless of whether an agent env file exists on the host.
     let final_output_runtime = match &final_output {
         Some(path) => {
-            let spec = match crate::structured_output::load_control(path) {
+            let spec = match crate::structured_output::load_control(
+                path,
+                config::effective_full_tool_schemas(&cfg),
+            ) {
                 Ok(spec) => spec,
                 Err(startup) => emit_final_output_startup_error(startup),
             };
@@ -996,6 +1052,7 @@ pub async fn run_chat(
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    enforce_full_schema_contract(&cfg, workspace);
     let ChatArgs {
         model,
         provider,
@@ -1065,6 +1122,7 @@ pub async fn run_acp(
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    enforce_full_schema_contract(&cfg, workspace);
     let AcpArgs {
         model,
         provider,
@@ -1157,6 +1215,7 @@ pub async fn run_session_daemon(
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    enforce_full_schema_contract(&cfg, workspace);
     let SessionDaemonArgs {
         socket,
         model,

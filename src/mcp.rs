@@ -31,10 +31,19 @@ pub(crate) const DAIMONOS_MCP_META_KEY: &str = "io.daimonos/server-kind";
 pub(crate) const DAIMONOS_MCP_META_VALUE: &str = "mcp";
 
 fn mcp_identity_meta() -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
-        DAIMONOS_MCP_META_KEY.to_string(),
-        Value::String(DAIMONOS_MCP_META_VALUE.to_string()),
-    )])
+    // WP15 (FR-13, AC-13.2): report the standalone tool-contract version during
+    // initialization, distinct from `serverInfo.version` (the binary version).
+    // Context: docs/adr/029-effective-tool-contract.md.
+    serde_json::Map::from_iter([
+        (
+            DAIMONOS_MCP_META_KEY.to_string(),
+            Value::String(DAIMONOS_MCP_META_VALUE.to_string()),
+        ),
+        (
+            crate::tool_contract::CONTRACT_VERSION_META_KEY.to_string(),
+            Value::String(crate::tool_contract::CONTRACT_VERSION.to_string()),
+        ),
+    ])
 }
 
 /// Liveness signal shared by the request handlers and the idle watchdog.
