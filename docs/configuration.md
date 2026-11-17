@@ -126,7 +126,10 @@ While it is on:
   `tool_policy_unsupported`: arbitrary `exec`/background processes, the repair
   helper, tool pipelines/registration, `execute_script`, and the external CLI
   plugins (`git`, `gh`, `cargo`, `pytest`, `docker`, `curl`, `shellcheck`,
-  `npm`, `discord`). An allowlist entry cannot override these refusals.
+  `npm`, `discord`). An allowlist entry cannot override these refusals. This
+  holds in every frontend: `execute_script` is refused before any Starlark runs
+  over MCP and in `daimonos agent` / `chat` / `acp` (the shared agent run loop),
+  not only on the MCP path.
 - Read and metadata tools keep working: `read_file`, `ls`, `search`,
   `diff_files`, `git_read` (its private status scratch is relocated outside the
   workspace), `workspace_info`, `get_tool_schema`, `list_tool_signatures`,
@@ -140,9 +143,12 @@ While it is on:
   a `logging.directory`, `tool_output.directory`, snapshot/process/`git_read`
   status directory configured inside the workspace, enabled per-turn
   `checkpoint`s (whose shadow repo defaults to `<workspace>/.daimonos/
-  checkpoints.git`), or the KGL autoindex/observation
+  checkpoints.git`), the structural request-trace directory
+  (`DAIMONOS_OPENROUTER_TRACE_DIR`), or the KGL autoindex/observation
   (`DAIMONOS_KGL_AUTOINDEX` / `DAIMONOS_KGL_OBSERVE`). This refusal is
-  independent of `--state-dir`.
+  independent of `--state-dir`. The guarded set is the single registry
+  `run_policy::INTERNAL_WRITERS`, cross-checked against the reviewer-runtime
+  INVENTORIES.md W-rows by a completeness test.
 
 The admission table lives in `src/run_policy.rs` (`ToolAdmission`,
 `EffectClass`). See ADR-022.

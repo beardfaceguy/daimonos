@@ -18,6 +18,13 @@
 //! Internal state writes are *not* workspace mutations: they are routed under
 //! the explicit state root by WP01/WP02 (ADR-021). This table classifies them
 //! as `Internal` and admits them — it does not duplicate writer routing.
+//!
+//! Refusal metadata exemption (R2): the `ToolFailure` `message` strings built in
+//! [`ToolAdmission::refuse`] are structured refusal metadata keyed by a reviewed
+//! `code` (INTERFACES.md's machine-readable contract), not model-facing prompts,
+//! so — exactly like the merged WP03 `path_policy::ToolFailure` messages — they
+//! stay in Rust rather than `prompts/` (AGENTS.md's prompt rule governs prompts
+//! and top-level tool descriptions, not refusal-code metadata).
 
 use crate::path_policy::ToolFailure;
 use crate::protocol::op;
@@ -241,24 +248,142 @@ pub fn resolves_inside(workspace: &Path, candidate: &Path) -> bool {
     lexical_normalize(&absolute).starts_with(lexical_normalize(workspace))
 }
 
-/// Under read-only, return the first internal-writer destination that would
-/// land inside the workspace. The caller refuses startup with
-/// `CODE_WORKSPACE_WRITE_FORBIDDEN`, naming the option (G3). Returns `None` when
-/// read-only is off or every destination is outside the workspace. The check is
-/// independent of `--state-dir`: an explicit state root simply relocates the
-/// destinations so they fall outside the workspace and pass.
-pub fn first_internal_destination_inside_workspace<'a>(
-    read_only: bool,
-    workspace: &Path,
-    destinations: &'a [(&'a str, PathBuf)],
-) -> Option<(&'a str, &'a Path)> {
-    if !read_only {
-        return None;
+/// How `--workspace-read-only` accounts for one internal writer catalogued in
+/// reviewer-runtime INVENTORIES.md (the W01..W27 table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterGuard {
+    /// Refused by the main startup destination guard when its configured
+    /// destination resolves inside the workspace. [`StartupDestinations`]
+    /// produces exactly these, and `main` consumes that list (R3).
+    StartupDestination,
+    /// KGL autoindex/observation: refused by `main`'s dedicated KGL startup
+    /// block (it creates `<workspace>/.kgl` unless a state root relocates it).
+    StartupKgl,
+    /// Mediated at a dispatch boundary (`admit_opcode`/`admit_tool`) or
+    /// relocated under the state root on use; never a startup destination.
+    OnUse,
+    /// Writes only to HOME/state/in-memory; cannot land inside the workspace.
+    NonWorkspace,
+}
+
+/// The single registry of every internal writer in INVENTORIES.md (W01..W27)
+/// with its read-only disposition. The startup guard consumes the
+/// [`WriterGuard::StartupDestination`] rows (via [`StartupDestinations`]); the
+/// completeness tests cross-check this list against INVENTORIES.md so a future
+/// workspace-capable writer cannot be added to the inventory without an
+/// explicit disposition here (R3 — W11 was previously omitted by hand).
+pub const INTERNAL_WRITERS: &[(&str, WriterGuard)] = &[
+    ("W01", WriterGuard::NonWorkspace),       // HOME token-debug log
+    ("W02", WriterGuard::NonWorkspace),       // in-memory index + watcher
+    ("W03", WriterGuard::OnUse),              // snapshot store (admit SNAP/RESTORE/DELETE)
+    ("W04", WriterGuard::StartupDestination), // analytics db path
+    ("W05", WriterGuard::StartupDestination), // coordination db dir
+    ("W06", WriterGuard::NonWorkspace),       // in-memory pipeline cache
+    ("W07", WriterGuard::StartupKgl),         // kgl store (on use: admit_tool)
+    ("W08", WriterGuard::StartupKgl),         // kgl autoindex watcher
+    ("W09", WriterGuard::StartupKgl),         // kgl observe after file ops
+    ("W10", WriterGuard::StartupDestination), // logging directory
+    ("W11", WriterGuard::StartupDestination), // providers/request_trace directory
+    ("W12", WriterGuard::StartupDestination), // tool_output directory
+    ("W13", WriterGuard::StartupDestination), // git_read status scratch
+    ("W14", WriterGuard::NonWorkspace),       // daemon socket/catalog under state/HOME
+    ("W15", WriterGuard::NonWorkspace),       // agent histories under state/HOME
+    ("W16", WriterGuard::NonWorkspace),       // chat histories under state/HOME
+    ("W17", WriterGuard::NonWorkspace),       // acp sessions under state/HOME
+    ("W18", WriterGuard::NonWorkspace),       // session store under state/HOME
+    ("W19", WriterGuard::NonWorkspace),       // daemon stores under state/HOME
+    ("W20", WriterGuard::NonWorkspace),       // session catalog under state/HOME
+    ("W21", WriterGuard::StartupDestination), // checkpoint shadow repo (workspace .daimonos)
+    ("W22", WriterGuard::NonWorkspace),       // evidence under HOME
+    ("W23", WriterGuard::NonWorkspace),       // mcp_oauth under HOME
+    ("W24", WriterGuard::OnUse),              // provisioning aggregates (producer admission)
+    ("W25", WriterGuard::OnUse),              // managed_process env (exec is refused)
+    ("W26", WriterGuard::OnUse),              // session resolve_path user writes (admit_opcode)
+    ("W27", WriterGuard::StartupDestination), // managed_process artifact directory
+];
+
+/// One labelled startup destination the read-only guard checks against the
+/// workspace. `w_id` ties it to its INVENTORIES.md row; `label` is the
+/// operator-facing destination name in the refusal.
+pub struct StartupDestinationEntry {
+    pub w_id: &'static str,
+    pub label: &'static str,
+    pub path: PathBuf,
+}
+
+/// Resolved destinations of every workspace-capable startup writer, filled by
+/// `main` from the pinned config and environment. Each present field is one
+/// INVENTORIES.md [`WriterGuard::StartupDestination`] row; [`Self::entries`] is
+/// the single list the read-only startup guard iterates. A `None` field means
+/// that writer is disabled or unconfigured for this run.
+#[derive(Debug, Default, Clone)]
+pub struct StartupDestinations {
+    /// W10 logging directory (when logging is enabled).
+    pub logging_dir: Option<PathBuf>,
+    /// W04 analytics db path (when analytics is enabled).
+    pub analytics_db: Option<PathBuf>,
+    /// W05 coordination db dir (when coordination is enabled).
+    pub coordination_db_dir: Option<PathBuf>,
+    /// W12 tool-output directory (always resolved).
+    pub tool_output_dir: Option<PathBuf>,
+    /// W27 background-process artifact directory (when explicitly configured).
+    pub process_artifact_dir: Option<PathBuf>,
+    /// W13 git_read private status scratch directory (when explicitly set).
+    pub git_read_status_dir: Option<PathBuf>,
+    /// W21 per-turn checkpoint shadow repository (when checkpoints are enabled).
+    pub checkpoint_repo: Option<PathBuf>,
+    /// W11 structural request-trace directory (DAIMONOS_OPENROUTER_TRACE_DIR).
+    pub request_trace_dir: Option<PathBuf>,
+}
+
+impl StartupDestinations {
+    /// The labelled `(w_id, label, path)` list for the enabled writers, driven
+    /// by the [`INTERNAL_WRITERS`] registry: it iterates every
+    /// [`WriterGuard::StartupDestination`] row and emits its resolved
+    /// destination when configured. `main` consumes this and refuses the first
+    /// path inside the read-only workspace. A StartupDestination row without a
+    /// resolver arm here is dropped and caught by the completeness test.
+    pub fn entries(&self) -> Vec<StartupDestinationEntry> {
+        INTERNAL_WRITERS
+            .iter()
+            .filter(|(_, guard)| *guard == WriterGuard::StartupDestination)
+            .filter_map(|(w_id, _)| {
+                let (label, path) = match *w_id {
+                    "W04" => ("analytics.db_path", &self.analytics_db),
+                    "W05" => ("coordination.db_dir", &self.coordination_db_dir),
+                    "W10" => ("logging.directory", &self.logging_dir),
+                    "W11" => (
+                        "providers.request_trace (DAIMONOS_OPENROUTER_TRACE_DIR)",
+                        &self.request_trace_dir,
+                    ),
+                    "W12" => ("tool_output.directory", &self.tool_output_dir),
+                    "W13" => ("git_read.status_directory", &self.git_read_status_dir),
+                    "W21" => ("checkpoint shadow repository", &self.checkpoint_repo),
+                    "W27" => ("process.artifact_directory", &self.process_artifact_dir),
+                    _ => return None,
+                };
+                path.clone()
+                    .map(|path| StartupDestinationEntry { w_id, label, path })
+            })
+            .collect()
     }
-    destinations
-        .iter()
-        .find(|(_, path)| resolves_inside(workspace, path))
-        .map(|(label, path)| (*label, path.as_path()))
+
+    /// Under read-only, the first enabled startup destination that resolves
+    /// inside `workspace`, as `(w_id, label, path)`. `main` refuses startup
+    /// (exit 2) naming the inventory row and its label.
+    pub fn first_inside_workspace(
+        &self,
+        read_only: bool,
+        workspace: &Path,
+    ) -> Option<(&'static str, &'static str, PathBuf)> {
+        if !read_only {
+            return None;
+        }
+        self.entries()
+            .into_iter()
+            .find(|entry| resolves_inside(workspace, &entry.path))
+            .map(|entry| (entry.w_id, entry.label, entry.path))
+    }
 }
 
 #[cfg(test)]
@@ -442,26 +567,124 @@ mod tests {
         }
     }
 
-    // G3: the startup destination guard flags a destination inside the
-    // workspace only while read-only, independent of state relocation.
+    // G3: the read-only startup destination guard flags a destination inside
+    // the workspace only while read-only, independent of state relocation.
     #[test]
     fn startup_destination_guard_flags_inside_workspace() {
         let ws = Path::new("/work/evidence");
-        let inside = ("logging.directory", ws.join("logs"));
-        let outside = ("logging.directory", PathBuf::from("/state/logs"));
-        assert!(first_internal_destination_inside_workspace(
-            true,
-            ws,
-            std::slice::from_ref(&outside)
-        )
-        .is_none());
-        let hit =
-            first_internal_destination_inside_workspace(true, ws, std::slice::from_ref(&inside));
-        assert_eq!(hit, Some(("logging.directory", ws.join("logs").as_path())));
+        let outside = StartupDestinations {
+            logging_dir: Some(PathBuf::from("/state/logs")),
+            ..StartupDestinations::default()
+        };
+        assert!(outside.first_inside_workspace(true, ws).is_none());
+        let inside = StartupDestinations {
+            logging_dir: Some(ws.join("logs")),
+            ..StartupDestinations::default()
+        };
+        assert_eq!(
+            inside.first_inside_workspace(true, ws),
+            Some(("W10", "logging.directory", ws.join("logs")))
+        );
         // Off => never flagged, even for an inside destination.
-        assert!(first_internal_destination_inside_workspace(false, ws, &[inside]).is_none());
+        assert!(inside.first_inside_workspace(false, ws).is_none());
         // A `..` escape out of the workspace is not flagged.
-        let escape = ("x", ws.join("../elsewhere"));
-        assert!(first_internal_destination_inside_workspace(true, ws, &[escape]).is_none());
+        let escape = StartupDestinations {
+            logging_dir: Some(ws.join("../elsewhere")),
+            ..StartupDestinations::default()
+        };
+        assert!(escape.first_inside_workspace(true, ws).is_none());
+    }
+
+    // R2: the refusal `message` strings are structured metadata keyed by a
+    // reviewed `code` (see the module-doc exemption), kept in Rust like
+    // `path_policy::ToolFailure`. Pin both templates so a future edit that
+    // drifts the machine-readable contract fails the build rather than a
+    // review.
+    #[test]
+    fn refusal_metadata_is_pinned_contract() {
+        let admission = admission(true);
+        let mutation = admission.admit_opcode(op::WRITE).unwrap_err();
+        assert_eq!(mutation.code, CODE_WORKSPACE_WRITE_FORBIDDEN);
+        assert_eq!(
+            mutation.message,
+            format!("opcode {} would mutate the read-only workspace", op::WRITE)
+        );
+        let opaque = admission.admit_tool("execute_script").unwrap_err();
+        assert_eq!(opaque.code, CODE_TOOL_POLICY_UNSUPPORTED);
+        assert_eq!(
+            opaque.message,
+            "tool execute_script cannot be mediated while the workspace is read-only"
+        );
+    }
+
+    // R3: the startup guard consumes `StartupDestinations::entries`; assert it
+    // yields exactly the registry's StartupDestination rows so the guard and
+    // the registry cannot drift (e.g. a field added without a registry row, or
+    // vice versa).
+    #[test]
+    fn startup_destinations_cover_every_startup_writer() {
+        let all = StartupDestinations {
+            logging_dir: Some(PathBuf::from("/x/log")),
+            analytics_db: Some(PathBuf::from("/x/a.db")),
+            coordination_db_dir: Some(PathBuf::from("/x/coord")),
+            tool_output_dir: Some(PathBuf::from("/x/out")),
+            process_artifact_dir: Some(PathBuf::from("/x/proc")),
+            git_read_status_dir: Some(PathBuf::from("/x/status")),
+            checkpoint_repo: Some(PathBuf::from("/x/ckpt")),
+            request_trace_dir: Some(PathBuf::from("/x/trace")),
+        };
+        let produced: std::collections::BTreeSet<&str> =
+            all.entries().iter().map(|entry| entry.w_id).collect();
+        let expected: std::collections::BTreeSet<&str> = INTERNAL_WRITERS
+            .iter()
+            .filter(|(_, guard)| *guard == WriterGuard::StartupDestination)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            produced, expected,
+            "StartupDestinations::entries must produce exactly the registry's \
+             StartupDestination rows"
+        );
+        // Sanity: the W11 request_trace writer (the row R3 added) is covered.
+        assert!(
+            produced.contains("W11"),
+            "W11 request_trace must be guarded"
+        );
+    }
+
+    // R3: every internal writer catalogued in INVENTORIES.md must be classified
+    // in `INTERNAL_WRITERS`. A new W-row added to the inventory without a
+    // disposition here (as W11 was missing from the hand-maintained list) fails
+    // this test rather than slipping past review.
+    #[test]
+    fn every_inventory_w_row_is_classified() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/contexts/reviewer-runtime/INVENTORIES.md"
+        ))
+        .expect("INVENTORIES.md must be readable from the crate root");
+        let mut in_doc = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("| W") {
+                // First table cell, e.g. "| W11 | ..." -> "W11".
+                let id_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if id_digits.len() == 2 {
+                    in_doc.insert(format!("W{id_digits}"));
+                }
+            }
+        }
+        let in_registry: std::collections::BTreeSet<String> = INTERNAL_WRITERS
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        assert!(
+            !in_doc.is_empty(),
+            "failed to parse any W-row from INVENTORIES.md"
+        );
+        assert_eq!(
+            in_doc, in_registry,
+            "INVENTORIES.md W-rows and INTERNAL_WRITERS must match exactly"
+        );
     }
 }

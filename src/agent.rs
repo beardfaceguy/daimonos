@@ -1425,7 +1425,29 @@ async fn run_inner(
                         )
                     });
                     let mut transient = false;
-                    let (mut content, is_error, mut outcome) = if name == EXECUTE_SCRIPT_TOOL {
+                    // R1 (ADR-022, INVENTORIES tool-class table): the agent /
+                    // chat / ACP run loop owns its own execute_script branch,
+                    // which bypasses `mcp::run_execute_script`. execute_script
+                    // is opaque — its inner effects cannot be mediated — so
+                    // refuse it here, before the Starlark engine starts, with
+                    // the same structured payload as the MCP boundary. An
+                    // allowlist entry cannot override this refusal.
+                    let script_refused_read_only =
+                        name == EXECUTE_SCRIPT_TOOL && session.lock().await.admission.read_only();
+                    let (mut content, is_error, mut outcome) = if script_refused_read_only {
+                        let content = serde_json::json!({
+                            "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+                            "message": "execute_script cannot be mediated while the workspace is read-only",
+                            "tool": "execute_script",
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if name == EXECUTE_SCRIPT_TOOL {
                         // execute_script shares the live session with its
                         // Starlark sandbox thread, so the loop hands it an
                         // `Arc<Mutex<Session>>` clone rather than a `&mut`.

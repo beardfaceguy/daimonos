@@ -486,44 +486,60 @@ async fn main() -> anyhow::Result<()> {
     // so they fall outside the workspace and pass. The KGL and snapshot stores
     // are guarded on use (tool/opcode admission), not here.
     if cfg.workspace_read_only {
-        let mut destinations: Vec<(&str, std::path::PathBuf)> = Vec::new();
-        if cfg.logging.enabled {
-            destinations.push(("logging.directory", cfg.logging.resolved_directory()));
-        }
-        if cfg.analytics.enabled {
-            destinations.push(("analytics.db_path", cfg.analytics.resolved_db_path()));
-        }
-        if cfg.coordination.enabled {
-            destinations.push(("coordination.db_dir", cfg.coordination.resolved_db_dir()));
-        }
-        destinations.push((
-            "tool_output.directory",
-            cfg.tool_output.resolved_directory(),
-        ));
-        if let Some(path) = &cfg.process.artifact_directory {
-            destinations.push(("process.artifact_directory", paths::expand_tilde(path)));
-        }
-        if let Some(path) = &cfg.git_read.status_directory {
-            destinations.push(("git_read.status_directory", paths::expand_tilde(path)));
-        }
-        if cfg.checkpoint.enabled {
+        // The single registry of startup-guarded internal writers lives in
+        // `run_policy::StartupDestinations`; this fills each enabled writer's
+        // resolved destination (R3). A completeness test cross-checks the
+        // registry against INVENTORIES.md so a new workspace-capable writer
+        // cannot be added without a disposition. The KGL autoindex/observe
+        // stores (W07-W09) are handled by the dedicated block above.
+        let destinations = run_policy::StartupDestinations {
+            logging_dir: cfg
+                .logging
+                .enabled
+                .then(|| cfg.logging.resolved_directory()),
+            analytics_db: cfg
+                .analytics
+                .enabled
+                .then(|| cfg.analytics.resolved_db_path()),
+            coordination_db_dir: cfg
+                .coordination
+                .enabled
+                .then(|| cfg.coordination.resolved_db_dir()),
+            tool_output_dir: Some(cfg.tool_output.resolved_directory()),
+            process_artifact_dir: cfg
+                .process
+                .artifact_directory
+                .as_ref()
+                .map(|path| paths::expand_tilde(path)),
+            git_read_status_dir: cfg
+                .git_read
+                .status_directory
+                .as_ref()
+                .map(|path| paths::expand_tilde(path)),
             // Agent/chat per-turn checkpoints write this shadow git repo and the
             // current frontend (src/agent.rs) never relocates it, so refuse at
             // startup rather than write under the workspace.
-            destinations.push((
-                "checkpoint shadow repository",
-                workspace.join(".daimonos/checkpoints.git"),
-            ));
-        }
-        if let Some((label, path)) =
-            run_policy::first_internal_destination_inside_workspace(true, &workspace, &destinations)
-        {
+            checkpoint_repo: cfg
+                .checkpoint
+                .enabled
+                .then(|| workspace.join(".daimonos/checkpoints.git")),
+            // W11 (R3): the structural request-trace directory is sourced from
+            // the environment (`providers::request_trace::RequestTrace::from_env`),
+            // not Config, so read it here. An inside-workspace trace dir without
+            // --state-dir is caught only by this guard (WP02 state validation
+            // requires a state root to refuse an out-of-state trace dir).
+            request_trace_dir: std::env::var("DAIMONOS_OPENROUTER_TRACE_DIR")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| paths::expand_tilde(&value)),
+        };
+        if let Some((w_id, label, path)) = destinations.first_inside_workspace(true, &workspace) {
             eprintln!(
                 "{}",
                 serde_json::json!({"error": {
                     "code": run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN,
                     "message": format!(
-                        "{label} resolves inside the read-only workspace ({}); relocate it with --state-dir or configure a destination outside the workspace",
+                        "{label} ({w_id}) resolves inside the read-only workspace ({}); relocate it with --state-dir or configure a destination outside the workspace",
                         path.display()
                     )
                 }})

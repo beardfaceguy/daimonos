@@ -57,7 +57,11 @@ Run from the repository root. The Python fixture builds the binary and starts a 
 The git_read tests use temporary repositories and require no remote objects or provider API key.
 The `tests/test_read_only_workspace.py` suite (FR-07, `--workspace-read-only`) includes a test that
 bind-mounts an evidence workspace read-only via `unshare -Urnm`; it is skipped when Linux user and
-mount namespaces are unavailable, like the git_read read-only-mount test.
+mount namespaces are unavailable, like the git_read read-only-mount test. It also drives
+`daimonos agent --print` with a local fake provider to prove `execute_script` is refused
+(`tool_policy_unsupported`) before any Starlark runs in agent mode, and that an
+`DAIMONOS_OPENROUTER_TRACE_DIR` inside the workspace (INVENTORIES W11) is refused at startup; both
+use local fake endpoints only (no live credentials).
 
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.

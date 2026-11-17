@@ -1023,3 +1023,191 @@ def test_g2_agent_print_refuses_checkpoint_at_startup(daimonos_binary, tmp_path)
     assert "workspace_write_forbidden" in completed.stderr, completed.stderr
     assert _snapshot(workspace) == before, "startup refusal still mutated the workspace"
     assert not (workspace / ".daimonos").exists()
+
+
+# --- R1: execute_script refused in the AGENT run loop (not only over MCP) --
+
+class _ExecuteScriptProvider:
+    """A local fake OpenAI-compatible endpoint. On the first turn it asks the
+    model to call `execute_script` with a body that both computes a distinctive
+    sentinel value and attempts an inner `write_file`; on the second turn (after
+    the tool result) it records the tool result and finishes. No network, no
+    key. The sentinel lets the test prove the Starlark body never ran: if it
+    had, the tool result would carry {"result": 31337}; the refusal carries the
+    structured `tool_policy_unsupported` payload instead."""
+
+    SENTINEL = 31337
+    BODY = "write_file('from_script.txt', 'x')\nresult = 31337"
+
+    def __init__(self):
+        self.tool_result_text = None
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                payload = json.dumps({"data": [{"id": "test/model",
+                    "context_length": 100000, "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "0", "completion": "0"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                messages = body["messages"]
+                tool_messages = [m for m in messages if m.get("role") == "tool"]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+
+                def chunk(delta, reason=None):
+                    payload = {"choices": [{"index": 0, "delta": delta, "finish_reason": reason}],
+                        "usage": {"prompt_tokens": 50, "completion_tokens": 5}}
+                    self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                    self.wfile.flush()
+
+                try:
+                    if not tool_messages:
+                        chunk({"role": "assistant", "content": "", "tool_calls": [{"index": 0,
+                            "id": "ro-script-1", "type": "function", "function": {
+                                "name": "execute_script",
+                                "arguments": json.dumps({"code": owner.BODY})}}]},
+                              "tool_calls")
+                    else:
+                        owner.tool_result_text = json.dumps(tool_messages)
+                        chunk({"role": "assistant", "content": _AGENT_DONE}, "stop")
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+
+
+def test_r1_agent_print_refuses_execute_script_before_starlark_runs(
+    daimonos_binary, tmp_path
+):
+    """R1 (ADR-022, INVENTORIES tool-class table): the agent run loop has its
+    own `execute_script` branch that must consult the admission table, exactly
+    as the MCP frontend's `run_execute_script` does. Under
+    `--workspace-read-only`, `daimonos agent --print` must return the structured
+    `tool_policy_unsupported` refusal to the model and must NOT run the Starlark
+    body. Uses --state-dir so internal stores relocate outside the workspace
+    (as in test_g2_agent_print_refuses_write_and_leaves_workspace_unchanged)."""
+    workspace = tmp_path / "evidence"
+    _seed_repo(workspace)
+    (tmp_path / "tmp").mkdir()
+    before = _snapshot(workspace)
+
+    provider = _ExecuteScriptProvider()
+    try:
+        # execute_script is gated by the agent allow-commands list; the operator
+        # must opt in before it ever reaches the run loop's branch. Allow it
+        # here so the test exercises the admission gap R1 describes rather than
+        # the earlier allowlist refusal.
+        agent_env = tmp_path / "agent.env"
+        agent_env.write_text("\n".join([
+            "DAIMONOS_AGENT_PROVIDER=openrouter",
+            "DAIMONOS_AGENT_MODEL=test/model",
+            f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{provider.server.server_port}/v1",
+            "DAIMONOS_AGENT_API_KEY=synthetic-not-a-real-key",
+            "DAIMONOS_AGENT_APPROVAL_MODE=auto",
+            "DAIMONOS_AGENT_COMPACTION=off",
+            "DAIMONOS_AGENT_MODELS_DISCOVER=off",
+            "DAIMONOS_AGENT_ALLOWED_COMMANDS=execute_script,write_file,read_file",
+            "",
+        ]))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("DAIMONOS_")}
+        env.update(_isolated_env(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700, exist_ok=True)
+        command = [daimonos_binary, "--workspace", str(workspace), "--workspace-read-only",
+                   "--state-dir", str(state)]
+        completed = subprocess.run(
+            command + ["agent", "--print", "--agent-env", str(agent_env),
+                       "please run the script"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+    finally:
+        provider.close()
+
+    assert completed.returncode == 0, completed.stderr
+    # (a) The model saw the structured opaque-tool refusal as the tool result.
+    assert provider.tool_result_text is not None, "provider never received a tool result"
+    assert "tool_policy_unsupported" in provider.tool_result_text, provider.tool_result_text
+    assert "execute_script" in provider.tool_result_text, provider.tool_result_text
+    assert _AGENT_DONE in completed.stdout, completed.stdout
+    # (b) The Starlark body did not run: its sentinel value never materialized
+    #     in the tool result (a run would have returned {"result": 31337}).
+    assert str(_ExecuteScriptProvider.SENTINEL) not in provider.tool_result_text, (
+        "execute_script body executed in agent mode under --workspace-read-only"
+    )
+    # (c) The workspace and its .git are byte-identical; nothing the script
+    #     attempted was written.
+    assert _snapshot(workspace) == before, "agent script run mutated the read-only workspace"
+    assert not (workspace / "from_script.txt").exists(), "the refused script wrote a file"
+    assert not (workspace / ".daimonos").exists()
+
+
+# --- R3: startup destination completeness — W11 providers/request_trace ------
+
+def test_r3_startup_refuses_request_trace_directory_inside_workspace(
+    daimonos_binary, tmp_path
+):
+    """R3 (INVENTORIES W11, src/providers/request_trace.rs::write_with_limit):
+    the structural request-trace directory is an explicit internal writer whose
+    destination (env `DAIMONOS_OPENROUTER_TRACE_DIR`) can land inside the
+    workspace. Under --workspace-read-only it must be refused at startup like
+    every other internal writer. --state-dir relocates the config-sourced
+    writers outside the workspace, so the trace dir is the sole inside-workspace
+    destination and the guard must name it with the workspace_write_forbidden
+    code and write nothing."""
+    workspace = tmp_path / "evidence"
+    _seed_repo(workspace)
+    (tmp_path / "tmp").mkdir()
+    before = _snapshot(workspace)
+    trace_dir = workspace / "trace"  # inside the read-only workspace
+
+    agent_env = tmp_path / "agent.env"
+    agent_env.write_text("\n".join([
+        "DAIMONOS_AGENT_PROVIDER=openrouter", "DAIMONOS_AGENT_MODEL=test/model",
+        "DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:1/v1",
+        "DAIMONOS_AGENT_API_KEY=x", "DAIMONOS_AGENT_APPROVAL_MODE=auto",
+        "DAIMONOS_AGENT_COMPACTION=off", "DAIMONOS_AGENT_MODELS_DISCOVER=off", "",
+    ]))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("DAIMONOS_")}
+    env.update(_isolated_env(tmp_path))
+    env["DAIMONOS_OPENROUTER_TRACE_DIR"] = str(trace_dir)
+    # No --state-dir: _isolated_env already relocates the config-sourced writers
+    # under HOME (outside the workspace), so the trace dir is the sole
+    # inside-workspace destination. (With --state-dir, WP02 state validation
+    # independently refuses an out-of-state trace dir; the read-only gap R3
+    # targets is the no---state-dir case, which that validation does not cover.)
+    completed = subprocess.run(
+        [daimonos_binary, "--workspace", str(workspace), "--workspace-read-only",
+         "agent", "--print", "--agent-env", str(agent_env), "hello"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+
+    assert completed.returncode == 2, (completed.returncode, completed.stdout, completed.stderr)
+    assert "workspace_write_forbidden" in completed.stderr, completed.stderr
+    assert "request_trace" in completed.stderr, completed.stderr
+    assert not trace_dir.exists(), "startup created the refused trace directory"
+    assert _snapshot(workspace) == before, "startup refusal mutated the workspace"
