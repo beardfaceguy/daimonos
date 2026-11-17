@@ -10,7 +10,7 @@ Cross-tool guidance for AI coding agents working in this repository.
 2. **Go to Vikunja first.** Use the Vikunja MCP tools to read the daimonos
    projects — see [Vikunja projects](#vikunja-projects) for the id map. This is
    the authoritative source for what's been done, what's in progress, and what's
-   planned. Most active work lives in project **183 (`daimonos-agent`)**.
+   planned. Most active work lives in project **30 (`daimonos working code`)**.
    Understand the project state before touching the codebase.
 3. Check `.cursor/rules/` — scoped rule files (bounded collections,
    configurable limits, env inheritance, no thread-spawn in callbacks,
@@ -66,6 +66,21 @@ See `docs/runtime-modes.md` for the six runtime modes and how they are selected.
 For the full vision (kernel, StructFS, capability security, phased roadmap),
 read the project descriptions in Vikunja.
 
+## Project tracking
+
+- System: Vikunja
+- Project URL: https://vikunja.wint3rmute.com/projects/30/117
+  — `daimonos working code` (id 30). Code tasks and code notes for this
+  repository.
+- Umbrella project URL: https://vikunja.wint3rmute.com/projects/12/45
+  — `Daimonos` (id 12). Root project. Parent of id 30 and id 91.
+- KGL project URL: https://vikunja.wint3rmute.com/projects/91/361
+  — `Knowledge Graph Language (KGL)` (id 91). Status not confirmed as of
+  2026-11-16. The last KGL code task (#1291, 2026-08-13) is in id 183. Ask the
+  user before you file KGL work.
+
+The other projects are in the [id map](#vikunja-projects).
+
 ## Systems of record
 
 | What | Where |
@@ -93,8 +108,8 @@ A search for "daimonos" matches many projects. The ones that matter:
 
 | Id | Project | Scope |
 |----|---------|-------|
-| **183** | `daimonos-agent` | **Primary.** Agent harness, ACP engine, providers, agent mail. Most active work. |
-| 30 | `daimonos` | Core tool server: shared daemon, trigram indexing, model-training research. |
+| 183 | `daimonos-agent` | Agent harness, ACP engine, providers, agent mail. Child of id 30. |
+| **30** | `daimonos working code` | **Primary.** Core tool server: shared daemon, trigram indexing, model-training research. Most active work. |
 | 172 | Agentic CLI tool | `daimonos agent` / `chat` CLI ergonomics. |
 | 12 | Daimonos | Umbrella / cross-references / distribution listings. |
 | 25 | Daimonos Documentation | Docs tasks. |
@@ -500,7 +515,7 @@ stale binary silently keeps serving the old behavior.
 ## Vikunja project management
 
 Keep Vikunja accurate **as you work**, not after being asked. Work goes in
-project **183 (`daimonos-agent`)** unless it clearly belongs to one of the other
+project **30 (`daimonos working code`)** unless it clearly belongs to one of the other
 projects in the id map above.
 
 - **Before starting work**: check whether a relevant task exists. If not, create
