@@ -15,7 +15,11 @@ initialization and equals the dump's version.
 import json
 import os
 import re
+import socket
 import subprocess
+import time
+
+import pytest
 
 CONTRACT_META_KEY = "io.daimonos/tool-contract-version"
 
@@ -281,3 +285,214 @@ def test_tool_contract_command_starts_no_session_store(daimonos_binary, tmp_path
     _dump(daimonos_binary, tmp_path)
     after = sorted(os.listdir(tmp_path))
     assert before == after, f"tool-contract mutated the workspace: {before} -> {after}"
+
+
+# ---------------------------------------------------------------------------
+# r2 coverage findings (integrator review of a407b11): confinement variant,
+# on-demand tier variant, socket-transport version, state-dir session-free.
+# ---------------------------------------------------------------------------
+
+
+def _serve_tools_confined(daimonos_binary, workspace) -> list:
+    """Spawn the stdio MCP server under ``--confine-paths`` and return its
+    served ``tools/list`` for ``workspace``."""
+    proc = subprocess.Popen(
+        [daimonos_binary, "--mcp", "--confine-paths", "-w", str(workspace)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        from conftest import _handshake
+
+        client = _handshake(proc, str(workspace))
+        return client.list_tools()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def _dump_confined(daimonos_binary, workspace) -> dict:
+    """Run ``daimonos --confine-paths tool-contract`` for ``workspace``."""
+    proc = subprocess.run(
+        [daimonos_binary, "--confine-paths", "-w", str(workspace), "tool-contract"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"confined tool-contract exited {proc.returncode}\n"
+        f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    )
+    return json.loads(proc.stdout)
+
+
+def test_dump_matches_serving_under_confinement(daimonos_binary, tmp_path):
+    """R1 / AC-13.1 policy variant: under ``--confine-paths`` the dump still
+    equals serving for the same workspace, and a tool confinement refuses is
+    absent from both.
+
+    ``write_file`` is outside the confined adapter allowlist
+    (``path_policy::tool_allowed``), so confinement refuses it; ``read_file`` is
+    allowed and remains in both the dump and ``tools/list``.
+    """
+    served_names = [t["name"] for t in _serve_tools_confined(daimonos_binary, tmp_path)]
+    doc = _dump_confined(daimonos_binary, tmp_path)
+    dump_names = [t["name"] for t in doc["tools"]]
+
+    assert dump_names == served_names, (
+        f"confined dump/serving differ\ndump={dump_names}\nserved={served_names}"
+    )
+    assert doc["effective_options"]["confined"] is True
+    # A confinement-refused tool is absent from BOTH the dump and serving.
+    assert "write_file" not in dump_names
+    assert "write_file" not in served_names
+    # A confinement-allowed tool remains in both.
+    assert "read_file" in dump_names
+    assert "read_file" in served_names
+
+
+def test_on_demand_tool_absent_from_initial_dump_and_serving(daimonos, daimonos_binary):
+    """R2 / AC-13.1 tier variant: the dump represents the INITIAL exposure tier,
+    not the full registry. A known on-demand tool (``diff_files``), excluded by
+    ``initial_exposed_tools``, is absent from both the dump and a fresh
+    ``tools/list`` (before any ``list_all_tools`` expansion).
+    """
+    workspace = daimonos.workspace
+    served_names = [t["name"] for t in daimonos.list_tools()]
+    doc = _dump(daimonos_binary, workspace)
+    dump_names = [t["name"] for t in doc["tools"]]
+
+    assert "diff_files" not in served_names, (
+        "diff_files is on-demand; a fresh tools/list must not expose it"
+    )
+    assert "diff_files" not in dump_names, (
+        "the dump reflects the initial exposure tier, so an on-demand tool "
+        "must be absent"
+    )
+
+
+def test_contract_version_reported_over_socket_initialization(daimonos_binary, tmp_path):
+    """R3 / AC-13.2 socket transport: a socket-transport ``initialize`` reports
+    ``_meta[io.daimonos/tool-contract-version]``, proving the contract version is
+    served on the socket frontend and not only on stdio.
+    """
+    sock_path = str(tmp_path / "mcp.sock")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    proc = subprocess.Popen(
+        [daimonos_binary, "--mcp-socket", sock_path, "-w", str(workspace)],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not os.path.exists(sock_path) and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(
+                    "socket server exited: "
+                    + proc.stderr.read().decode(errors="replace")
+                )
+            time.sleep(0.05)
+        assert os.path.exists(sock_path), "socket file never appeared"
+
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(sock_path)
+        try:
+            rfile = client.makefile("rb")
+            client.sendall(
+                (
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {},
+                            "clientInfo": {"name": "pytest-socket", "version": "1.0.0"},
+                        },
+                    })
+                    + "\n"
+                ).encode()
+            )
+            resp = json.loads(rfile.readline())
+        finally:
+            client.close()
+
+        assert "result" in resp, f"socket initialize failed: {resp}"
+        meta = resp["result"].get("_meta", {})
+        assert CONTRACT_META_KEY in meta, f"socket _meta missing {CONTRACT_META_KEY}: {meta}"
+        assert meta[CONTRACT_META_KEY] == "1.0.0"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def _file_inventory(root) -> set:
+    """Return every file path (relative to ``root``) under ``root``."""
+    found = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            found.add(os.path.relpath(os.path.join(dirpath, name), root))
+    return found
+
+
+def test_tool_contract_creates_no_state_analytics_or_log(daimonos_binary, tmp_path):
+    """R4 / session-free (ADR-029) beyond the workspace: ``daimonos
+    tool-contract`` writes no session store, analytics file, or log into the
+    resolved state directory or an isolated HOME — not only the workspace.
+
+    The tool-contract runtime mode deliberately refuses an explicit
+    ``--state-dir`` (``state_mode_unsupported``), so we isolate HOME and every
+    ``XDG_*_HOME`` under a fresh temp directory. The resolved *default* state
+    directory therefore lives under this HOME, so inventorying HOME recursively
+    before and after covers the resolved state directory as well as any
+    analytics/log/session-store artifact the dump might otherwise create.
+    """
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    for directory in (home, workspace):
+        directory.mkdir()
+    # Point every state/config/data/cache root under the isolated HOME so the
+    # resolved state directory is captured by the HOME inventory.
+    for sub in (".config", ".state", ".data", ".cache", ".local"):
+        (home / sub).mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["XDG_STATE_HOME"] = str(home / ".state")
+    env["XDG_DATA_HOME"] = str(home / ".data")
+    env["XDG_CACHE_HOME"] = str(home / ".cache")
+
+    before = {
+        "home": _file_inventory(home),
+        "workspace": _file_inventory(workspace),
+    }
+
+    proc = subprocess.run(
+        [daimonos_binary, "-w", str(workspace), "tool-contract"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+    assert proc.returncode == 0, (
+        f"tool-contract exited {proc.returncode}\n"
+        f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    )
+    json.loads(proc.stdout)  # still a valid dump
+
+    after = {
+        "home": _file_inventory(home),
+        "workspace": _file_inventory(workspace),
+    }
+    for scope in ("home", "workspace"):
+        new_files = sorted(after[scope] - before[scope])
+        assert not new_files, (
+            f"tool-contract created files under {scope} "
+            f"(includes the resolved state directory): {new_files}"
+        )

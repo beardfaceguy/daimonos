@@ -788,8 +788,16 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut observability_runtime =
         observability::ObservabilityRuntime::initialize(&observability_config);
+    // WP15 (FR-13): the session-free `tool-contract` dump must create no state
+    // artifacts, including the secure log file. Suppress file logging for it,
+    // mirroring how observability is disabled outside agent modes above.
+    // Context: docs/adr/029-effective-tool-contract.md.
+    let mut logging_config = cfg.logging.clone();
+    if matches!(runtime_mode, RuntimeMode::ToolContract) {
+        logging_config.enabled = false;
+    }
     let _logging_guard = match logging::init(
-        &cfg.logging,
+        &logging_config,
         observability_runtime.tracer(),
         cfg.state_authority.is_some(),
     ) {

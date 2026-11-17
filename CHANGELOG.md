@@ -17,6 +17,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   initialization in `_meta["io.daimonos/tool-contract-version"]` and tracked in
   `docs/tool-contract-changelog.md`. See
   [ADR-029](docs/adr/029-effective-tool-contract.md).
+- **Default behavior change (FR-13, no opt-out).** Every MCP `initialize`
+  response now carries the additional `_meta` key
+  `io.daimonos/tool-contract-version`; this is unconditional (required by
+  AC-13.2) and has no option — the existing `server-kind` meta and
+  `serverInfo.version` (binary version) are unchanged. The session-free
+  `daimonos tool-contract` command also writes no state artifacts, including no
+  secure log file in the resolved state directory.
 
 ## [0.1.5] - 2026-10-18
 
