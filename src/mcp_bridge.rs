@@ -1139,6 +1139,294 @@ fn client_details() -> InitializeRequestParams {
     }
 }
 
+// --- WP10 (FR-05, ADR-028): credential-free worker execution ---------------
+//
+// Context: docs/adr/028-worker-only-execution.md, docs/contexts/reviewer-runtime.
+// A worker is a caller-supplied MCP-stdio tool server (e.g. daimonos run as a
+// read-only tool server inside dbunk's container, or dbunk's `compute` server).
+// It reuses the SAME ClientRuntime / StdioTransport / handshake the forwarded
+// ACP bridge uses, so this is NOT a second worker protocol (ADR-028). The one
+// difference is launch isolation: the rust_mcp_sdk StdioTransport spawns its
+// child with `Command::envs(..)` and NEVER clears the environment, so the model
+// process's credential and provider configuration would otherwise be inherited.
+// `connect_worker` launches through `env -i` so the exec'd worker starts from a
+// CLEARED environment plus only the caller's explicit map — the same env-clear
+// discipline as managed_process::apply_environment, applied to the SDK child
+// (W25). The self-connection guard is deliberately NOT applied: dbunk's tool
+// side is itself a daimonos instance, which is the intended Route-1 topology.
+
+/// One connected, owned credential-free worker client.
+pub struct WorkerClient {
+    name: String,
+    client: Arc<ClientRuntime>,
+    /// PIDs of the worker's launched child process(es), captured at connect so
+    /// a stalled teardown can still reap them (R6). Empty on non-Linux, where
+    /// PID discovery via `/proc` is unavailable (teardown then relies on the
+    /// SDK's `kill_on_drop` alone; see docs/configuration.md).
+    child_pids: Vec<u32>,
+}
+
+/// A worker's discovered tool, before namespacing into the exported catalog.
+pub struct WorkerToolDef {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+/// Outcome of a single worker tool call. `Down` is a terminal loss of the
+/// worker route (transport/protocol error or a stall): ADR-028 requires the run
+/// to abort with a distinct failure and NO local fallback, so it is kept
+/// separate from a served result whose `is_error` is an ordinary tool error.
+pub enum WorkerCallResult {
+    Served { content: String, is_error: bool },
+    Down(String),
+}
+
+impl WorkerClient {
+    /// Dispatch one tool call to this worker over the MCP channel. A transport
+    /// or protocol error (the worker exited, closed stdio, or never answered)
+    /// is reported as `Down`; a normal MCP result — including a tool-reported
+    /// `isError` — is `Served`. Bounded by `timeout`.
+    pub async fn call(
+        &self,
+        original_tool: &str,
+        input: &Value,
+        timeout: Duration,
+    ) -> WorkerCallResult {
+        let params = CallToolRequestParams {
+            name: original_tool.to_string(),
+            arguments: input.as_object().cloned(),
+            meta: None,
+            task: None,
+        };
+        match tokio::time::timeout(timeout, self.client.request_tool_call(params)).await {
+            Ok(Ok(result)) => {
+                let outcome = result_to_outcome(result);
+                WorkerCallResult::Served {
+                    content: outcome.content,
+                    is_error: outcome.is_error,
+                }
+            }
+            Ok(Err(e)) => WorkerCallResult::Down(format!(
+                "worker '{}' tool '{original_tool}' failed: {e}",
+                self.name
+            )),
+            Err(_) => WorkerCallResult::Down(format!(
+                "worker '{}' tool '{original_tool}' timed out after {}s",
+                self.name,
+                timeout.as_secs()
+            )),
+        }
+    }
+
+    /// Bounded teardown (R6, ADR-028). First ask the SDK to shut down (it
+    /// cancels the transport, closing the worker's stdin so a well-behaved
+    /// worker exits on EOF). The SDK keeps the child handle in an internal
+    /// `wait` task and `shut_down` only closes stdio, so a worker that ignores
+    /// stdin closure would survive; after a bounded grace we force-kill the
+    /// worker's process group (the SDK spawns each child with `process_group(0)`,
+    /// so `pgid == pid`), which also reaps any descendant such as an `unshare`
+    /// wrapper.
+    ///
+    /// On LINUX this GUARANTEES no owned worker child outlives the run: the
+    /// child PIDs are discovered via `/proc` and the process group is reaped.
+    /// On other platforms `child_pids` is empty (no `/proc` PID scan), so
+    /// teardown falls back to the SDK's `kill_on_drop`, which reaps only the
+    /// direct child — a descendant such as an `unshare` wrapper may survive
+    /// (the same platform caveat `docs/configuration.md` records).
+    pub async fn shutdown(&self, timeout: Duration) {
+        let client = Arc::clone(&self.client);
+        let mut task = tokio::spawn(async move {
+            let _ = client.shut_down().await;
+        });
+        let _ = tokio::time::timeout(timeout, &mut task).await;
+        #[cfg(unix)]
+        reap_worker_children(&self.child_pids, timeout).await;
+    }
+}
+
+/// Launch and connect one credential-free MCP-stdio worker. The child is
+/// started from a cleared environment (`env -i`) plus only `env`, so no
+/// inherited parent variable (model credential, provider config, ambient
+/// state) reaches it (ADR-028, AC-05.1). Executable lookup is resolved from the
+/// caller-controlled settings only: pass an absolute `command`, or include
+/// `PATH` in `env`. Discovery (initialize + tools/list) is bounded by
+/// `init_timeout`.
+/// The direct child process ids of the current process, read from `/proc`
+/// (Linux). Used to identify a worker's launched child (the SDK does not expose
+/// the `Child`) so a stalled teardown can still reap it through the OS.
+#[cfg(target_os = "linux")]
+fn direct_child_pids() -> HashSet<u32> {
+    let me = std::process::id();
+    let mut children = HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return children;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|rest| rest.trim().parse::<u32>().ok());
+        if parent == Some(me) {
+            children.insert(pid);
+        }
+    }
+    children
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn direct_child_pids() -> HashSet<u32> {
+    // No portable /proc PPid scan; teardown relies on the SDK's kill_on_drop.
+    HashSet::new()
+}
+
+#[cfg(not(unix))]
+fn direct_child_pids() -> HashSet<u32> {
+    HashSet::new()
+}
+
+/// Reap each owned worker child through the managed-process lifecycle: the SDK
+/// `shut_down` only cancels the reader (it does NOT close the child's stdin
+/// while the client Arc is still held), so a graceful stdin-EOF exit is not
+/// guaranteed. Signal the worker's process group `SIGTERM`, wait a bounded
+/// `grace` for it to exit, then `SIGKILL` the group (and the pid as a fallback)
+/// if it stalls. Targeting the group (the SDK sets `process_group(0)`, so
+/// `pgid == pid`) also reaps any descendant such as an `unshare` wrapper. This
+/// is the same SIGTERM→grace→SIGKILL discipline as `managed_process::terminate`
+/// and GUARANTEES no owned worker child outlives the run. `kill(pid, 0)` probes
+/// liveness without delivering a signal.
+#[cfg(unix)]
+async fn reap_worker_children(pids: &[u32], grace: Duration) {
+    for &pid in pids {
+        let Ok(signed) = i32::try_from(pid) else {
+            continue;
+        };
+        if unsafe { libc::kill(signed, 0) } != 0 {
+            continue; // already gone
+        }
+        unsafe { libc::kill(-signed, libc::SIGTERM) };
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(signed, 0) } != 0 {
+                break; // exited on SIGTERM
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if unsafe { libc::kill(signed, 0) } == 0 {
+            unsafe {
+                libc::kill(-signed, libc::SIGKILL);
+                libc::kill(signed, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Resolve the `env` launcher by ABSOLUTE path (R8): the worker launcher is
+/// never found through an inherited `PATH`. Returns the first of the standard
+/// POSIX locations that exists. On a platform that ships `env` elsewhere (or
+/// not at all), worker-only execution is unavailable and the launch fails as
+/// `worker_unavailable` with this reason (documented in docs/configuration.md).
+fn env_launcher() -> Result<&'static str, String> {
+    for path in ["/usr/bin/env", "/bin/env"] {
+        if std::path::Path::new(path).exists() {
+            return Ok(path);
+        }
+    }
+    Err(
+        "no `env` launcher found at /usr/bin/env or /bin/env; credential-free \
+         worker execution requires a POSIX `env` supporting `-i`"
+            .to_string(),
+    )
+}
+
+pub async fn connect_worker(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    init_timeout: Duration,
+) -> Result<(WorkerClient, Vec<WorkerToolDef>), String> {
+    // `env -i <ASSIGN...> -- <command> <args...>` clears the environment for the
+    // exec'd worker and sets ONLY the explicit assignments. The SDK still spawns
+    // `env` itself with the inherited parent environment (to locate `env` on
+    // PATH), but `-i` discards all of it before the worker image is exec'd, so
+    // the worker's own environment is exactly `env`.
+    let mut wrapped: Vec<String> = Vec::with_capacity(args.len() + env.len() + 3);
+    wrapped.push("-i".to_string());
+    let mut assignments: Vec<(&String, &String)> = env.iter().collect();
+    assignments.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in assignments {
+        wrapped.push(format!("{key}={value}"));
+    }
+    // No `--` separator: GNU `env` treats the first argument without `=` as the
+    // command, and would try to exec a literal `--`. Worker commands are
+    // absolute paths (no `=`), so the first non-assignment arg is the command.
+    wrapped.push(command.to_string());
+    wrapped.extend(args.iter().cloned());
+    let launcher = env_launcher().map_err(|reason| format!("worker '{name}': {reason}"))?;
+    let transport = StdioTransport::create_with_server_launch(
+        launcher.to_string(),
+        wrapped,
+        None,
+        TransportOptions::default(),
+    )
+    .map_err(|e| format!("worker '{name}' stdio transport: {e}"))?;
+    let client = client_runtime::create_client(McpClientOptions {
+        client_details: client_details(),
+        transport,
+        handler: BridgeClientHandler.to_mcp_client_handler(),
+        task_store: None,
+        server_task_store: None,
+        message_observer: None,
+    });
+    let deadline = tokio::time::Instant::now() + init_timeout;
+    // Snapshot direct children before the handshake spawns the worker child
+    // (inside `client.start()`); the post-handshake difference is this worker's
+    // launched pid(s). connect_worker is called sequentially per worker, so the
+    // difference is unambiguous. Used only for guaranteed reaping (R6).
+    let before_children = direct_child_pids();
+    // reject_daimonos = false: the worker IS allowed to be a daimonos instance
+    // (Route 1). The handshake only initializes and lists tools.
+    let tools = match handshake(&client, deadline, false).await {
+        Ok(Some(tools)) => tools,
+        Ok(None) => unreachable!("reject_daimonos is false"),
+        Err(e) => {
+            shutdown_rejected_client(client, &AcpMcpConfig::default()).await;
+            return Err(format!("worker '{name}': {e}"));
+        }
+    };
+    let defs = tools
+        .into_iter()
+        .map(|tool| WorkerToolDef {
+            name: tool.name,
+            description: tool.description.unwrap_or_default(),
+            input_schema: serde_json::to_value(&tool.input_schema).unwrap_or(Value::Null),
+        })
+        .collect();
+    let child_pids: Vec<u32> = direct_child_pids()
+        .difference(&before_children)
+        .copied()
+        .collect();
+    Ok((
+        WorkerClient {
+            name: name.to_string(),
+            client,
+            child_pids,
+        },
+        defs,
+    ))
+}
+
 #[cfg(test)]
 fn create_client(spec: &ServerSpec, cfg: &AcpMcpConfig) -> Result<Arc<ClientRuntime>, String> {
     create_client_with_proxy(spec, cfg, None)
@@ -1257,7 +1545,7 @@ const MAX_TOOL_NAME_LEN: usize = 64;
 /// `mcp__{server}__{tool}`, sanitized to the provider tool-name constraint
 /// (`^[a-zA-Z0-9_-]{1,64}$`) and truncated to 64 bytes. Non-conforming chars
 /// become `_`.
-fn namespaced_name(server: &str, tool: &str) -> String {
+pub(crate) fn namespaced_name(server: &str, tool: &str) -> String {
     let raw = format!("{REMOTE_TOOL_PREFIX}{server}__{tool}");
     let mut s: String = raw
         .chars()

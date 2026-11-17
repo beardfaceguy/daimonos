@@ -189,10 +189,16 @@ impl SessionFactory for AgentSessionFactory {
         let before_lifecycle = Arc::clone(&tool_lifecycle);
         let after_lifecycle = Arc::clone(&tool_lifecycle);
         let stream_events = Arc::clone(&events);
+        // FR-02 (WP06, ADR-023) R1: the session daemon offers the model only
+        // allowlisted tools (filtered at the single source); a no-op with no
+        // explicit `--tool-allowlist`.
+        let tool_policy =
+            crate::run_policy::ToolPolicy::from_config(self.config.tool_allowlist.as_ref());
         let mut tools: Vec<ToolSchema> = crate::tool_facade::active_schemas_for_policy(
             &workspace,
             &self.config.prompts.resolved_tool_descriptions,
             self.config.filesystem_authority.is_some(),
+            &tool_policy,
         )
         .into_iter()
         .map(|schema| ToolSchema {
@@ -210,7 +216,13 @@ impl SessionFactory for AgentSessionFactory {
         let agent_mcp =
             crate::agent_mcp::connect(&self.config, &native_names, self.analytics.clone()).await;
         if let Some(mcp) = &agent_mcp {
-            tools.extend(mcp.tools());
+            // FR-02 R1: remote MCP tools obey the same allowlist (listing ==
+            // dispatchable set); a no-op with no explicit list.
+            tools.extend(
+                mcp.tools()
+                    .into_iter()
+                    .filter(|t| tool_policy.allows(&t.name)),
+            );
         }
         let agent_config = AgentConfig {
             system: Some(
