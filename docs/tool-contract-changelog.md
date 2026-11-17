@@ -23,6 +23,24 @@ entry here must correspond to a version bump. The deterministic dump
 (`daimonos tool-contract`) and the MCP initialization metadata
 (`_meta["io.daimonos/tool-contract-version"]`) both report this version.
 
+## [1.1.0] - 2026-11-17
+
+Owned path annotations (WP16, FR-14). Additive, backward-compatible.
+
+- Added the standard schema annotation `"x-daimonos-path": true` to every
+  Daimonos-owned argument whose value is a filesystem path, a glob, or a
+  directory to walk, including the elements of path arrays (the array `items`
+  node is marked). This is a newly populated schema annotation, so it is a minor
+  change under the versioning rules above.
+- The marker means the same thing in every tool and is documented in
+  `docs/configuration.md`. A reader can enumerate the path slots of any tool
+  from its schema without a hand-written per-tool list (FR-14).
+- Annotations are applied in the shared serving pipeline, so the deterministic
+  dump and the live `tools/list` carry identical marks for the same inputs.
+- No annotation is added to non-path arguments, to opaque command/script/argv
+  strings, to agent-mail reservation glob patterns (never resolved against the
+  filesystem), or to caller-provided worker / final-answer schemas.
+
 ## [1.0.0] - 2026-11-17
 
 Initial tool-contract version (WP15, FR-13).

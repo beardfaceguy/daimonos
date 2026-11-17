@@ -45,10 +45,14 @@ pub fn active_schemas_for_policy(
                 description.push_str("\n\nExact Starlark tool signatures:\n");
                 description.push_str(&crate::script::tool_signatures_for_policy(confined));
             }
+            let mut input_schema = descriptions.schema_with_parameters(t.name, &t.schema);
+            // WP16 (FR-14): same owned path annotations the MCP serving path adds,
+            // so `x-daimonos-path` is consistent across frontends.
+            crate::path_annotations::annotate(t.name, &mut input_schema);
             NeutralToolSchema {
                 name: t.name.to_string(),
                 description,
-                input_schema: descriptions.schema_with_parameters(t.name, &t.schema),
+                input_schema,
             }
         })
         .collect()
@@ -104,6 +108,36 @@ mod tests {
     }
 
     // --- active_schemas ---
+
+    /// WP16 (FR-14): the agent-facing catalog carries the same owned path
+    /// annotations the MCP serving path does, so `x-daimonos-path` is consistent
+    /// across frontends. `read_file.path` is marked; its non-path `offset` is
+    /// not, and the opaque `execute_script.code` is never marked.
+    #[test]
+    fn active_schemas_carry_owned_path_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let schemas = default_schemas(dir.path());
+        let read_file = schemas
+            .iter()
+            .find(|s| s.name == "read_file")
+            .expect("read_file schema");
+        let props = &read_file.input_schema["properties"];
+        assert_eq!(
+            props["path"][crate::path_annotations::PATH_ANNOTATION_KEY],
+            json!(true)
+        );
+        assert!(props["offset"]
+            .get(crate::path_annotations::PATH_ANNOTATION_KEY)
+            .is_none());
+
+        let script = schemas
+            .iter()
+            .find(|s| s.name == "execute_script")
+            .expect("execute_script schema");
+        assert!(script.input_schema["properties"]["code"]
+            .get(crate::path_annotations::PATH_ANNOTATION_KEY)
+            .is_none());
+    }
 
     #[test]
     fn execute_script_schema_includes_generated_tool_signatures() {

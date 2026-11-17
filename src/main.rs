@@ -29,6 +29,7 @@ mod mcp_config_cmd;
 mod mcp_oauth;
 mod observability;
 mod ops;
+mod path_annotations;
 mod path_policy;
 mod paths;
 mod pipeline_cache;

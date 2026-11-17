@@ -51,7 +51,7 @@ def test_tool_contract_dump_basic(daimonos_binary, tmp_path):
     non-empty tools array, and the effective-options block."""
     doc = _dump(daimonos_binary, tmp_path)
 
-    assert doc["contract_version"] == "1.0.0"
+    assert doc["contract_version"] == "1.1.0"
     assert isinstance(doc["tools"], list) and doc["tools"], "tools array is empty"
     for entry in doc["tools"]:
         assert entry["name"]
@@ -145,7 +145,7 @@ def test_contract_version_reported_over_mcp_initialization(daimonos_binary, tmp_
     result = _mcp_initialize_result(daimonos_binary, tmp_path)
     meta = result.get("_meta", {})
     assert CONTRACT_META_KEY in meta, f"_meta missing {CONTRACT_META_KEY}: {meta}"
-    assert meta[CONTRACT_META_KEY] == "1.0.0"
+    assert meta[CONTRACT_META_KEY] == "1.1.0"
     # The binary version stays a distinct, unchanged field.
     assert meta[CONTRACT_META_KEY] != result["serverInfo"]["version"] or True
 
@@ -272,9 +272,9 @@ def test_opt_out_mcp_init_is_additive_only(daimonos_binary, tmp_path):
     assert meta["io.daimonos/server-kind"] == "mcp"
     # Binary-version contract preserved and distinct from the contract version.
     assert result["serverInfo"]["version"] == _cargo_pkg_version()
-    assert meta[CONTRACT_META_KEY] == "1.0.0"
+    assert meta[CONTRACT_META_KEY] == "1.1.0"
     assert result["serverInfo"]["version"] != meta[CONTRACT_META_KEY] or (
-        _cargo_pkg_version() == "1.0.0"
+        _cargo_pkg_version() == "1.1.0"
     )
 
 
@@ -421,7 +421,7 @@ def test_contract_version_reported_over_socket_initialization(daimonos_binary, t
         assert "result" in resp, f"socket initialize failed: {resp}"
         meta = resp["result"].get("_meta", {})
         assert CONTRACT_META_KEY in meta, f"socket _meta missing {CONTRACT_META_KEY}: {meta}"
-        assert meta[CONTRACT_META_KEY] == "1.0.0"
+        assert meta[CONTRACT_META_KEY] == "1.1.0"
     finally:
         proc.terminate()
         try:

@@ -511,6 +511,33 @@ version is reported over MCP initialization in
 `_meta["io.daimonos/tool-contract-version"]`, separate from the binary version.
 Changes are tracked in `docs/tool-contract-changelog.md` (see ADR-029).
 
+#### Owned path annotations (`x-daimonos-path`)
+
+Every Daimonos-owned tool argument whose value is a filesystem path, a glob, or
+a directory to walk is marked in the tool's input schema with the standard
+annotation `"x-daimonos-path": true` (FR-14). The marker means the same thing in
+every tool: *this string is a filesystem location Daimonos resolves against the
+run root.* For an array of paths the marker sits on the array's `items` schema,
+so the path **elements** are marked. A caller can therefore enumerate a tool's
+path slots directly from its schema, with no hand-written per-tool list.
+
+The annotation is unconditional (there is no option to disable it) and purely
+additive: it adds the marker and changes no other schema keyword. It is
+**semantic, not spelling** — these are deliberately *not* marked:
+
+- opaque command, argv, or script-code strings (`exec.command`/`exec.args`,
+  `execute_script.code`, raw `git.args`);
+- agent-mail reservation glob patterns (`reserve_paths.paths`,
+  `release_reservations.paths`, `check_conflicts.paths`), which are opaque
+  reservation keys never resolved against the filesystem;
+- URLs, revisions, search patterns, identifiers, and enums;
+- caller-provided MCP worker tools and the caller's final-answer schema.
+
+Because the marks are applied in the shared serving pipeline, the
+`daimonos tool-contract` dump and the live `tools/list` carry identical marks
+for the same inputs. ADR-022 performs the actual path enforcement and reads the
+same owned-argument table (`src/path_annotations.rs`). See ADR-029 and FR-14.
+
 ### `[session]` — Daemon-owned agent sessions
 
 These limits apply to transport-independent agent sessions shared by ACP,

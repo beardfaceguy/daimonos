@@ -62,6 +62,15 @@ deterministic dump is byte-stable, equals `tools/list` for the same workspace,
 config, and schema mode, and that the contract version reported over MCP
 initialization equals the dump's version.
 
+`tests/test_path_annotations.py` (FR-14) drives the same real `daimonos
+tool-contract` dump and asserts AC-14.1: every Daimonos-owned filesystem path,
+glob, or walk argument — including the elements of path arrays — carries the
+`x-daimonos-path` annotation, and no non-path, opaque-command/script, or
+reservation-glob argument does. A Rust seam test
+(`tool_facade::active_schemas_carry_owned_path_annotations`) checks the agent
+catalog carries the same marks, since no model-free process interface observes
+it. No provider API key is required.
+
 Temporary programs under `target/test-tools` can support local checks on a restricted host.
 They are not a required bootstrap path. Use the documented package installation on a clean host.
 If a local run uses temporary programs, report their versions and the PATH prefix explicitly.

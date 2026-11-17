@@ -151,6 +151,7 @@ No independent updater/downloader service appeared in the inspected first-party 
 - WP18/WP19 test cooperative stops, process-group teardown, cached/composite accounting, and complete digest failure when the budget is insufficient.
 - WP20 tests the full admitted read catalog while observing DNS, socket/connect, and child attempts from startup through shutdown.
 - WP15 tests (implemented) assert the `tool-contract` dump is byte-stable, equals MCP `tools/list` for the same workspace/config/schema-mode, mutates nothing in the workspace, and reports a contract version over MCP initialization equal to the dump's; the dump performs no implicit discovery or evidence scan and starts no session store.
+- WP16 tests (implemented) assert AC-14.1 over the `tool-contract` dump: for every owned tool, every filesystem path/glob/walk argument (including array `items`) carries `x-daimonos-path: true` and no other argument does; opaque command/script args and agent-mail reservation glob patterns are left unmarked. The marks are added in the shared serving pipeline (no second tool list) and moved the tool-contract version to 1.1.0; they add no state writer, discovery source, or network producer.
 - Observation must demonstrate zero attempted outbound IP activity, not just failed requests under a disconnected network.
 - A source row with no test mapping remains an integration blocker. New consumers update this inventory in the same change.
 

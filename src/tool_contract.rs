@@ -31,7 +31,7 @@ use crate::verbosity::Verbosity;
 /// breaking tool change (name/argument/result shape); minor for additive
 /// compatible changes; patch for corrections. Every bump needs a
 /// `docs/tool-contract-changelog.md` entry.
-pub const CONTRACT_VERSION: &str = "1.0.0";
+pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// MCP initialization `_meta` key carrying [`CONTRACT_VERSION`] (AC-13.2). It is
 /// distinct from the server-kind key and from `serverInfo.version` (the binary
@@ -283,7 +283,7 @@ mod tests {
         let inputs = inputs_for(&cfg, &descriptions, dir.path());
         let catalog = EffectiveToolCatalog::freeze(&inputs).unwrap();
         let doc = catalog.export();
-        assert_eq!(doc.contract_version, "1.0.0");
+        assert_eq!(doc.contract_version, "1.1.0");
         assert!(!doc.tools.is_empty());
         for tool in &doc.tools {
             assert!(!tool.name.is_empty());

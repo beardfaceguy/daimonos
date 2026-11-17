@@ -24,6 +24,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `serverInfo.version` (binary version) are unchanged. The session-free
   `daimonos tool-contract` command also writes no state artifacts, including no
   secure log file in the resolved state directory.
+- **Owned path annotations (FR-14).** Every Daimonos-owned tool argument whose
+  value is a filesystem path, a glob, or a directory to walk — including the
+  elements of path arrays — now carries the standard JSON Schema annotation
+  `"x-daimonos-path": true` in the served and exported schemas, so a caller can
+  enumerate a tool's path slots without a hand-written list. Opaque
+  command/script/argv strings, agent-mail reservation glob patterns, URLs, and
+  caller-provided worker / final-answer schemas are deliberately not marked.
+- **Default behavior change (FR-14, no opt-out).** The path annotations above are
+  added unconditionally to the served schemas (there is no option to disable
+  them). They are purely additive metadata: no existing schema key, tool, or
+  argument is changed or removed. Because a newly populated schema annotation is
+  an additive contract change, the tool-contract version moves from `1.0.0` to
+  `1.1.0` (`docs/tool-contract-changelog.md`); the binary version
+  (`serverInfo.version`) is unchanged.
 
 ## [0.1.5] - 2026-10-18
 
