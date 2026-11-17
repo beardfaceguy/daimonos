@@ -158,10 +158,15 @@ pub fn base_url_host(url: &str) -> Option<String> {
 
 /// One versioned audit event, exactly as serialized to the JSONL stream:
 /// `audit_version`, `run_id`, `sequence`, `kind`, then the kind-specific fields
-/// in insertion order. Reserved public name (reviewer-runtime INTERFACES.md
-/// "Audit, output, and resource contracts"); constructing it and calling
-/// [`AuditEvent::to_json`] yields byte-identical output to the map the sink
-/// writes, so the typed event and the stream never drift.
+/// in a stable sorted order. Reserved public name (reviewer-runtime
+/// INTERFACES.md "Audit, output, and resource contracts").
+///
+/// The field order is fixed by this type's own [`serde::Serialize`] impl
+/// (header keys in a fixed logical order, then the kind-specific keys sorted),
+/// so a written record's layout never depends on serde_json's optional
+/// `preserve_order` feature (R4). INTERFACES.md only fixes the four header
+/// fields and "the fields allowed for that kind", not an insertion order, so
+/// recording a stable sorted order is within the accepted schema.
 #[derive(Debug, Clone)]
 pub struct AuditEvent {
     pub audit_version: &'static str,
@@ -171,21 +176,25 @@ pub struct AuditEvent {
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
-impl AuditEvent {
-    /// The ordered JSON object written as one line of the stream.
-    pub fn to_json(&self) -> serde_json::Value {
-        let mut event = serde_json::Map::new();
-        event.insert(
-            "audit_version".into(),
-            serde_json::json!(self.audit_version),
-        );
-        event.insert("run_id".into(), serde_json::json!(self.run_id));
-        event.insert("sequence".into(), serde_json::json!(self.sequence));
-        event.insert("kind".into(), serde_json::json!(self.kind));
-        for (key, value) in &self.fields {
-            event.insert(key.clone(), value.clone());
+impl serde::Serialize for AuditEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(4 + self.fields.len()))?;
+        map.serialize_entry("audit_version", &self.audit_version)?;
+        map.serialize_entry("run_id", &self.run_id)?;
+        map.serialize_entry("sequence", &self.sequence)?;
+        map.serialize_entry("kind", &self.kind)?;
+        // Stable key order independent of the serde_json `preserve_order`
+        // feature, so the record layout cannot drift with a Cargo feature (R4).
+        let mut keys: Vec<&String> = self.fields.keys().collect();
+        keys.sort();
+        for key in keys {
+            map.serialize_entry(key, &self.fields[key])?;
         }
-        serde_json::Value::Object(event)
+        map.end()
     }
 }
 
@@ -487,7 +496,7 @@ impl RunAudit {
                 kind: kind.to_string(),
                 fields,
             };
-            let mut line = serde_json::to_string(&event.to_json()).map_err(|error| {
+            let mut line = serde_json::to_string(&event).map_err(|error| {
                 AuditFailure::new(format!("audit event not serializable: {error}"))
             })?;
             if line.len() > self.limits.max_event_bytes {
@@ -778,15 +787,18 @@ mod tests {
             kind: "run_end".into(),
             fields,
         };
-        let json = event.to_json();
+        let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["audit_version"], AUDIT_VERSION);
         assert_eq!(json["run_id"], "r");
         assert_eq!(json["sequence"], 3);
         assert_eq!(json["kind"], "run_end");
         assert_eq!(json["status"], "ok");
+        // Field order is fixed by AuditEvent's own Serialize impl (header keys
+        // first, then the kind-specific fields in a stable sorted order), so it
+        // never depends on serde_json's optional `preserve_order` feature (R4).
         assert_eq!(
-            serde_json::to_string(&json).unwrap(),
-            r#"{"audit_version":"1","run_id":"r","sequence":3,"kind":"run_end","status":"ok","exit_code":0}"#
+            serde_json::to_string(&event).unwrap(),
+            r#"{"audit_version":"1","run_id":"r","sequence":3,"kind":"run_end","exit_code":0,"status":"ok"}"#
         );
     }
 

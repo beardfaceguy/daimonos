@@ -191,6 +191,12 @@ def test_successful_run_writes_run_start_and_run_end(daimonos_binary, tmp_path):
     assert DONE in completed.stdout, completed.stdout
     assert audit_path.exists(), "audit record was not written"
 
+    # R6: the audit file is created private (owner-only 0600) — never group- or
+    # world-readable — so a run's own evidence record cannot leak via mode.
+    import stat as _stat
+    mode = _stat.S_IMODE(audit_path.stat().st_mode)
+    assert mode == 0o600, oct(mode)
+
     events = _read_events(audit_path)
     assert len(events) >= 2, events
     for i, ev in enumerate(events):
@@ -310,11 +316,21 @@ def test_model_requests_recorded_and_no_credential_in_record(daimonos_binary, tm
     raw = Path(audit_path).read_text()
     events = _read_events(audit_path)
 
+    # R2: run_start records the effective policy exactly as configured — the
+    # tool allowlist from the agent env and the evidence root — so removing
+    # either recording would fail here (not merely a key-presence check).
+    assert events[0]["kind"] == "run_start", events[0]
+    assert events[0]["effective_allowlist"] == ["read_file", "write_file", "ls"], events[0]
+    assert events[0]["effective_root"] == str(tmp_path / "evidence"), events[0]
+
     model_requests = _by_kind(events, "model_request")
     assert model_requests, f"no model_request events: {events}"
     assert model_requests[0]["request_sequence"] == 0, model_requests[0]
     assert model_requests[0]["probe"] is False, model_requests[0]
     assert "http_status" in model_requests[0], model_requests[0]
+    # R2: the endpoint-reported token usage is recorded against the configured
+    # fake provider's counts (prompt_tokens=42, completion_tokens=7).
+    assert model_requests[0]["usage"] == {"input_tokens": 42, "output_tokens": 7}, model_requests[0]
     # sequences are contiguous per model request
     seqs = [m["request_sequence"] for m in model_requests]
     assert seqs == list(range(len(seqs))), seqs
@@ -553,6 +569,24 @@ def test_interactive_agent_refuses_audit_path(daimonos_binary, tmp_path):
     finally:
         provider.close()
     _assert_refused(rc, stderr, audit_path)
+
+
+def test_dry_run_refuses_audit_path(daimonos_binary, tmp_path):
+    """R3: `agent --dry-run` is a pure inspection mode that writes no audit, so
+    it refuses --audit-path at startup (exit 2, audit_unsupported_frontend) and
+    creates no file — a dry run must never look audited."""
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        _, state, audit_path, env, agent_env = _frontend_base(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(tmp_path / "evidence"),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "agent", "--dry-run", "--agent-env", str(agent_env), "hi"]
+        rc, stderr = _spawn_collect(cmd, env)
+    finally:
+        provider.close()
+    _assert_refused(rc, stderr, audit_path)
+    # No model request runs either: refusal precedes any provider contact.
+    assert provider.post_count == 0, provider.post_count
 
 
 def _write_config(tmp_path, body):
