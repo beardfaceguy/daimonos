@@ -90,7 +90,14 @@ async fn read_confined(session: &mut Session, op: &Op) -> Response {
         .as_ref()
         .expect("confined read requires authority");
     let requested = session.resolve_path(raw);
-    let authorized = match authority.open_read(&requested) {
+    // WP14: under the no-follow policy, a symlink read is refused with its
+    // target text rather than followed to the target's content.
+    let open_result = if authority.no_follow() {
+        authority.open_read_no_follow(&requested)
+    } else {
+        authority.open_read(&requested)
+    };
+    let authorized = match open_result {
         Ok(file) => file,
         Err(error) => return error.with_argument(raw).into_response("read_file"),
     };
@@ -469,13 +476,16 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
             .and_then(|pattern| glob::Pattern::new(pattern).ok());
     let filter = op.n2;
     let result = tokio::task::spawn_blocking(move || {
-        let start = authority.open_read(&path)?;
+        // WP14: honor no-follow for the explicit scope so a symlink named as
+        // the ls root is refused with its target, never listed through.
+        let start = authority.open_read_policy(&path)?;
         let base = start.relative_path().to_path_buf();
         let walk = authority.walk(
             &path,
             WalkOptions {
                 max_depth: Some(depth - 1),
-                follow_symlinks: true,
+                // WP14: no-follow lists links but never descends into them.
+                follow_symlinks: !authority.no_follow(),
                 include_hidden: show_all,
                 skip_dirs: SKIP_DIRS,
             },
@@ -643,7 +653,11 @@ pub async fn stat(session: &Session, op: &Op) -> Response {
             Ok(None) => {}
             Err(error) => return error.with_argument(path).into_response("stat"),
         }
-        let entry = match authority.open_read(&requested) {
+        // WP14 (FR-12): honor no-follow for the fallthrough. When the final
+        // element is not itself a link but an intermediate component is a
+        // symlink, `open_read` would follow it and leak the resolved target's
+        // type/size; `open_read_policy` refuses it under no-follow with target.
+        let entry = match authority.open_read_policy(&requested) {
             Ok(entry) => entry,
             Err(error) => return error.with_argument(path).into_response("stat"),
         };
@@ -760,8 +774,9 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let supplied = Path::new(&pattern);
         if explicit_scope {
+            // WP14: no-follow refuses a symlink named as the glob scope.
             authority
-                .open_read(&scope)
+                .open_read_policy(&scope)
                 .map_err(|error| error.with_argument(&scope_argument))?;
         }
         let (scope, relative) = if supplied.is_absolute() {
@@ -773,8 +788,9 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
             )
         } else {
             if !explicit_scope {
+                // WP14: no-follow refuses a symlink named as the glob scope.
                 authority
-                    .open_read(&scope)
+                    .open_read_policy(&scope)
                     .map_err(|error| error.with_argument(&scope_argument))?;
             }
             (scope, supplied.to_path_buf())
@@ -809,7 +825,8 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
             suffix.push(name);
         }
         let start = scope.join(prefix);
-        let directory = match authority.open_read(&start) {
+        // WP14: no-follow refuses a symlink in the glob prefix path.
+        let directory = match authority.open_read_policy(&start) {
             Ok(directory) => directory,
             Err(error) if error.code == crate::path_policy::CODE_PATH_NOT_FOUND => {
                 return Ok((Vec::new(), 0));
@@ -836,6 +853,8 @@ async fn glob_confined(session: &Session, op: &Op) -> Response {
                 &directory,
                 WalkOptions {
                     max_depth: depth,
+                    // WP14: no-follow never walks through links.
+                    follow_symlinks: !authority.no_follow(),
                     ..WalkOptions::default()
                 },
             )
@@ -901,9 +920,18 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
 
     let pattern_clone = pattern.clone();
     let workspace = session.workspace.clone();
+    // D08 (ADR-021, FR-09): explicit-only runs let no implicit ignore file steer the walk.
+    let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
 
     let result = tokio::task::spawn_blocking(move || {
-        grep_blocking(&pattern_clone, &root, &workspace, max, file_glob.as_deref())
+        grep_blocking(
+            &pattern_clone,
+            &root,
+            &workspace,
+            max,
+            file_glob.as_deref(),
+            apply_ignore_files,
+        )
     })
     .await;
 
@@ -950,6 +978,10 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
         op.n.unwrap_or(session.cfg.search.default_grep_max as i64)
             .max(1) as usize;
     let file_glob = op.g.clone();
+    // D08 (ADR-021, FR-09): explicit-only runs read no implicit ignore file,
+    // even under confinement (--confine-paths), so a hostile ignore file cannot
+    // steer confined evidence grep.
+    let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
     let result = tokio::task::spawn_blocking(move || {
         let mut searcher = Searcher::new();
         let mut scan = |file: std::fs::File,
@@ -970,7 +1002,9 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
                 .is_ok()
         };
         let mut matches = Vec::new();
-        let start = authority.open_read(&root)?;
+        // WP14: honor no-follow for the explicit scope so a symlink named as
+        // the search root is refused with its target, never scanned through.
+        let start = authority.open_read_policy(&root)?;
         if start.metadata().is_ok_and(|metadata| metadata.is_file()) {
             let display = authority.root().join(start.relative_path());
             if file_glob
@@ -991,10 +1025,16 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
             &root,
             WalkOptions {
                 include_hidden: false,
+                // WP14: no-follow never walks through links.
+                follow_symlinks: !authority.no_follow(),
                 ..WalkOptions::default()
             },
         )?;
-        let ignores = crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &root, &walk);
+        let ignores = if apply_ignore_files {
+            crate::confined_ignore::ConfinedIgnore::from_walk(&authority, &root, &walk)
+        } else {
+            crate::confined_ignore::ConfinedIgnore::disabled(&authority)
+        };
         let mut skipped = walk.skipped.len();
         for entry in walk.entries {
             if matches.len() >= max {
@@ -1010,7 +1050,10 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
             {
                 continue;
             }
-            let authorized = match authority.open_read(&entry.relative_path) {
+            // WP14: under no-follow, re-open via the policy so an in-root
+            // symlink-to-file entry listed by the walk is refused (skipped),
+            // never scanned through to its target's content.
+            let authorized = match authority.open_read_policy(&entry.relative_path) {
                 Ok(authorized) => authorized,
                 Err(_) => {
                     skipped += 1;
@@ -1050,6 +1093,7 @@ fn grep_blocking(
     workspace: &Path,
     max: usize,
     file_glob: Option<&str>,
+    apply_ignore_files: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
     use grep_regex::RegexMatcher;
     use grep_searcher::sinks::UTF8;
@@ -1061,7 +1105,19 @@ fn grep_blocking(
     let mut matches = Vec::new();
 
     let mut walk = WalkBuilder::new(root);
-    walk.hidden(true).git_ignore(true);
+    walk.hidden(true);
+    if apply_ignore_files {
+        walk.git_ignore(true);
+    } else {
+        // D08 (ADR-021, FR-09): disable every implicit ignore-file layer so a
+        // hostile `.gitignore`/`.ignore` cannot steer evidence walks. Built-in
+        // hidden-file filtering is not an ignore file and is left unchanged.
+        walk.git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
 
     let _ = file_glob; // glob filtering handled per-file below
 
@@ -1218,6 +1274,47 @@ mod tests {
         assert_eq!(data["type"], "link");
         assert_eq!(data["target"], "missing");
         assert_eq!(data["broken"], true);
+    }
+
+    #[tokio::test]
+    async fn confined_no_follow_stat_through_intermediate_dir_link_refused() {
+        // WP14 R1: under no-follow, STAT on a path routed through an in-root
+        // intermediate directory symlink must refuse (symlink_refused + target)
+        // and must NOT return the resolved target's type/size. Reached via the
+        // native STAT opcode through ops::dispatch (no MCP `stat` tool exists).
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("real")).unwrap();
+        std::fs::write(workspace.path().join("real/f.txt"), "DEEP_SENTINEL").unwrap();
+        symlink("real", workspace.path().join("alias")).unwrap();
+        let mut cfg = Config::default();
+        let mut authority =
+            crate::path_policy::FilesystemAuthority::confined(workspace.path(), cfg.fs_limits())
+                .unwrap();
+        authority.set_no_follow(true);
+        cfg.filesystem_authority = Some(Arc::new(authority));
+        let mut session = Session::new(workspace.path().to_path_buf(), Arc::new(cfg));
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::STAT,
+                p: Some("alias/f.txt".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(
+            !response.ok,
+            "stat followed intermediate link: {:?}",
+            response.d
+        );
+        let data = response.d.expect("refusal carries metadata");
+        assert_eq!(data["code"], "symlink_refused");
+        assert_eq!(data["target"], "real");
+        // No resolved target type/size is disclosed.
+        assert!(data.get("type").is_none(), "leaked type: {data}");
+        assert!(data.get("size").is_none(), "leaked size: {data}");
+        assert!(!data.to_string().contains("DEEP_SENTINEL"));
     }
 
     #[tokio::test]

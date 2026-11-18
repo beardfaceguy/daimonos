@@ -44,6 +44,64 @@ pub struct AgentArgs {
         conflicts_with = "interactive"
     )]
     pub debug_thoughts_path: Option<PathBuf>,
+    /// WP07 (FR-04): opt-in controlled model transport. Path to ONE JSON object
+    /// owning the five required values (`provider_label`, `model`, `base_url`,
+    /// `wire` = "chat"|"messages", `credential_env`) and the optional controlled
+    /// request settings (`max_tokens`, `timeout_ms`, `request_retries`, `proxy`,
+    /// `extra_body_fields`). The sole source for those values; cannot be combined
+    /// with --model/--provider. Default off keeps legacy provider behavior.
+    #[arg(
+        long,
+        value_name = "PATH",
+        // WP07 R1 (review r3): the controlled profile is honored only by the
+        // one-shot print send-path. Interactive mode returns through the session
+        // daemon, which carries no profile, so it could only fall back to the
+        // legacy transport. A security-critical opt-in must fail closed: refuse
+        // the combination at parse time. Interactive mode is reachable only via
+        // --interactive (tui::resolve_agent_mode), so this closes every path.
+        conflicts_with_all = ["model", "provider", "interactive"]
+    )]
+    pub model_profile: Option<PathBuf>,
+    /// Opt-in structured final output (ADR-024, FR-01). Path to a JSON control
+    /// file: `schema` XOR `schema_path`, `tool_name`, `tool_description`,
+    /// `corrective_retries`, and optional `max_model_requests`. On success the
+    /// run emits only the validated argument JSON and one newline on stdout; a
+    /// failed ending emits the typed final-output error. Default off.
+    ///
+    /// Honored only by the one-shot `--print` path. Interactive and dry-run
+    /// modes cannot emit a single validated terminal document, so the flag is
+    /// refused there at startup (ADR-024 / INTERFACES.md frontend coverage)
+    /// rather than silently ignored. The chat, ACP, and session-daemon
+    /// frontends never carry this agent-only flag at all.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
+    pub final_output: Option<PathBuf>,
+    /// WP09 (FR-04 requirements 14-17, ADR-027): opt-in same-tool capability
+    /// probe. Path to a JSON file holding ONE minimal valid payload for the
+    /// final-answer tool. Before any evidence tool runs, Daimonos sends exactly
+    /// one unretried probe offering the frozen run tool catalog and asking the
+    /// model to call the final-answer tool once with this payload. Only one
+    /// schema-valid final call passes; any other outcome exits 21
+    /// (`model_unsupported`) and does no further work. Requires --final-output
+    /// (FR-01) and --model-profile (controlled transport); omitting either is a
+    /// startup refusal (exit 2). Default off.
+    #[arg(long, value_name = "PATH")]
+    pub capability_probe_payload: Option<PathBuf>,
+    /// WP10 (FR-05, ADR-028): opt-in credential-free worker execution. Path to
+    /// a JSON control file of explicit MCP-stdio worker definitions and their
+    /// explicit, credential-free child environment (`workers` map of
+    /// name -> {command, args, env}). When set, every non-final tool call is
+    /// routed to a caller-supplied worker or refused; nothing runs in the
+    /// model-side process, and no credential, provider config, or inherited
+    /// environment reaches a worker. The final-answer tool (FR-01) is validated
+    /// and emitted model-side and is never forwarded to a worker. Default off.
+    ///
+    /// Honored only by the one-shot `--print` path. Interactive and dry-run
+    /// modes cannot host the two-process split (interactive returns through the
+    /// worker-less session daemon; dry-run never runs the loop), so the flag is
+    /// refused there at startup rather than silently ignored. The chat, ACP,
+    /// and session-daemon frontends never carry this agent-only flag at all.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
+    pub worker_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -206,6 +264,9 @@ pub enum Command {
     McpConfig(McpConfigArgs),
     /// Run the compact opcode protocol daemon over a Unix socket.
     Daemon,
+    /// Print the effective tool contract as deterministic JSON and exit
+    /// (WP15, FR-13). Session-free: no model run or session store is started.
+    ToolContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +282,7 @@ pub enum RuntimeMode {
     McpAuth,
     Daemon,
     Stats,
+    ToolContract,
 }
 
 impl RuntimeMode {
@@ -237,6 +299,7 @@ impl RuntimeMode {
             Self::McpAuth => "mcp_auth",
             Self::Daemon => "socket",
             Self::Stats => "stats",
+            Self::ToolContract => "tool_contract",
         }
     }
 
@@ -321,6 +384,54 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub confine_root: Option<PathBuf>,
 
+    /// Prohibit every workspace mutation end to end (FR-07, ADR-022). Internal
+    /// state still writes under `--state-dir`. Default off; when absent,
+    /// behavior is unchanged.
+    #[arg(long, global = true, default_value_t = false)]
+    pub workspace_read_only: bool,
+
+    /// Write a caller-requested, private JSONL run audit to PATH (WP08, FR-04).
+    /// Default off. The destination is outside evidence and, with --state-dir,
+    /// must be under the state root. A requested audit write failure stops the
+    /// run (exit 23). Context: ADR-026.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub audit_path: Option<PathBuf>,
+
+    /// Enforce an explicit tool allowlist for the run (FR-02, ADR-023). PATH is
+    /// a JSON array of exact exported tool names. Omitted keeps legacy
+    /// behavior (all tools). An empty array `[]` grants no tools. Unknown names
+    /// fail at startup (exit 2). The list is the effective set at every model
+    /// listing and every direct, batch, Starlark, plugin, and remote dispatch;
+    /// it cannot be widened by workspace/environment config. Default off.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub tool_allowlist: Option<PathBuf>,
+
+    /// Serve and export full, self-contained JSON Schema draft 2020-12 tool
+    /// schemas instead of the default stripped placeholders (WP17, FR-15).
+    /// Equivalent to `[mcp] full_tool_schemas = true`; the config/env seam still
+    /// applies. Opt-in: the legacy terse/lazy serving stays the default when it
+    /// is absent. Context: docs/adr/030-self-contained-full-schemas.md.
+    #[arg(long, global = true, default_value_t = false)]
+    pub full_tool_schemas: bool,
+
+    /// Refuse every implicit configuration source (environment files, config,
+    /// instructions, skills, registrations, ignore files); honour only explicit
+    /// caller inputs such as `--config` (reviewer-runtime INTERFACES.md, FR-09;
+    /// ADR-021). Default-off: current discovery behaviour is unchanged.
+    #[arg(long, global = true, default_value_t = false)]
+    pub ignore_config_files: bool,
+
+    /// Bound oversized tool output in place without writing a full-output spill
+    /// copy or emitting a saved-file pointer (ADR-021, FR-11). Truncated results
+    /// keep paging/narrowing guidance. Default behavior is preserved when absent.
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_output_spill: bool,
+
+    /// Report symbolic links without following them. Independent of
+    /// confinement; both may be combined (ADR-022, WP14, FR-12).
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_follow_symlinks: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -329,6 +440,19 @@ impl Cli {
     /// True when either confinement flag is present (ADR-022).
     pub fn confinement_requested(&self) -> bool {
         self.confine_paths || self.confine_root.is_some()
+    }
+
+    /// True when explicit-only configuration discovery is requested (FR-09).
+    pub fn explicit_only(&self) -> bool {
+        self.ignore_config_files
+    }
+
+    /// True when the shared filesystem authority must be constructed: either
+    /// confinement or the independent no-follow option is requested (ADR-022,
+    /// WP14). No-follow is enforced through the same pinned-root authority, so
+    /// the authority is built even when confinement is absent.
+    pub fn filesystem_authority_requested(&self) -> bool {
+        self.confinement_requested() || self.no_follow_symlinks
     }
 
     /// Resolve old flags and normalized subcommands to one runtime identity.
@@ -348,6 +472,7 @@ impl Cli {
                 .map(RuntimeMode::McpSocket)
                 .unwrap_or(RuntimeMode::McpStdio),
             Some(Command::Daemon) => RuntimeMode::Daemon,
+            Some(Command::ToolContract) => RuntimeMode::ToolContract,
             None if self.stats => RuntimeMode::Stats,
             None if self.mcp => RuntimeMode::McpStdio,
             None => self
@@ -364,6 +489,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignore_config_files_is_global_and_default_off() {
+        assert!(!Cli::try_parse_from(["daimonos", "mcp"])
+            .unwrap()
+            .explicit_only());
+        assert!(
+            Cli::try_parse_from(["daimonos", "--ignore-config-files", "mcp"])
+                .unwrap()
+                .explicit_only()
+        );
+        assert!(
+            Cli::try_parse_from(["daimonos", "mcp", "--ignore-config-files"])
+                .unwrap()
+                .explicit_only()
+        );
+    }
+
+    #[test]
     fn confinement_flags_are_global_and_root_implies_confinement() {
         assert!(Cli::try_parse_from(["daimonos", "--confine-paths", "acp"]).is_ok());
         assert!(Cli::try_parse_from(["daimonos", "acp", "--confine-paths"]).is_ok());
@@ -373,6 +515,26 @@ mod tests {
         assert!(!Cli::try_parse_from(["daimonos", "acp"])
             .unwrap()
             .confinement_requested());
+    }
+
+    #[test]
+    fn no_output_spill_is_a_global_opt_in_flag() {
+        // Global: parses before and after a subcommand, and defaults off.
+        assert!(
+            !Cli::try_parse_from(["daimonos", "mcp"])
+                .unwrap()
+                .no_output_spill
+        );
+        assert!(
+            Cli::try_parse_from(["daimonos", "--no-output-spill", "mcp"])
+                .unwrap()
+                .no_output_spill
+        );
+        assert!(
+            Cli::try_parse_from(["daimonos", "mcp", "--no-output-spill"])
+                .unwrap()
+                .no_output_spill
+        );
     }
 
     #[test]

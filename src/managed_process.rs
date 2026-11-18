@@ -201,18 +201,41 @@ impl Drop for ManagedChild {
 /// Long-lived background child plus its bounded output-drain tasks.
 pub struct ManagedBackground {
     pub child: ManagedChild,
-    pub output_path: PathBuf,
+    /// Artifact file the output was drained to. `None` under no-spill
+    /// (ADR-021, FR-11), where output is held in [`ManagedBackground::buffer`]
+    /// and no file is written or advertised.
+    pub output_path: Option<PathBuf>,
+    /// No-spill in-memory capture (ADR-021, FR-11); `None` in the default
+    /// (artifact-file) mode. Bounded by `artifact_max_bytes` like the file.
+    buffer: Option<Arc<Mutex<Vec<u8>>>>,
     drains: Vec<tokio::task::JoinHandle<io::Result<()>>>,
 }
 
 impl ManagedBackground {
-    pub fn spawn(command: &mut Command, cfg: &ProcessConfig, label: &str) -> io::Result<Self> {
-        let (output_path, file) = create_artifact(cfg, label)?;
+    pub fn spawn(
+        command: &mut Command,
+        cfg: &ProcessConfig,
+        label: &str,
+        save_full_output: bool,
+    ) -> io::Result<Self> {
+        // No-spill (ADR-021, FR-11): when the caller opted out of saved copies,
+        // capture the child's output in a bounded in-memory buffer instead of a
+        // private artifact file, so nothing is written to a state location and
+        // no artifact path can be advertised. Default (spill) behavior is
+        // unchanged when `save_full_output` is true.
+        let (output_path, file) = if save_full_output {
+            let (path, file) = create_artifact(cfg, label)?;
+            (Some(path), Some(file))
+        } else {
+            (None, None)
+        };
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match ManagedChild::spawn(command) {
             Ok(child) => child,
             Err(error) => {
-                remove_artifact(&output_path);
+                if let Some(path) = &output_path {
+                    remove_artifact(path);
+                }
                 return Err(error);
             }
         };
@@ -224,20 +247,38 @@ impl ManagedBackground {
             .stderr_mut()
             .take()
             .ok_or_else(|| io::Error::other("spawned process has no stderr pipe"))?;
-        let file = Arc::new(Mutex::new(tokio::fs::File::from_std(file)));
         let written = Arc::new(AtomicU64::new(0));
         let max = cfg.artifact_max_bytes;
-        let stdout_drain = tokio::spawn(drain_to_artifact(
-            stdout,
-            Arc::clone(&file),
-            Arc::clone(&written),
-            max,
-        ));
-        let stderr_drain = tokio::spawn(drain_to_artifact(stderr, file, written, max));
+        let (buffer, drains) = match file {
+            Some(file) => {
+                let file = Arc::new(Mutex::new(tokio::fs::File::from_std(file)));
+                let stdout_drain = tokio::spawn(drain_to_artifact(
+                    stdout,
+                    Arc::clone(&file),
+                    Arc::clone(&written),
+                    max,
+                ));
+                let stderr_drain = tokio::spawn(drain_to_artifact(stderr, file, written, max));
+                (None, vec![stdout_drain, stderr_drain])
+            }
+            None => {
+                let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+                let stdout_drain = tokio::spawn(drain_to_memory(
+                    stdout,
+                    Arc::clone(&buffer),
+                    Arc::clone(&written),
+                    max,
+                ));
+                let stderr_drain =
+                    tokio::spawn(drain_to_memory(stderr, Arc::clone(&buffer), written, max));
+                (Some(buffer), vec![stdout_drain, stderr_drain])
+            }
+        };
         Ok(Self {
             child,
             output_path,
-            drains: vec![stdout_drain, stderr_drain],
+            buffer,
+            drains,
         })
     }
 
@@ -266,7 +307,27 @@ impl ManagedBackground {
     }
 
     pub fn cleanup_artifact(&self) {
-        remove_artifact(&self.output_path);
+        if let Some(path) = &self.output_path {
+            remove_artifact(path);
+        }
+    }
+
+    /// Last `line_count` lines of captured output, bounded to `max_read_bytes`.
+    /// Reads the in-memory buffer under no-spill (ADR-021, FR-11) or the
+    /// artifact file otherwise, so `poll` is identical to the caller either way.
+    pub async fn read_tail(&self, line_count: usize, max_read_bytes: usize) -> io::Result<String> {
+        if let Some(buffer) = &self.buffer {
+            let bytes = buffer.lock().await;
+            let start = bytes.len().saturating_sub(max_read_bytes);
+            let text = String::from_utf8_lossy(&bytes[start..]);
+            let lines: Vec<&str> = text.lines().collect();
+            let from = lines.len().saturating_sub(line_count);
+            Ok(lines[from..].join("\n"))
+        } else if let Some(path) = &self.output_path {
+            tail_lines(path, line_count, max_read_bytes).await
+        } else {
+            Ok(String::new())
+        }
     }
 }
 
@@ -275,7 +336,9 @@ impl Drop for ManagedBackground {
         for drain in &self.drains {
             drain.abort();
         }
-        remove_artifact(&self.output_path);
+        if let Some(path) = &self.output_path {
+            remove_artifact(path);
+        }
     }
 }
 
@@ -299,6 +362,32 @@ async fn drain_to_artifact<R: AsyncRead + Unpin>(
         let mut file = file.lock().await;
         file.write_all(&chunk[..retained]).await?;
         file.flush().await?;
+    }
+}
+
+/// No-spill (ADR-021, FR-11) analogue of [`drain_to_artifact`]: keep a bounded
+/// prefix of the child's output in memory so `poll` can show it without ever
+/// writing a file. Overflow past `max` is still drained (and dropped) so a
+/// noisy child cannot deadlock on a full pipe, exactly as for the file path.
+async fn drain_to_memory<R: AsyncRead + Unpin>(
+    mut reader: R,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    written: Arc<AtomicU64>,
+    max: u64,
+) -> io::Result<()> {
+    let mut chunk = vec![0; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let start = written.fetch_add(read as u64, Ordering::Relaxed);
+        if start >= max {
+            continue;
+        }
+        let retained = usize::try_from((max - start).min(read as u64)).unwrap_or(read);
+        let mut buffer = buffer.lock().await;
+        buffer.extend_from_slice(&chunk[..retained]);
     }
 }
 

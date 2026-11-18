@@ -26,7 +26,30 @@ pub struct BootstrapOptions<'a> {
     pub agent_instructions: Option<&'a Path>,
     pub confine_reference: Option<&'a Path>,
     pub confine_identity: Option<&'a str>,
+    /// Explicit-only configuration discovery (ADR-021, FR-09). Pinned into the
+    /// daemon launch identity so a daemon started with the mode is never reused
+    /// by a frontend that did not request it, and vice versa.
+    pub ignore_config_files: bool,
+    /// Independent no-follow option (WP14). Part of the daemon's launch
+    /// identity so a pinned session daemon enforces the same link policy.
+    pub no_follow: bool,
     pub debug_tokens: bool,
+    /// FR-07 (ADR-022, WP04): whether the client requested `--workspace-read-only`.
+    /// This is part of the daemon's immutable launch identity: a read-only client
+    /// must spawn a read-only daemon (forwarded in `daemon_args`) and must refuse
+    /// to attach to a daemon that was started without it (hashed into
+    /// `bootstrap_fingerprint`, treated as an explicit selection in
+    /// `launch_identity`). The daemon's `Session::admission` is pinned from the
+    /// DAEMON's own config, so reuse across this boundary would otherwise bypass
+    /// the read-only gate (R4).
+    pub workspace_read_only: bool,
+    /// FR-02 (WP06): the client's `--tool-allowlist` file path. Part of the
+    /// daemon's immutable launch identity exactly like `workspace_read_only`:
+    /// forwarded in `daemon_args`, hashed into `bootstrap_fingerprint`, and an
+    /// explicit selection in `launch_identity`, so a client requesting an
+    /// allowlist cannot be served by a daemon started without the same one (the
+    /// daemon pins `Session::policy` from its OWN config).
+    pub tool_allowlist: Option<&'a Path>,
     pub socket_path: &'a Path,
     pub provider: Option<&'a str>,
     pub model: Option<&'a str>,
@@ -34,6 +57,10 @@ pub struct BootstrapOptions<'a> {
     pub max_frame_bytes: usize,
     pub timeout: Duration,
     pub retry_interval: Duration,
+    /// WP17 (FR-15): serve/export full self-contained schemas in the daemon.
+    /// Part of the launch identity so a frontend requesting it cannot silently
+    /// attach to a daemon launched without it.
+    pub full_tool_schemas: bool,
 }
 
 pub struct BootstrapConnection {
@@ -184,10 +211,23 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
     if options.debug_tokens {
         args.push(OsString::from("--debug-tokens"));
     }
+    if options.workspace_read_only {
+        args.push(OsString::from("--workspace-read-only"));
+    }
+    if let Some(path) = options.tool_allowlist {
+        args.push(OsString::from("--tool-allowlist"));
+        args.push(path.as_os_str().to_owned());
+    }
     if let Some(reference) = options.confine_reference {
         args.push(OsString::from("--confine-paths"));
         args.push(OsString::from("--confine-root"));
         args.push(reference.as_os_str().to_owned());
+    }
+    if options.ignore_config_files {
+        args.push(OsString::from("--ignore-config-files"));
+    }
+    if options.no_follow {
+        args.push(OsString::from("--no-follow-symlinks"));
     }
     args.push(OsString::from("session-daemon"));
     args.push(OsString::from("--socket"));
@@ -203,6 +243,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
     if let Some(path) = options.agent_env {
         args.push(OsString::from("--agent-env"));
         args.push(path.as_os_str().to_owned());
+    }
+    if options.full_tool_schemas {
+        args.push(OsString::from("--full-tool-schemas"));
     }
     args
 }
@@ -235,15 +278,33 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
     if options.debug_tokens {
         digest.update(b"debug-tokens\0");
     }
+    if options.workspace_read_only {
+        digest.update(b"workspace-read-only\0");
+    }
+    if let Some(path) = options.tool_allowlist {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        digest.update(b"tool-allowlist\0");
+        digest.update(canonical.as_os_str().as_bytes());
+        digest.update([0_u8]);
+    }
     if let Some(identity) = options.confine_identity {
         digest.update(b"confined-root\0");
         digest.update(identity.as_bytes());
         digest.update([0_u8]);
     }
+    if options.ignore_config_files {
+        digest.update(b"ignore-config-files\0");
+    }
+    if options.no_follow {
+        digest.update(b"no-follow\0");
+    }
     if let Some(provider) = options.provider {
         digest.update(provider.as_bytes());
     }
     digest.update([0_u8]);
+    if options.full_tool_schemas {
+        digest.update(b"full-tool-schemas\0");
+    }
     format!("{:x}", digest.finalize())
 }
 
@@ -254,7 +315,11 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.state_dir.is_none()
         && options.agent_instructions.is_none()
         && !options.debug_tokens
+        && !options.workspace_read_only
+        && options.tool_allowlist.is_none()
         && options.confine_identity.is_none()
+        && !options.ignore_config_files
+        && !options.no_follow
     {
         return Ok(LaunchIdentity::NotRequested);
     }
@@ -331,12 +396,16 @@ mod tests {
     ) -> BootstrapOptions<'a> {
         BootstrapOptions {
             workspace,
+            tool_allowlist: None,
             config_path: Some(config),
             state_dir: None,
             agent_instructions: None,
             confine_reference: None,
             confine_identity: None,
+            ignore_config_files: false,
+            no_follow: false,
             debug_tokens: false,
+            workspace_read_only: false,
             socket_path: socket,
             provider: Some("openrouter"),
             model: Some("test/model"),
@@ -344,6 +413,7 @@ mod tests {
             max_frame_bytes: 1024,
             timeout: Duration::from_secs(1),
             retry_interval: Duration::from_millis(1),
+            full_tool_schemas: false,
         }
     }
 
@@ -401,6 +471,123 @@ mod tests {
         assert_ne!(
             bootstrap_fingerprint(&first),
             bootstrap_fingerprint(&second)
+        );
+    }
+
+    // WP11 (FR-09, ADR-021): explicit-only mode is pinned into the daemon's
+    // launch identity, the same way --confine-paths is.
+    #[test]
+    fn explicit_only_is_pinned_into_daemon_launch_identity() {
+        let base = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        let explicit = BootstrapOptions {
+            ignore_config_files: true,
+            ..options(
+                Path::new("/workspace"),
+                Path::new("/config.toml"),
+                Path::new("/runtime/session.sock"),
+                Path::new("/agent.env"),
+            )
+        };
+        let args = daemon_args(&explicit);
+        assert!(args.iter().any(|arg| arg == "--ignore-config-files"));
+        assert!(!daemon_args(&base)
+            .iter()
+            .any(|arg| arg == "--ignore-config-files"));
+        assert_ne!(
+            bootstrap_fingerprint(&base),
+            bootstrap_fingerprint(&explicit)
+        );
+    }
+
+    #[test]
+    fn explicit_only_alone_requests_a_pinned_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path().join("session.sock");
+        let config = directory.path().join("config.toml");
+        let agent_env = directory.path().join("agent.env");
+        let pinned = BootstrapOptions {
+            config_path: None,
+            provider: None,
+            agent_env: None,
+            ignore_config_files: true,
+            ..options(directory.path(), &config, &socket, &agent_env)
+        };
+        assert_ne!(
+            launch_identity(&pinned).unwrap(),
+            LaunchIdentity::NotRequested,
+            "explicit-only mode must request a pinned daemon identity"
+        );
+    }
+
+    #[test]
+    fn daemon_args_include_full_tool_schemas_when_requested() {
+        let mut opts = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        assert!(!daemon_args(&opts)
+            .iter()
+            .any(|a| a == "--full-tool-schemas"));
+        opts.full_tool_schemas = true;
+        assert!(daemon_args(&opts)
+            .iter()
+            .any(|a| a == "--full-tool-schemas"));
+    }
+
+    #[test]
+    fn bootstrap_fingerprint_changes_with_full_tool_schemas() {
+        // WP17 (FR-15): the full-schema mode is part of the daemon launch
+        // identity, so an interactive frontend requesting it cannot silently
+        // attach to a daemon launched without it (frontend coverage rule).
+        let first = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        let mut second = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        second.full_tool_schemas = true;
+        assert_ne!(
+            bootstrap_fingerprint(&first),
+            bootstrap_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn daemon_arguments_and_identity_include_no_follow() {
+        // WP14: the independent no-follow option must ride the daemon launch
+        // identity so a pinned session daemon enforces the same link policy.
+        let base = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        assert!(!daemon_args(&base).contains(&OsString::from("--no-follow-symlinks")));
+        let mut nofollow = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        nofollow.no_follow = true;
+        assert!(daemon_args(&nofollow).contains(&OsString::from("--no-follow-symlinks")));
+        assert_ne!(
+            bootstrap_fingerprint(&base),
+            bootstrap_fingerprint(&nofollow)
         );
     }
 
@@ -534,6 +721,104 @@ mod tests {
         assert_eq!(
             bootstrap_fingerprint(&direct),
             bootstrap_fingerprint(&aliased)
+        );
+    }
+
+    // R4 (FR-07, ADR-022): `--workspace-read-only` is part of the daemon's
+    // launch identity. A read-only client (a) spawns a read-only daemon,
+    // (b) hashes read-only into the fingerprint, and (c) treats read-only as an
+    // explicit selection so attaching to a daemon with a different (e.g.
+    // non-read-only) identity is Mismatched, never a silent NotRequested join.
+    #[test]
+    fn read_only_is_forwarded_to_the_spawned_daemon() {
+        let mut opts = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        assert!(!daemon_args(&opts).contains(&OsString::from("--workspace-read-only")));
+        opts.workspace_read_only = true;
+        assert!(daemon_args(&opts).contains(&OsString::from("--workspace-read-only")));
+    }
+
+    #[test]
+    fn read_only_changes_the_bootstrap_fingerprint() {
+        let plain = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        let mut read_only = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        read_only.workspace_read_only = true;
+        assert_ne!(
+            bootstrap_fingerprint(&plain),
+            bootstrap_fingerprint(&read_only)
+        );
+    }
+
+    #[test]
+    fn read_only_client_refuses_a_non_read_only_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path().join("session.sock");
+        let config = directory.path().join("config.toml");
+        let agent_env = directory.path().join("agent.env");
+        let metadata_path = crate::session_daemon::instance_metadata_path(&socket);
+
+        // A read-only client whose ONLY selection is read-only is still an
+        // explicit selection (not NotRequested), so it is compared against the
+        // daemon's published identity.
+        let read_only = BootstrapOptions {
+            config_path: None,
+            provider: None,
+            agent_env: None,
+            workspace_read_only: true,
+            ..options(directory.path(), &config, &socket, &agent_env)
+        };
+
+        // The running daemon published a NON-read-only fingerprint (its own
+        // bare identity). The client must NOT silently attach.
+        let non_read_only = BootstrapOptions {
+            config_path: None,
+            provider: None,
+            agent_env: None,
+            ..options(directory.path(), &config, &socket, &agent_env)
+        };
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "pid": 1,
+                "bootstrap_fingerprint": bootstrap_fingerprint(&non_read_only),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            launch_identity(&read_only).unwrap(),
+            LaunchIdentity::Mismatched
+        );
+
+        // A read-only client attaching to a read-only daemon Matches.
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "pid": 1,
+                "bootstrap_fingerprint": bootstrap_fingerprint(&read_only),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            launch_identity(&read_only).unwrap(),
+            LaunchIdentity::Matched
         );
     }
 }

@@ -1,4 +1,11 @@
 //! Model-visible tool-output bounding and deterministic intra-turn pruning.
+//!
+//! Context: the caller-owned no-spill mode (`--no-output-spill`,
+//! `tool_output.save_full_output = false`) is ADR-021 / FR-11. When it is set,
+//! [`bound_text`], [`reformat_text`], and [`microcompact_history`] bound or
+//! prune in place with [`NO_SPILL_MARKER`] / [`NO_SPILL_PRUNED_MARKER`] and
+//! never call [`store_full`], so no spill file is written and no saved-file
+//! pointer is emitted. Default (spill) behavior is unchanged when it is absent.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,7 +17,19 @@ use crate::config::{ReformatConfig, ToolOutputConfig};
 use crate::providers::{ContentBlock, Message};
 
 pub(crate) const TRUNCATED_MARKER: &str = "truncated; full output saved to";
+/// Caller-owned no-spill replacement for [`TRUNCATED_MARKER`] (ADR-021, FR-11):
+/// it still marks the result as truncated so the model never treats a partial
+/// result as complete, but points at paging/query-narrowing instead of a saved
+/// file. It deliberately does not contain the `full output saved to` substring,
+/// so recovery-pointer parsers (`marker_output_path`, compaction) find nothing.
+pub(crate) const NO_SPILL_MARKER: &str =
+    "truncated; re-read with offset/limit or narrow the query to see more (output not saved)";
 const PRUNED_MARKER: &str = "old tool result pruned; full output saved to";
+/// No-spill replacement for [`PRUNED_MARKER`] (ADR-021, FR-11): an old result
+/// is still pruned to reclaim tokens, but nothing is stored and no saved path
+/// is advertised, so the model is told to re-run the tool to retrieve it.
+const NO_SPILL_PRUNED_MARKER: &str =
+    "old tool result pruned (output not saved); re-run the tool to retrieve";
 const ARGUMENT_MARKER: &str = "...(argument truncated)";
 
 #[derive(Debug)]
@@ -499,6 +518,25 @@ pub async fn reformat_text(
         return bound_text(cfg, tool_name, content).await;
     }
 
+    // No-spill (ADR-021, FR-11): the reformat route is explicitly in scope, so
+    // show the (lossless) summary but never store the raw output and advertise
+    // no saved-file pointer. The summary already carries the distinct signal;
+    // the marker still states how to recover the raw detail (re-run the tool),
+    // matching the wording style of NO_SPILL_MARKER / NO_SPILL_PRUNED_MARKER so
+    // the model is never left to assume the condensed result is the whole of it.
+    if !cfg.save_full_output {
+        let visible = format!(
+            "{summary}\n\n[reformatted from {original_chars} chars; output not saved, \
+             re-run the tool to retrieve the full output]"
+        );
+        return BoundText {
+            visible_chars: visible.chars().count(),
+            content: visible,
+            output_path: None,
+            original_chars,
+        };
+    }
+
     // Only now preserve the raw output: storing before the call would write the
     // file twice whenever we fall back, since `bound_text` stores it too.
     // If storage fails the reformatting would be lossy — there would be nowhere
@@ -541,6 +579,64 @@ fn head_tail(content: &str, cap: usize) -> String {
     format!("{head}\n...(middle elided for the reformatter)...\n{tail}")
 }
 
+/// No-spill in-place bounding (ADR-021, FR-11). The oversized result is
+/// previewed under the same byte/line caps, but nothing is written to disk and
+/// no saved-file pointer is produced; the preview carries [`NO_SPILL_MARKER`]
+/// so the truncation stays explicit and the model is told how to page or narrow
+/// instead. Structured results stay valid JSON via [`no_spill_structured_preview`].
+fn no_spill_bound(cfg: &ToolOutputConfig, content: String, original_chars: usize) -> BoundText {
+    let marker = format!("... {NO_SPILL_MARKER} ...");
+    let visible = match serde_json::from_str(&content) {
+        Ok(value) => no_spill_structured_preview(value, &marker, cfg.max_lines, cfg.max_bytes)
+            .unwrap_or_else(|| preview(&content, &marker, cfg.max_lines, cfg.max_bytes)),
+        Err(_) => preview(&content, &marker, cfg.max_lines, cfg.max_bytes),
+    };
+    BoundText {
+        visible_chars: visible.chars().count(),
+        content: visible,
+        output_path: None,
+        original_chars,
+    }
+}
+
+/// JSON-preserving no-spill preview: shrink the longest string value with the
+/// no-spill marker until the value fits the byte cap. Mirrors
+/// [`structured_preview`] but has no saved-file fallback — when the structure
+/// cannot be shrunk enough it returns a minimal, still-truncation-explicit
+/// object carrying the paging guidance. Returns `None` only when even that
+/// object cannot fit, so the caller falls back to the plain-text preview.
+fn no_spill_structured_preview(
+    mut value: serde_json::Value,
+    marker: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> Option<String> {
+    loop {
+        let serialized = serde_json::to_string(&value).ok()?;
+        if serialized.len() <= max_bytes {
+            return Some(serialized);
+        }
+        let longest = longest_json_string_len(&value);
+        if longest == 0 {
+            break;
+        }
+        let excess = serialized.len().saturating_sub(max_bytes);
+        if excess > longest {
+            break;
+        }
+        let target_bytes = longest.saturating_sub(excess);
+        if !truncate_first_json_string(&mut value, longest, target_bytes, marker, max_lines) {
+            break;
+        }
+    }
+    let fallback = serde_json::json!({
+        "truncated": true,
+        "note": NO_SPILL_MARKER,
+    })
+    .to_string();
+    (fallback.len() <= max_bytes).then_some(fallback)
+}
+
 pub async fn bound_text(cfg: &ToolOutputConfig, tool_name: &str, content: String) -> BoundText {
     let original_chars = content.chars().count();
     if content.len() <= cfg.max_bytes && line_count(&content) <= cfg.max_lines {
@@ -550,6 +646,13 @@ pub async fn bound_text(cfg: &ToolOutputConfig, tool_name: &str, content: String
             output_path: None,
             original_chars,
         };
+    }
+
+    // No-spill: bound in place, never open or write the full copy (INVENTORIES
+    // W12). This is the producer-level prevention ADR-021 requires, not just
+    // removal of the final pointer.
+    if !cfg.save_full_output {
+        return no_spill_bound(cfg, content, original_chars);
     }
 
     let Ok(path) = store_full(cfg, tool_name, &content).await else {
@@ -731,35 +834,42 @@ pub async fn microcompact_history(
         else {
             continue;
         };
-        if content.contains(PRUNED_MARKER) {
+        if content.contains(PRUNED_MARKER) || content.contains(NO_SPILL_PRUNED_MARKER) {
             continue;
         }
         let tool_name = call_info
             .get(&item.id)
             .map(|(name, _)| name.as_str())
             .unwrap_or("tool");
-        let managed_directory = cfg.resolved_directory();
-        let existing_path =
-            existing_output_path(content).filter(|path| path.starts_with(&managed_directory));
-        let (path, created) = if let Some(path) = existing_path {
-            match tokio::fs::metadata(&path).await {
-                Ok(metadata) if metadata.is_file() => (path, false),
-                _ => {
-                    let Ok(path) = store_full(cfg, tool_name, content).await else {
-                        continue;
-                    };
-                    (path, true)
+        // No-spill (ADR-021, FR-11): still prune to reclaim tokens, but never
+        // open or write the full copy and advertise no saved path.
+        let (marker, created_path) = if cfg.save_full_output {
+            let managed_directory = cfg.resolved_directory();
+            let existing_path =
+                existing_output_path(content).filter(|path| path.starts_with(&managed_directory));
+            let (path, created) = if let Some(path) = existing_path {
+                match tokio::fs::metadata(&path).await {
+                    Ok(metadata) if metadata.is_file() => (path, false),
+                    _ => {
+                        let Ok(path) = store_full(cfg, tool_name, content).await else {
+                            continue;
+                        };
+                        (path, true)
+                    }
                 }
-            }
-        } else {
-            let Ok(path) = store_full(cfg, tool_name, content).await else {
-                continue;
+            } else {
+                let Ok(path) = store_full(cfg, tool_name, content).await else {
+                    continue;
+                };
+                (path, true)
             };
-            (path, true)
+            let marker = format!("[{PRUNED_MARKER} {}]", path.to_string_lossy());
+            (marker, created.then_some(path))
+        } else {
+            (format!("[{NO_SPILL_PRUNED_MARKER}]"), None)
         };
-        let marker = format!("[{PRUNED_MARKER} {}]", path.to_string_lossy());
         if marker.chars().count() >= item.chars {
-            if created {
+            if let Some(path) = created_path {
                 let _ = tokio::fs::remove_file(path).await;
             }
             continue;
@@ -908,6 +1018,58 @@ mod tests {
         assert_eq!(out.original_chars, raw.chars().count());
     }
 
+    /// No-spill reformatting (ADR-021, FR-11): the reformat route is explicitly
+    /// in scope for no-spill, so the summary is shown but the raw output is not
+    /// stored and no saved-file pointer is emitted.
+    #[tokio::test]
+    async fn reformat_no_spill_shows_summary_without_storing_or_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(dir.path());
+        config.save_full_output = false;
+        let raw = "FAILED tests/test_a.py::test_x - AssertionError\n".repeat(200);
+        let model = StubModel {
+            reply: Some("1 distinct failure (x200): test_x AssertionError in tests/test_a.py"),
+        };
+
+        let out = reformat_text(
+            &config,
+            "pytest",
+            raw.clone(),
+            &model,
+            "cheap-model",
+            &json!({}),
+            None,
+            &[],
+        )
+        .await;
+
+        assert!(out.content.contains("1 distinct failure"));
+        // FR-11.1 (R2): a no-spill result must say how to get the full output,
+        // like NO_SPILL_MARKER / NO_SPILL_PRUNED_MARKER. The reformat summary is
+        // lossless, but the raw detail is still gone, so the recovery hint must
+        // be present.
+        assert!(
+            out.content.contains("re-run the tool"),
+            "reformat marker must tell the model how to retrieve the full output: {}",
+            out.content
+        );
+        assert!(
+            out.output_path.is_none(),
+            "no file is retained under no-spill"
+        );
+        assert!(!out.content.contains(TRUNCATED_MARKER));
+        assert!(!out.content.contains("full output saved to"));
+        assert!(!out
+            .content
+            .contains(&dir.path().to_string_lossy().to_string()));
+        assert_eq!(out.original_chars, raw.chars().count());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the raw output must not be written anywhere"
+        );
+    }
+
     /// A reformatter failure must never destroy or truncate a successful tool
     /// result. This is a *paid optional enhancement*; if it cannot run, the
     /// deterministic path must carry the output exactly as it would have
@@ -1029,6 +1191,7 @@ mod tests {
             intra_turn_keep_recent_results: 1,
             old_argument_max_chars: 24,
             reformat: ReformatConfig::default(),
+            save_full_output: true,
         }
     }
 
@@ -1141,6 +1304,55 @@ mod tests {
             std::fs::read_to_string(bounded.output_path.unwrap()).unwrap(),
             original
         );
+    }
+
+    /// No-spill `bound_text` (ADR-021, FR-11) for both plain-text and structured
+    /// results: oversized output is bounded in place under the same caps, marks
+    /// the truncation with paging/narrowing guidance, writes no file, and emits
+    /// no saved-file pointer.
+    #[tokio::test]
+    async fn no_spill_bounds_in_place_without_writing_or_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(dir.path());
+        config.save_full_output = false;
+
+        // Plain text.
+        let text = (0..40)
+            .map(|i| format!("line-{i:02}-{}", "x".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bounded = bound_text(&config, "search", text).await;
+        assert!(bounded.output_path.is_none());
+        assert!(bounded.content.contains("truncated"));
+        assert!(bounded.content.contains("offset") && bounded.content.contains("limit"));
+        assert!(!bounded.content.contains("full output saved to"));
+        assert!(!bounded
+            .content
+            .contains(&dir.path().to_string_lossy().to_string()));
+        assert!(bounded.content.len() <= 256);
+        assert!(bounded.content.lines().count() <= 6);
+
+        // Structured JSON stays valid JSON.
+        let json_in = json!({
+            "exit": 0,
+            "out": format!("first\n{}\nlast", "x".repeat(2_000)),
+            "err": ""
+        })
+        .to_string();
+        let bounded = bound_text(&config, "exec", json_in).await;
+        assert!(bounded.output_path.is_none());
+        assert!(bounded.content.len() <= 256);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&bounded.content).expect("no-spill JSON must stay valid");
+        assert!(bounded.content.contains("truncated"));
+        assert!(!bounded.content.contains("full output saved to"));
+        assert!(!bounded
+            .content
+            .contains(&dir.path().to_string_lossy().to_string()));
+        let _ = parsed;
+
+        // Nothing was written to the managed directory.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -1306,6 +1518,60 @@ mod tests {
         assert_eq!(stats.results_pruned, 0);
         assert_eq!(stats.arguments_pruned, 1);
         assert!(stats.estimated_tokens_saved > 0);
+    }
+
+    /// No-spill microcompaction (ADR-021, FR-11): old successes are still
+    /// pruned to reclaim tokens, but `store_full` is never called and the
+    /// marker carries no saved-file path, so the state-file inventory is
+    /// unchanged (INVENTORIES W12).
+    #[tokio::test]
+    async fn microcompaction_no_spill_prunes_without_writing_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(dir.path());
+        config.save_full_output = false;
+        let mut messages = vec![Message::user("task")];
+        messages.extend(tool_pair(
+            "old",
+            "search",
+            json!({"pattern":"x"}),
+            &"a".repeat(800),
+            false,
+        ));
+        messages.extend(tool_pair(
+            "new",
+            "search",
+            json!({"pattern":"z"}),
+            &"c".repeat(80),
+            false,
+        ));
+
+        let stats = microcompact_history(&mut messages, &config).await;
+
+        assert_eq!(stats.results_pruned, 1);
+        assert!(stats.estimated_tokens_saved > 0);
+        // The producer wrote nothing.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let pruned = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "old" => Some(content),
+                _ => None,
+            })
+            .unwrap();
+        assert!(pruned.contains("output not saved"), "{pruned}");
+        assert!(!pruned.contains(TRUNCATED_MARKER));
+        assert!(!pruned.contains("full output saved to"));
+        assert!(!pruned.contains(&dir.path().to_string_lossy().to_string()));
+
+        // Idempotent: a second pass neither prunes again nor writes a file.
+        let second = microcompact_history(&mut messages, &config).await;
+        assert_eq!(second.results_pruned, 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

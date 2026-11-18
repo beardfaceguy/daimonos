@@ -1205,7 +1205,10 @@ pub fn tool_definitions(
         .into_iter()
         .filter(|tool| tool.tier.defined_for_mcp())
         .map(|td| {
-            let input_schema = descriptions.schema_with_parameters(td.name, &td.schema);
+            let mut input_schema = descriptions.schema_with_parameters(td.name, &td.schema);
+            // WP16 (FR-14): mark owned filesystem path/glob/walk arguments so the
+            // dump and `tools/list` carry identical `x-daimonos-path` marks.
+            crate::path_annotations::annotate(td.name, &mut input_schema);
             serde_json::from_value(json!({
                 "name": td.name,
                 "description": descriptions.full_or_name(td.name),
