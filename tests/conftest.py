@@ -91,6 +91,9 @@ def _handshake(proc, workspace) -> DaimonosClient:
         },
     })
     assert "result" in init_resp, f"initialize failed: {init_resp}"
+    # WP14: the dynamic server instructions (project/VCS/dir detection) are
+    # observable here, so tests can assert no-follow does not probe through links.
+    client.instructions = init_resp.get("result", {}).get("instructions", "")
     client.send_raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
     return client
 

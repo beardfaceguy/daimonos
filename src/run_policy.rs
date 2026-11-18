@@ -113,6 +113,7 @@ impl ToolPolicy {
                 message: format!("tool {name} is not on the explicit tool allowlist"),
                 tool: Some(name.to_string()),
                 argument: None,
+                target: None,
                 budget: None,
                 retryable: false,
             })
@@ -300,6 +301,7 @@ impl ToolAdmission {
             message,
             tool: None,
             argument: None,
+            target: None,
             budget: None,
             retryable: false,
         }

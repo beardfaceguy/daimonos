@@ -427,6 +427,11 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub no_output_spill: bool,
 
+    /// Report symbolic links without following them. Independent of
+    /// confinement; both may be combined (ADR-022, WP14, FR-12).
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_follow_symlinks: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -440,6 +445,14 @@ impl Cli {
     /// True when explicit-only configuration discovery is requested (FR-09).
     pub fn explicit_only(&self) -> bool {
         self.ignore_config_files
+    }
+
+    /// True when the shared filesystem authority must be constructed: either
+    /// confinement or the independent no-follow option is requested (ADR-022,
+    /// WP14). No-follow is enforced through the same pinned-root authority, so
+    /// the authority is built even when confinement is absent.
+    pub fn filesystem_authority_requested(&self) -> bool {
+        self.confinement_requested() || self.no_follow_symlinks
     }
 
     /// Resolve old flags and normalized subcommands to one runtime identity.

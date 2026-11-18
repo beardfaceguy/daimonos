@@ -456,6 +456,11 @@ pub async fn run_agent(
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
                 ignore_config_files: cfg.discovery_policy.is_explicit_only(),
+                // WP14: carry the independent no-follow option to the daemon.
+                no_follow: cfg
+                    .filesystem_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.no_follow()),
                 debug_tokens: token_log.is_some(),
                 // FR-07 (R4): read-only is part of the daemon identity so a
                 // read-only client spawns a read-only daemon and refuses to

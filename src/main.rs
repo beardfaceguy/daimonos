@@ -281,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
     // Explicit-only discovery is pinned before any implicit startup read (ADR-021, FR-09).
     let explicit_only = cli.explicit_only();
     // Pin the confinement root before implicit startup file discovery (ADR-022).
-    let mut filesystem_authority = if cli.confinement_requested() {
+    let mut filesystem_authority = if cli.filesystem_authority_requested() {
         let root = cli.confine_root.as_deref().unwrap_or(&workspace);
         match path_policy::FilesystemAuthority::confined(root, path_policy::FsLimits::default()) {
             Ok(authority) => Some(authority),
@@ -866,7 +866,7 @@ async fn main() -> anyhow::Result<()> {
         // silently masked by it (config::effective_full_tool_schemas).
         cfg.mcp.full_tool_schemas_forced = true;
     }
-    if cli.confinement_requested() {
+    if cli.filesystem_authority_requested() {
         if let Some(name) = cfg.tools.keys().min() {
             eprintln!(
                 "{}",
@@ -889,6 +889,8 @@ async fn main() -> anyhow::Result<()> {
         }
         if let Some(mut authority) = filesystem_authority.take() {
             authority.set_limits(cfg.fs_limits());
+            // WP14: independent no-follow option on the shared authority.
+            authority.set_no_follow(cli.no_follow_symlinks);
             cfg.caller_agent_env = caller_agent_env;
             let authority = Arc::new(authority);
             cfg.agent.skills.filesystem_authority = Some(Arc::clone(&authority));
