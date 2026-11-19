@@ -5,7 +5,7 @@
 - **Deciders:** Repository maintainer (decision pending).
 - **Consulted:** None recorded.
 - **Informed:** None recorded.
-- **Spec:** Vikunja #1621. The request document is linked from that task. It is not in this repository.
+- **Spec:** Vikunja #1621. That task names the request document. The document is not committed to this repository.
 - **Dependencies:** ADR-014, ADR-021, ADR-033 (all accepted).
 - **Supersedes:** None. Amends ADR-024 for one option combination (Decision 14).
 - **Superseded by:** None
@@ -129,8 +129,9 @@ These block acceptance:
 2. **Cache intent.** Decision 7 changes the request for session runs. The request did not ask for it. Without it, the goal of the request is not reached on direct Anthropic. Is it in scope?
 3. **Save after a failed run.** Decision 8 saves for each stop reason. Is that correct, or must a failed first run leave the id free?
 4. **Option name.** A top-level `--session-id` exists. It filters `--stats` by the external session id. Is the same name accepted on `agent` with another meaning?
+5. **Result pruning.** Decision 6 keeps the pruning of old tool results in session runs. Pruning rewrites earlier messages inside a run, so later requests of that run can miss the cache. Without pruning, a long run reaches the context limit sooner. Which behavior is correct for a session run?
 
 These do not block acceptance:
 
-5. The reason codes, the field names, the column name, the 128-character limit, and exit code 1 for a failed save are proposed.
-6. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this.
+6. The reason codes, the field names, the column name, the 128-character limit, and exit code 1 for a failed save are proposed.
+7. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this.
