@@ -2,10 +2,10 @@
 
 - **Status:** Proposed
 - **Date:** 2026-11-19
-- **Deciders:** Repository maintainer (decision pending).
+- **Deciders:** Repository maintainer. The maintainer resolved open questions 1 to 5 on 2026-11-20. The acceptance of this ADR is pending.
 - **Consulted:** None recorded.
 - **Informed:** None recorded.
-- **Spec:** Vikunja #1621. That task names the request document. The document is not committed to this repository.
+- **Spec:** Vikunja #1621. Request: [one-shot resume and JSON handoff](../handoffs/daimonos-handoff-oneshot-resume-and-json.md).
 - **Dependencies:** ADR-014, ADR-021, ADR-033 (all accepted).
 - **Supersedes:** None. Amends ADR-024 for one option combination (Decision 14).
 - **Superseded by:** None
@@ -38,7 +38,7 @@ We will add three opt-in options to one-shot `daimonos agent`: `--session-id <id
 
 ### Sessions
 
-1. `--session-id <id>` starts a new named session. `--resume <id>` continues one. The two options conflict with each other, with `--interactive`, and with `--dry-run`. The id uses the `SessionStore` id alphabet, with at most 128 characters (proposed).
+1. `--session-id <id>` starts a new named session. `--resume <id>` continues one. The two options conflict with each other, with `--interactive`, and with `--dry-run`. The id uses the `SessionStore` id alphabet, with at most 128 characters (proposed). The top-level `--session-id` keeps its meaning: it filters `--stats`. The position separates the two options: before `agent`, or after it.
 2. The session uses the `SessionStore` type in its own directory: `~/.daimonos/oneshot-sessions`, or `sessions/oneshot` under a selected state root (new `SessionStoreKind::OneShot`). `chat --list` and `chat --resume` do not see these sessions.
 3. `PersistedSession` gets one optional field, the **prefix record**: the provider name, the system prompt text, and the ordered tool list with a SHA-256 digest of each tool's description and input schema. The model and the thinking level use the existing fields. The record version stays 1.
 4. A new session claims the writer with no expected generation. A resume loads the record and claims the writer at the loaded generation. `claim_writer` takes the owner lock, so a second live process is refused (ADR-033).
@@ -96,6 +96,7 @@ We will add three opt-in options to one-shot `daimonos agent`: `--session-id <id
 - With prompt caching on, each request of a session run pays the provider's cache-write price for its new part. A session that is never resumed costs more than a run of today.
 - A failed run consumes the session id.
 - `agent_runs` has three id columns.
+- `--session-id` has two meanings. The position before or after `agent` selects the meaning.
 - With `--output json`, no code on the print path may write to stdout.
 
 ## Confirmation
@@ -109,6 +110,7 @@ We will add three opt-in options to one-shot `daimonos agent`: `--session-id <id
 - A test compares `usage`, `stop_reason`, and `turns` with the `agent_runs` row.
 - An Anthropic request-builder test: a session run marks the last message.
 - A state-root test: the session database is under `sessions/oneshot`.
+- A CLI parse test: the top-level `--session-id` and `agent --session-id` parse as two separate values.
 - `cargo test` and `python3 -m pytest tests/ -v` pass.
 
 ## Anchors
@@ -123,15 +125,15 @@ _Anchors:_ src/agent_cmd.rs::run_agent, src/agent_runtime.rs::run_agent, src/age
 
 ## Open questions
 
-These block acceptance:
+The maintainer resolved these on 2026-11-20. Each answer keeps the rule of the Decision section:
 
-1. **Store directory.** The request says "don't add a second one". Decision 2 reuses the store type and adds a directory. Is a separate directory accepted, or must one-shot sessions go in the chat directory?
-2. **Cache intent.** Decision 7 changes the request for session runs. The request did not ask for it. Without it, the goal of the request is not reached on direct Anthropic. Is it in scope?
-3. **Save after a failed run.** Decision 8 saves for each stop reason. Is that correct, or must a failed first run leave the id free?
-4. **Option name.** A top-level `--session-id` exists. It filters `--stats` by the external session id. Is the same name accepted on `agent` with another meaning?
-5. **Result pruning.** Decision 6 keeps the pruning of old tool results in session runs. Pruning rewrites earlier messages inside a run, so later requests of that run can miss the cache. Without pruning, a long run reaches the context limit sooner. Which behavior is correct for a session run?
+1. **Store directory.** A separate directory with the same store type (Decision 2).
+2. **Cache intent.** In scope. Session runs mark the message list as the stable prefix (Decision 7).
+3. **Save after a failed run.** The run saves for each stop reason (Decision 8).
+4. **Option name.** `--session-id` on `agent` (Decision 1). A probe with clap 4.6.1 showed that the top-level option and the `agent` option parse as two separate values.
+5. **Result pruning.** It stays on in session runs (Decision 6).
 
-These do not block acceptance:
+These are open. They do not block acceptance:
 
 6. The reason codes, the field names, the column name, the 128-character limit, and exit code 1 for a failed save are proposed.
 7. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this.
