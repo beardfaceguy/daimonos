@@ -1,11 +1,11 @@
 # ADR-036: One-shot agent runs can be named, resumed, and reported as JSON
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-19
-- **Deciders:** Repository maintainer. The maintainer resolved open questions 1 to 5 on 2026-11-20. The acceptance of this ADR is pending.
+- **Deciders:** Repository maintainer, by explicit user decision on 2026-11-20. The maintainer resolved open questions 1 to 5 on the same day.
 - **Consulted:** None recorded.
 - **Informed:** None recorded.
-- **Spec:** Vikunja #1621. Request: [one-shot resume and JSON handoff](../handoffs/daimonos-handoff-oneshot-resume-and-json.md).
+- **Spec:** Vikunja #1621. Request: [one-shot resume and JSON handoff](../handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md).
 - **Dependencies:** ADR-014, ADR-021, ADR-033 (all accepted).
 - **Supersedes:** None. Amends ADR-024 for one option combination (Decision 14).
 - **Superseded by:** None
@@ -133,7 +133,7 @@ The maintainer resolved these on 2026-11-20. Each answer keeps the rule of the D
 4. **Option name.** `--session-id` on `agent` (Decision 1). A probe with clap 4.6.1 showed that the top-level option and the `agent` option parse as two separate values.
 5. **Result pruning.** It stays on in session runs (Decision 6).
 
-These are open. They do not block acceptance:
+These are open. They did not block acceptance:
 
 6. The reason codes, the field names, the column name, the 128-character limit, and exit code 1 for a failed save are proposed.
 7. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this.

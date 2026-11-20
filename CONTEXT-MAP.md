@@ -1,11 +1,11 @@
 # Context map
 
-Date: 2026-11-19
+Date: 2026-11-20
 
 | Context | Glossary | Decisions |
 |---------|----------|-----------|
 | Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md), [Proposed ADR-018](docs/adr/018-strict-git-pinning.md), [Proposed ADR-019](docs/adr/019-ignore-repository-filters.md) |
-| Session durability | [Glossary](docs/contexts/session-durability/CONTEXT.md) | [ADR-014](docs/adr/014-sqlite-session-memory.md), [ADR-015](docs/adr/015-session-protocol-v3.md), [ADR-016](docs/adr/016-cancelled-turn-partial-commit.md), [ADR-020](docs/adr/020-durable-turn-checkpoints.md), [ADR-033](docs/adr/033-live-session-owner-lock.md), [Proposed ADR-036](docs/adr/036-oneshot-sessions-and-json-result.md) |
+| Session durability | [Glossary](docs/contexts/session-durability/CONTEXT.md) | [ADR-014](docs/adr/014-sqlite-session-memory.md), [ADR-015](docs/adr/015-session-protocol-v3.md), [ADR-016](docs/adr/016-cancelled-turn-partial-commit.md), [ADR-020](docs/adr/020-durable-turn-checkpoints.md), [ADR-033](docs/adr/033-live-session-owner-lock.md), [ADR-036](docs/adr/036-oneshot-sessions-and-json-result.md) |
 | Reviewer runtime | [Glossary](docs/contexts/reviewer-runtime/CONTEXT.md) | [Accepted ADR inventory, 021–032](docs/handoffs/2026-10-28-dbunk-remaining-work.md#adr-inventory) |
 
 This map covers git reads, session durability, and accepted reviewer-runtime decisions. Other contexts are not mapped here yet.
