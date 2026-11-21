@@ -1,10 +1,10 @@
 # Plan: named one-shot sessions and a JSON result for `daimonos agent`
 
-- **Status:** Draft
+- **Status:** Approved (maintainer review, 2026-11-20)
 - **Date:** 2026-11-20
 - **Spec:** Vikunja #1621. Request: [one-shot resume and JSON handoff](../../handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md).
 - **Decisions:** [ADR-036](../../adr/036-oneshot-sessions-and-json-result.md) (Accepted). It depends on ADR-001, ADR-014, ADR-021, and ADR-033.
-- **Branch:**
+- **Branch:** `feat/1621-oneshot-sessions-json`
 
 Paths and symbols in this plan were read at `230df9d`. A name marked `(new)` does not exist yet. A name marked `(proposed)` can change in review.
 
