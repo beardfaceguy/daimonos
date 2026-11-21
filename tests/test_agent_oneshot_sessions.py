@@ -4,8 +4,11 @@ These tests run the real binary against a local OpenRouter-compatible endpoint.
 No request leaves 127.0.0.1.
 """
 import json
+import shutil
+import sqlite3
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -61,6 +64,10 @@ class FakeProvider:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 owner.requests.append(body)
                 reply = owner.replies.pop(0) if owner.replies else http_error(500, "fake provider has no reply")
+                gate = reply.get("hold")
+                if gate is not None:
+                    # Keep the run in flight until the test releases it.
+                    assert gate.wait(timeout=30), "the test did not release a held reply"
                 if reply["kind"] == "error":
                     payload = json.dumps({"error": {"message": reply["message"]}}).encode()
                     self._send(reply["status"], "application/json", payload)
@@ -120,12 +127,23 @@ class Harness:
             f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{port}", "DAIMONOS_AGENT_API_KEY=test",
             "DAIMONOS_AGENT_APPROVAL_MODE=auto", "DAIMONOS_AGENT_COMPACTION=off", ""]))
 
+    def command(self, *args, global_args=()):
+        return [self.binary, "--workspace", str(self.workspace), "--config", str(self.config),
+                *global_args, "agent", "--agent-env", str(self.agent_env), *args]
+
+    def environment(self):
+        return {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
+
     def agent(self, *args, global_args=()):
         return subprocess.run(
-            [self.binary, "--workspace", str(self.workspace), "--config", str(self.config),
-             *global_args, "agent", "--agent-env", str(self.agent_env), *args],
-            cwd=self.workspace, env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+            self.command(*args, global_args=global_args), cwd=self.workspace, env=self.environment(),
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+
+    def start(self, *args):
+        """Start a run and return at once. The caller reads it with `communicate`."""
+        return subprocess.Popen(
+            self.command(*args), cwd=self.workspace, env=self.environment(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 def only_json_document(stdout):
@@ -189,3 +207,218 @@ def test_output_json_reports_a_context_overflow(daimonos_binary, tmp_path, fake_
     assert doc["context_overflow"] is True
     # No compaction and no retry: one request reached the provider.
     assert len(provider.requests) == 1
+
+
+# --- named sessions (--session-id) ---
+
+def refusal(done):
+    """A refused run: exit 2, nothing on stdout, one JSON error on stderr."""
+    assert done.returncode == 2, (done.returncode, done.stderr)
+    assert done.stdout == ""
+    errors = [json.loads(line) for line in done.stderr.splitlines() if line.startswith("{")]
+    assert len(errors) == 1, done.stderr
+    assert errors[0]["error"]["code"] == "run_configuration_invalid"
+    return errors[0]["error"]
+
+
+def session_rows(database):
+    with sqlite3.connect(database) as db:
+        return db.execute("SELECT session_id, generation, payload FROM sessions ORDER BY session_id").fetchall()
+
+
+def test_session_id_saves_a_session_and_refuses_the_same_id_again(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("FIRST"), text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
+
+    first = harness.agent("--session-id", "run-1", "first task")
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == "FIRST\n"
+    rows = session_rows(database)
+    assert [(row[0], row[1]) for row in rows] == [("run-1", 1)]
+    record = json.loads(rows[0][2])
+    assert record["model"] == "test/model"
+    assert record["prefix"]["provider"] == "openrouter"
+    assert [message["role"].lower() for message in record["messages"]] == ["user", "assistant"]
+    # chat does not list a one-shot session.
+    assert not (harness.home / ".daimonos" / "chat-sessions").exists()
+
+    second = harness.agent("--session-id", "run-1", "second task")
+    error = refusal(second)
+    assert error["reason"] == "session_exists"
+    assert len(provider.requests) == 1, "a refused run must not call the provider"
+    assert session_rows(database) == rows, "a refused run must not change the record"
+
+
+def test_an_invalid_session_id_is_refused_before_any_store_access(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    for bad in ["has space", "dot.dot", "a" * 129]:
+        error = refusal(harness.agent("--session-id", bad, "task"))
+        assert error["reason"] == "session_id_invalid"
+    assert provider.requests == []
+    assert not (harness.home / ".daimonos" / "oneshot-sessions").exists()
+
+
+def test_a_selected_state_root_holds_the_session_store(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("FIRST")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    # A selected state root refuses a log directory outside it, so this run
+    # uses the default log placement under the state root.
+    harness.config.write_text("[analytics]\nenabled=false\n")
+
+    done = harness.agent("--session-id", "run-1", "first task", global_args=("--state-dir", str(state)))
+    assert done.returncode == 0, done.stderr
+    assert [row[0] for row in session_rows(state / "sessions" / "oneshot" / "sessions.sqlite3")] == ["run-1"]
+    assert not (harness.home / ".daimonos" / "oneshot-sessions").exists()
+
+
+def test_output_json_names_the_saved_session(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("FIRST")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    done = harness.agent("--session-id", "run-1", "--output", "json", "first task")
+    assert done.returncode == 0, done.stderr
+    doc = only_json_document(done.stdout)
+    assert (doc["session_id"], doc["resumed"], doc["session_saved"], doc["session_error"]) == ("run-1", False, True, None)
+
+
+# --- resumed sessions (--resume) ---
+
+def held(reply):
+    """A reply that the provider sends only after the returned event is set."""
+    gate = threading.Event()
+    return dict(reply, hold=gate), gate
+
+
+def wait_for_requests(provider, count):
+    deadline = time.monotonic() + 30
+    while len(provider.requests) < count:
+        assert time.monotonic() < deadline, f"the provider received {len(provider.requests)} request(s)"
+        time.sleep(0.02)
+
+
+def ordered(value):
+    """Serialize with the received key order, so equality also compares order."""
+    return json.dumps(value)
+
+
+def add_workspace_skill(harness):
+    """Change the workspace so that a rebuilt system prompt differs."""
+    skill = harness.workspace / ".agents" / "skills" / "probe"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: probe\ndescription: resume prefix probe\n---\nbody\n")
+
+
+def test_resume_sends_the_same_prefix_and_only_the_new_input(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("FIRST"), text_reply("SECOND"), text_reply("CONTROL")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+
+    first = harness.agent("--session-id", "run-1", "first task")
+    assert first.returncode == 0, first.stderr
+    add_workspace_skill(harness)
+    second = harness.agent("--resume", "run-1", "the tests failed: E1")
+    assert second.returncode == 0, second.stderr
+    # Only the assistant text of this invocation.
+    assert second.stdout == "SECOND\n"
+    # Control: a new session in the changed workspace gets another system prompt.
+    control = harness.agent("--session-id", "run-2", "first task")
+    assert control.returncode == 0, control.stderr
+
+    one, two, three = provider.requests
+    assert ordered(three["messages"][0]) != ordered(one["messages"][0]), \
+        "control: the workspace change must alter a rebuilt system prompt"
+    assert one["messages"][0]["role"] == "system"
+    assert ordered(two["tools"]) == ordered(one["tools"])
+    earlier = len(one["messages"])
+    assert ordered(two["messages"][:earlier]) == ordered(one["messages"])
+    added = two["messages"][earlier:]
+    assert [message["role"] for message in added] == ["assistant", "user"]
+    assert "FIRST" in ordered(added[0])
+    assert "the tests failed: E1" in ordered(added[1])
+    assert two["model"] == one["model"]
+
+
+def test_resume_refuses_another_model_another_provider_and_an_unknown_id(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("FIRST"), text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
+    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
+    before = session_rows(database)
+
+    model = refusal(harness.agent("--resume", "run-1", "--model", "other/model", "more"))
+    assert model["reason"] == "session_model_mismatch"
+    assert "test/model" in model["message"] and "other/model" in model["message"]
+    other_provider = refusal(harness.agent("--resume", "run-1", "--provider", "openai", "more"))
+    assert other_provider["reason"] == "session_provider_mismatch"
+    unknown = refusal(harness.agent("--resume", "run-9", "more"))
+    assert unknown["reason"] == "session_not_found"
+
+    assert len(provider.requests) == 1, "a refused run must not call the provider"
+    assert session_rows(database) == before
+    # The saved model, named explicitly, is accepted.
+    same = harness.agent("--resume", "run-1", "--model", "test/model", "more")
+    assert same.returncode == 0, same.stderr
+
+
+def test_a_second_resume_of_a_running_session_is_refused(daimonos_binary, tmp_path, fake_provider):
+    slow, gate = held(text_reply("SECOND"))
+    provider = fake_provider([text_reply("FIRST"), slow, text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
+
+    running = harness.start("--resume", "run-1", "second task")
+    try:
+        wait_for_requests(provider, 2)
+        error = refusal(harness.agent("--resume", "run-1", "third task"))
+        assert error["reason"] == "session_owned_elsewhere"
+        assert str(running.pid) in error["message"]
+    finally:
+        gate.set()
+        stdout, stderr = running.communicate(timeout=30)
+    assert running.returncode == 0, stderr
+    assert stdout == "SECOND\n"
+    assert len(provider.requests) == 2, "the refused run must not call the provider"
+    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
+    assert [(row[0], row[1]) for row in session_rows(database)] == [("run-1", 2)]
+
+
+def test_a_failed_save_exits_non_zero_after_the_json_document(daimonos_binary, tmp_path, fake_provider):
+    slow, gate = held(text_reply("FIRST"))
+    provider = fake_provider([slow])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+
+    running = harness.start("--session-id", "run-1", "--output", "json", "first task")
+    try:
+        wait_for_requests(provider, 1)
+        # Remove the store while the run is in flight, so the save cannot find its writer.
+        shutil.rmtree(harness.home / ".daimonos" / "oneshot-sessions")
+    finally:
+        gate.set()
+        stdout, stderr = running.communicate(timeout=30)
+    assert running.returncode == 1, (running.returncode, stderr)
+    doc = only_json_document(stdout)
+    assert doc["stop_reason"] == "end_turn"
+    assert (doc["session_id"], doc["session_saved"]) == ("run-1", False)
+    assert doc["session_error"]
+    assert "session run-1 was not saved" in stderr
+
+
+def test_resume_json_reports_this_invocation_only(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([
+        text_reply("FIRST", usage={"prompt_tokens": 900, "completion_tokens": 50}),
+        text_reply("SECOND", usage={"prompt_tokens": 1000, "completion_tokens": 7,
+                                    "prompt_tokens_details": {"cached_tokens": 940}}),
+    ])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
+    done = harness.agent("--resume", "run-1", "--output", "json", "second task")
+    assert done.returncode == 0, done.stderr
+    doc = only_json_document(done.stdout)
+    assert (doc["session_id"], doc["resumed"], doc["session_saved"]) == ("run-1", True, True)
+    assert doc["final_text"] == "SECOND"
+    assert doc["turns"] == 1
+    assert doc["usage"]["input_tokens"] == 60
+    assert doc["usage"]["cache_read_tokens"] == 940
+    assert doc["usage"]["output_tokens"] == 7

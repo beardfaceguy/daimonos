@@ -44,6 +44,8 @@ pub struct RunOptions {
     /// Provider name. Used only in the JSON result document.
     pub provider: String,
     pub output: crate::cli::AgentOutputFormat,
+    /// A claimed named session (`--session-id` or `--resume`).
+    pub session: Option<crate::oneshot_session::OpenSession>,
 }
 
 /// The `--output json` result document of one invocation (ADR-036,
@@ -90,6 +92,7 @@ impl RunReport {
         options: &RunOptions,
         model: &str,
         result: &AgentResult,
+        session_save: Option<&std::result::Result<(), String>>,
         initial_len: usize,
         turns: u32,
         elapsed: std::time::Duration,
@@ -122,10 +125,10 @@ impl RunReport {
         };
         RunReport {
             schema_version: 1,
-            session_id: None,
-            resumed: false,
-            session_saved: None,
-            session_error: None,
+            session_id: options.session.as_ref().map(|s| s.id().to_string()),
+            resumed: options.session.as_ref().is_some_and(|s| s.is_resume()),
+            session_saved: session_save.map(|save| save.is_ok()),
+            session_error: session_save.and_then(|save| save.as_ref().err().cloned()),
             provider: options.provider.clone(),
             model: model.to_string(),
             stop_reason: result.stop_reason.as_str().to_string(),
@@ -287,7 +290,27 @@ pub async fn run_agent_with(
         tools.extend(mcp.tools());
     }
 
-    let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
+    // ADR-036 Decision 5: a resumed session keeps its request prefix. It runs
+    // on the saved model and thinking level with the saved system prompt, and
+    // a different tool list is refused before any provider call.
+    if let Some(session) = &options.session {
+        session.check_tools(&tools)?;
+    }
+    let saved = options.session.as_ref().and_then(|session| session.saved());
+    let model = match saved {
+        Some(saved) => saved.model.clone(),
+        None => args.model.unwrap_or_else(|| "claude-opus-4-8".to_string()),
+    };
+    let thinking = match saved {
+        Some(saved) => saved.thinking.clone(),
+        None => args.thinking,
+    };
+    // The saved text, not a rebuilt one: the agent usually changed the
+    // workspace, and a rebuilt prompt can differ and miss the prompt cache.
+    let system = match saved {
+        Some(saved) => saved.prefix.system.clone(),
+        None => crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await,
+    };
     let before_tool_call = args.safety.map(|p| p.into_before_hook());
     let thought_capture = match args.thought_log {
         Some(path) => Some(Arc::new(ThoughtCapture::open(path.clone()).map_err(
@@ -304,11 +327,11 @@ pub async fn run_agent_with(
         }) as crate::agent::StreamHook
     });
     let config = AgentConfig {
-        system: Some(crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await),
+        system: Some(system),
         tools,
         opts: CompleteOpts {
             model,
-            thinking: args.thinking,
+            thinking,
             ..CompleteOpts::default()
         },
         before_tool_call,
@@ -341,7 +364,11 @@ pub async fn run_agent_with(
     let mut tool_session = Session::new(workspace.to_path_buf(), cfg);
     crate::provisioning::provision_session(&mut tool_session, &services);
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(tool_session));
-    let initial = vec![Message::user(task)];
+    // A resume continues the saved messages with the new input (Decision 6).
+    let mut initial = saved
+        .map(|saved| saved.messages.clone())
+        .unwrap_or_default();
+    initial.push(Message::user(task));
     let initial_len = initial.len();
     let external_session_id = crate::analytics::read_agent_session_id_env();
     let prompt_span = PromptSpan::new(PromptMetadata {
@@ -369,6 +396,35 @@ pub async fn run_agent_with(
         _ => None,
     };
     prompt_span.finish(result.stop_reason.as_str(), error_type);
+
+    // ADR-036 Decision 8: a named session is saved after the loop returns, for
+    // each stop reason, so a failed attempt can be continued. The caller
+    // depends on the save, so a failure is reported and fails the run.
+    let session_save: Option<std::result::Result<(), String>> =
+        options.session.as_ref().map(|session| {
+            // A resume keeps the prefix record that it loaded and checked.
+            let prefix = match session.saved() {
+                Some(saved) => saved.prefix.clone(),
+                None => crate::oneshot_session::PrefixRecord {
+                    provider: options.provider.clone(),
+                    system: config.system.clone().unwrap_or_default(),
+                    tools: crate::oneshot_session::tool_digests(&config.tools),
+                },
+            };
+            session.save(
+                &config.opts.model,
+                config.opts.thinking.as_str(),
+                &result.messages,
+                workspace,
+                &prefix,
+            )
+        });
+    let session_failure = match (&options.session, &session_save) {
+        (Some(session), Some(Err(error))) => {
+            Some(format!("session {} was not saved: {error}", session.id()))
+        }
+        _ => None,
+    };
     // Messages that this invocation added after its own input. Without a
     // session, the input is one message, so this is the value of before.
     let turns = result.messages.len().saturating_sub(initial_len) as u32;
@@ -377,6 +433,7 @@ pub async fn run_agent_with(
         let task_prefix: String = args.task.chars().take(200).collect();
         store.record_agent_run(&AgentRunRecord {
             external_session_id,
+            oneshot_session_id: options.session.as_ref().map(|s| s.id().to_string()),
             task_prefix,
             input_tokens: result.usage.input,
             output_tokens: result.usage.output,
@@ -397,6 +454,7 @@ pub async fn run_agent_with(
             &options,
             &config.opts.model,
             &result,
+            session_save.as_ref(),
             initial_len,
             turns,
             started.elapsed(),
@@ -404,6 +462,9 @@ pub async fn run_agent_with(
         serde_json::to_writer(&mut *out, &report)?;
         writeln!(out)?;
         thought_capture_result?;
+        if let Some(failure) = session_failure {
+            anyhow::bail!(failure);
+        }
         return Ok(result);
     }
 
@@ -411,7 +472,14 @@ pub async fn run_agent_with(
     // completed provider run has closed its span and reached analytics.
     thought_capture_result?;
 
-    for msg in &result.messages {
+    // Decision 15: a resumed run prints only the assistant text that this
+    // invocation added. Every other run prints as before.
+    let already_printed = if options.session.as_ref().is_some_and(|s| s.is_resume()) {
+        initial_len
+    } else {
+        0
+    };
+    for msg in result.messages.iter().skip(already_printed) {
         if matches!(msg.role, Role::Assistant) {
             for block in &msg.content {
                 if let ContentBlock::Text(t) = block {
@@ -421,6 +489,9 @@ pub async fn run_agent_with(
         }
     }
 
+    if let Some(failure) = session_failure {
+        anyhow::bail!(failure);
+    }
     Ok(result)
 }
 
@@ -1095,10 +1166,20 @@ mod tests {
 
     // --- ADR-036: --output json ---
 
+    /// The default configuration without outbound MCP servers. The default
+    /// reads the MCP servers of the host user's editor settings, so the tool
+    /// list would depend on the host and on which servers connect.
+    fn hermetic_cfg() -> Arc<Config> {
+        let mut cfg = Config::default();
+        cfg.agent.mcp.enabled = false;
+        Arc::new(cfg)
+    }
+
     fn json_options() -> RunOptions {
         RunOptions {
             provider: "mock".to_string(),
             output: crate::cli::AgentOutputFormat::Json,
+            session: None,
         }
     }
 
@@ -1136,7 +1217,7 @@ mod tests {
         run_agent_with(
             &provider,
             dir.path(),
-            default_cfg(),
+            hermetic_cfg(),
             a,
             json_options(),
             &mut out,
@@ -1181,7 +1262,7 @@ mod tests {
         let result = run_agent_with(
             &provider,
             dir.path(),
-            default_cfg(),
+            hermetic_cfg(),
             args("go"),
             json_options(),
             &mut out,
@@ -1208,7 +1289,7 @@ mod tests {
         run_agent_with(
             &provider,
             dir.path(),
-            default_cfg(),
+            hermetic_cfg(),
             args("go"),
             json_options(),
             &mut out,
@@ -1247,7 +1328,7 @@ mod tests {
         run_agent_with(
             &provider,
             dir.path(),
-            default_cfg(),
+            hermetic_cfg(),
             a,
             json_options(),
             &mut out,
@@ -1326,7 +1407,7 @@ mod tests {
         run_agent_with(
             &provider,
             dir.path(),
-            default_cfg(),
+            hermetic_cfg(),
             args("go"),
             json_options(),
             &mut out,
@@ -1338,5 +1419,520 @@ mod tests {
         assert_eq!(doc["final_text"], "the note says hello");
         // assistant (tool call), tool result, assistant (final).
         assert_eq!(doc["turns"], 3);
+    }
+
+    // --- ADR-036: --session-id ---
+
+    use crate::oneshot_session::{self, SessionRequest};
+    use crate::session_store::SessionStore;
+
+    fn oneshot_store(dir: &Path) -> SessionStore {
+        SessionStore::new(dir.to_path_buf())
+    }
+
+    fn session_options(
+        state: &Path,
+        request: SessionRequest,
+        output: crate::cli::AgentOutputFormat,
+    ) -> RunOptions {
+        RunOptions {
+            provider: "mock".to_string(),
+            output,
+            session: Some(oneshot_session::open_when_free(state, request).unwrap()),
+        }
+    }
+
+    fn start(id: &str) -> SessionRequest {
+        SessionRequest::Start(id.to_string())
+    }
+
+    #[tokio::test]
+    async fn session_run_saves_the_conversation_and_the_prefix() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![end_turn_with_text("done")]);
+        let mut a = args("first task");
+        a.model = Some("mock-model".to_string());
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            a,
+            session_options(state.path(), start("s1"), Default::default()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, b"done\n");
+        let record = oneshot_store(state.path()).load_result("s1").unwrap();
+        assert_eq!(record.model, "mock-model");
+        assert_eq!(record.thinking.as_deref(), Some("medium"));
+        assert_eq!(record.cwd.as_deref(), Some(workspace.path()));
+        assert_eq!(record.messages.len(), 2);
+        let prefix = record
+            .prefix
+            .expect("a one-shot record has a prefix record");
+        assert_eq!(prefix.provider, "mock");
+        assert!(!prefix.system.is_empty());
+        assert!(prefix.tools.iter().any(|tool| tool.name == "read_file"));
+    }
+
+    #[tokio::test]
+    async fn session_run_saves_after_a_provider_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![LlmResponse::error("api down")]);
+        let mut out = Vec::new();
+        let result = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("first task"),
+            session_options(state.path(), start("s1"), Default::default()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
+        let record = oneshot_store(state.path()).load_result("s1").unwrap();
+        assert!(record.prefix.is_some());
+        assert_eq!(record.messages.len(), result.messages.len());
+    }
+
+    /// A provider that removes the session store during the model call, so
+    /// the save after the loop cannot find its writer.
+    struct StoreRemovingProvider {
+        store: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StoreRemovingProvider {
+        async fn complete(&self, _: &Context, _: &CompleteOpts) -> LlmResponse {
+            std::fs::remove_dir_all(&self.store).unwrap();
+            end_turn_with_text("done")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_save_is_an_error_after_the_json_document() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store_dir = state.path().join("store");
+        let provider = StoreRemovingProvider {
+            store: store_dir.clone(),
+        };
+        let mut out = Vec::new();
+        let run = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("first task"),
+            session_options(&store_dir, start("s1"), crate::cli::AgentOutputFormat::Json),
+            &mut out,
+        )
+        .await;
+        let Err(error) = run else {
+            panic!("a failed save must fail the run");
+        };
+        assert!(
+            error.to_string().contains("session s1 was not saved"),
+            "{error}"
+        );
+
+        let doc = single_json_document(&out);
+        assert_eq!(doc["session_id"], "s1");
+        assert_eq!(doc["resumed"], false);
+        assert_eq!(doc["session_saved"], false);
+        assert!(doc["session_error"].is_string());
+        assert_eq!(doc["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn session_run_reports_the_session_in_json_and_in_analytics() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let db_path = state.path().join("analytics.db");
+        let analytics = Arc::new(AnalyticsStore::new(&db_path, 90).unwrap());
+        let provider = MockProvider::new(vec![
+            end_turn_with_text("with session"),
+            end_turn_with_text("without session"),
+        ]);
+        let mut a = args("first task");
+        a.analytics = Some(Arc::clone(&analytics));
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            a,
+            session_options(
+                &state.path().join("store"),
+                start("s1"),
+                crate::cli::AgentOutputFormat::Json,
+            ),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let doc = single_json_document(&out);
+        assert_eq!(doc["session_id"], "s1");
+        assert_eq!(doc["session_saved"], true);
+        assert_eq!(doc["session_error"], serde_json::Value::Null);
+
+        let mut b = args("second task");
+        b.analytics = Some(Arc::clone(&analytics));
+        run_agent(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            b,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        let ids: Vec<Option<String>> = db
+            .prepare("SELECT oneshot_session_id FROM agent_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(ids, vec![Some("s1".to_string()), None]);
+    }
+
+    // --- ADR-036: --resume ---
+
+    fn resume(id: &str) -> SessionRequest {
+        SessionRequest::Resume(id.to_string())
+    }
+
+    /// What one provider call received, in a comparable form.
+    #[derive(Debug, Clone, PartialEq)]
+    struct SeenRequest {
+        system: Option<String>,
+        tools: Vec<String>,
+        messages: Vec<String>,
+        stable_prefix_len: usize,
+        model: String,
+        thinking: &'static str,
+    }
+
+    struct RecordingProvider {
+        responses: Mutex<VecDeque<LlmResponse>>,
+        seen: Mutex<Vec<SeenRequest>>,
+    }
+
+    impl RecordingProvider {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<SeenRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn message_json(message: &Message) -> String {
+        serde_json::to_string(message).unwrap()
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingProvider {
+        async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
+            self.seen.lock().unwrap().push(SeenRequest {
+                system: ctx.system.clone(),
+                tools: ctx
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        serde_json::json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "input_schema": tool.input_schema,
+                        })
+                        .to_string()
+                    })
+                    .collect(),
+                messages: ctx.messages.iter().map(message_json).collect(),
+                stable_prefix_len: ctx.stable_prefix_len,
+                model: opts.model.clone(),
+                thinking: opts.thinking.as_str(),
+            });
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| LlmResponse::error("RecordingProvider exhausted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_sends_the_saved_prefix_and_one_new_user_message() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let provider = RecordingProvider::new(vec![
+            end_turn_with_text("first answer"),
+            end_turn_with_text("second answer"),
+        ]);
+        let first = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("first task"),
+            session_options(state.path(), start("s1"), Default::default()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        // The agent usually edits the workspace. A new workspace skill changes
+        // a rebuilt system prompt, so it shows that the resume does not rebuild.
+        let skill = workspace.path().join(".agents/skills/probe");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: probe\ndescription: resume prefix probe\n---\nbody\n",
+        )
+        .unwrap();
+        let rebuilt =
+            crate::prompts::agent_system_for_workspace(&hermetic_cfg(), Some(workspace.path()))
+                .await;
+
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("second task"),
+            session_options(state.path(), resume("s1"), Default::default()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let seen = provider.seen();
+        assert_eq!(seen.len(), 2);
+        assert_ne!(
+            seen[0].system.as_deref(),
+            Some(rebuilt.as_str()),
+            "control: the workspace change must alter a rebuilt system prompt"
+        );
+        assert_eq!(seen[1].system, seen[0].system);
+        assert_eq!(seen[1].tools, seen[0].tools);
+        let earlier: Vec<String> = first.messages.iter().map(message_json).collect();
+        assert_eq!(seen[1].messages.len(), earlier.len() + 1);
+        assert_eq!(seen[1].messages[..earlier.len()], earlier[..]);
+        assert_eq!(
+            seen[1].messages[earlier.len()],
+            message_json(&Message::user("second task"))
+        );
+        // Decision 15: only the assistant text of this invocation.
+        assert_eq!(out, b"second answer\n");
+
+        let record = oneshot_store(state.path()).load_result("s1").unwrap();
+        assert_eq!(record.generation, 2);
+        assert_eq!(record.messages.len(), earlier.len() + 2);
+    }
+
+    #[tokio::test]
+    async fn resume_runs_on_the_saved_model_and_thinking_level() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let provider = RecordingProvider::new(vec![
+            end_turn_with_text("first answer"),
+            end_turn_with_text("second answer"),
+        ]);
+        let mut a = args("first task");
+        a.model = Some("model-one".to_string());
+        a.thinking = crate::providers::ThinkingLevel::High;
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            a,
+            session_options(state.path(), start("s1"), Default::default()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        // The values of the agent env file can differ at resume time.
+        let mut b = args("second task");
+        b.model = Some("model-two".to_string());
+        b.thinking = crate::providers::ThinkingLevel::Low;
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            b,
+            session_options(state.path(), resume("s1"), Default::default()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let seen = provider.seen();
+        assert_eq!(
+            (seen[1].model.as_str(), seen[1].thinking),
+            ("model-one", "high")
+        );
+        let record = oneshot_store(state.path()).load_result("s1").unwrap();
+        assert_eq!(record.model, "model-one");
+        assert_eq!(record.thinking.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn resume_json_counts_only_this_invocation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let provider = RecordingProvider::new(vec![
+            end_turn_with_text("first answer"),
+            end_turn_with_text("second answer"),
+        ]);
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("first task"),
+            session_options(state.path(), start("s1"), Default::default()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("second task"),
+            session_options(
+                state.path(),
+                resume("s1"),
+                crate::cli::AgentOutputFormat::Json,
+            ),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let doc = single_json_document(&out);
+        assert_eq!(doc["session_id"], "s1");
+        assert_eq!(doc["resumed"], true);
+        assert_eq!(doc["session_saved"], true);
+        assert_eq!(doc["final_text"], "second answer");
+        assert_eq!(doc["turns"], 1);
+    }
+
+    #[tokio::test]
+    async fn resume_context_overflow_ends_the_run_and_saves_the_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let provider = RecordingProvider::new(vec![
+            end_turn_with_text("first answer"),
+            LlmResponse::context_overflow_error("prompt is too long"),
+        ]);
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("first task"),
+            session_options(state.path(), start("s1"), Default::default()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        let result = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("second task"),
+            session_options(
+                state.path(),
+                resume("s1"),
+                crate::cli::AgentOutputFormat::Json,
+            ),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        // Decision 10: no compaction and no retry. One call for each run.
+        assert_eq!(provider.seen().len(), 2);
+        assert!(result.context_overflow);
+        let doc = single_json_document(&out);
+        assert_eq!(doc["stop_reason"], "error");
+        assert_eq!(doc["context_overflow"], true);
+        assert_eq!(doc["session_saved"], true);
+        assert_eq!(
+            oneshot_store(state.path())
+                .load_result("s1")
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_with_a_different_tool_list_is_refused_before_the_provider() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // A session whose saved tool list is not the tool list of this build.
+        {
+            let session = oneshot_session::open_when_free(state.path(), start("s1")).unwrap();
+            let other_tools = [ToolSchema {
+                name: "not_a_real_tool".to_string(),
+                description: "saved by another build".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }];
+            session
+                .save(
+                    "mock-model",
+                    "medium",
+                    &[
+                        Message::user("first task"),
+                        Message::assistant("first answer"),
+                    ],
+                    workspace.path(),
+                    &oneshot_session::PrefixRecord {
+                        provider: "mock".to_string(),
+                        system: "saved system".to_string(),
+                        tools: oneshot_session::tool_digests(&other_tools),
+                    },
+                )
+                .unwrap();
+        }
+        let provider = RecordingProvider::new(vec![end_turn_with_text("never sent")]);
+        let mut out = Vec::new();
+        let run = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("second task"),
+            session_options(state.path(), resume("s1"), Default::default()),
+            &mut out,
+        )
+        .await;
+        let Err(error) = run else {
+            panic!("a different tool list must refuse the resume");
+        };
+        let refusal = error
+            .downcast_ref::<oneshot_session::Refusal>()
+            .expect("the error must be a session refusal");
+        assert_eq!(refusal.code(), "session_tools_changed");
+        assert!(
+            provider.seen().is_empty(),
+            "no provider call after a refusal"
+        );
+        assert!(out.is_empty());
+        let record = oneshot_store(state.path()).load_result("s1").unwrap();
+        assert_eq!(record.generation, 1, "a refused resume must not save");
     }
 }

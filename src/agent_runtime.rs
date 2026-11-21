@@ -260,7 +260,16 @@ pub async fn run_agent(
         debug_thoughts,
         debug_thoughts_path,
         output,
+        oneshot_session_id,
+        resume,
     } = args;
+    let session_request = oneshot_session_id
+        .map(crate::oneshot_session::SessionRequest::Start)
+        .or(resume.map(crate::oneshot_session::SessionRequest::Resume));
+    if let Some(request) = &session_request {
+        // ADR-036: a bad id is refused before any store or provider access.
+        crate::oneshot_session::validate_id(request.id())?;
+    }
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
     // no TTY is attached. Only the Print fallback's require_agent_task error
@@ -454,6 +463,9 @@ pub async fn run_agent(
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+    // An explicit --model. The model of the agent env file is a default, not
+    // a request, so a resume does not compare it with the saved model.
+    let explicit_model = model.clone();
     let effective_model = model.unwrap_or_else(|| agent.model.clone());
     let llm = build_provider(
         &effective_provider,
@@ -492,9 +504,18 @@ pub async fn run_agent(
         thought_log,
         thinking: agent.thinking.clone(),
     };
+    let session = match session_request {
+        Some(request) => {
+            let session = open_oneshot_session(&cfg, request)?;
+            session.check_overrides(explicit_model.as_deref(), &effective_provider)?;
+            Some(session)
+        }
+        None => None,
+    };
     let options = agent_cmd::RunOptions {
         provider: effective_provider,
         output,
+        session,
     };
     let result = agent_cmd::run_agent_with(
         llm.as_ref(),
@@ -506,6 +527,30 @@ pub async fn run_agent(
     )
     .await?;
     check_agent_result(&result)
+}
+
+/// Claim a named one-shot session in its own store (ADR-036 Decision 2):
+/// `sessions/oneshot` under a selected state root, else
+/// `~/.daimonos/oneshot-sessions`.
+fn open_oneshot_session(
+    cfg: &config::Config,
+    request: crate::oneshot_session::SessionRequest,
+) -> Result<crate::oneshot_session::OpenSession, crate::oneshot_session::Refusal> {
+    use crate::oneshot_session::Refusal;
+    let directory = match &cfg.state_authority {
+        Some(authority) => {
+            authority.verify_session_store(crate::state_root::SessionStoreKind::OneShot)?
+        }
+        None => paths::oneshot_sessions_dir().ok_or_else(|| {
+            Refusal::state_unusable("no home directory for the one-shot session store")
+        })?,
+    };
+    let store = crate::session_store::SessionStore::new(directory)
+        .with_private_state(cfg.state_authority.is_some())
+        .with_busy_timeout(std::time::Duration::from_millis(
+            cfg.session.session_store_busy_timeout_ms,
+        ));
+    crate::oneshot_session::open(store, request)
 }
 
 pub async fn run_chat(
