@@ -46,6 +46,9 @@ pub struct RunOptions {
     pub output: crate::cli::AgentOutputFormat,
     /// A claimed named session (`--session-id` or `--resume`).
     pub session: Option<crate::oneshot_session::OpenSession>,
+    /// The provider was built with prompt caching on
+    /// (`DAIMONOS_AGENT_PROMPT_CACHE`).
+    pub prompt_cache: bool,
 }
 
 /// The `--output json` result document of one invocation (ADR-036,
@@ -341,6 +344,10 @@ pub async fn run_agent_with(
             label: "agent".to_string(),
         }),
         remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
+        // ADR-036 Decision 7. Only with prompt caching on: the Anthropic
+        // adapter sets a cache marker for any non-zero prefix length, and the
+        // mark must have no effect while prompt caching is off.
+        stable_prefix: options.session.is_some() && options.prompt_cache,
         ..AgentConfig::default()
     };
 
@@ -1180,6 +1187,7 @@ mod tests {
             provider: "mock".to_string(),
             output: crate::cli::AgentOutputFormat::Json,
             session: None,
+            prompt_cache: false,
         }
     }
 
@@ -1439,6 +1447,7 @@ mod tests {
             provider: "mock".to_string(),
             output,
             session: Some(oneshot_session::open_when_free(state, request).unwrap()),
+            prompt_cache: false,
         }
     }
 
@@ -1934,5 +1943,72 @@ mod tests {
         assert!(out.is_empty());
         let record = oneshot_store(state.path()).load_result("s1").unwrap();
         assert_eq!(record.generation, 1, "a refused resume must not save");
+    }
+
+    // --- ADR-036 Decision 7: the stable-prefix mark ---
+
+    fn read_note_then_answer() -> Vec<LlmResponse> {
+        vec![
+            LlmResponse {
+                retryable: false,
+                content: vec![ContentBlock::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "note.txt"}),
+                }],
+                stop_reason: crate::providers::StopReason::ToolUse,
+                error_message: None,
+                context_overflow: false,
+                usage: Usage::default(),
+            },
+            end_turn_with_text("done"),
+        ]
+    }
+
+    /// For each provider call: (stable_prefix_len, message count).
+    async fn prefix_marks(session: bool, prompt_cache: bool) -> Vec<(usize, usize)> {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("note.txt"), "hello\n").unwrap();
+        let provider = RecordingProvider::new(read_note_then_answer());
+        let options = RunOptions {
+            prompt_cache,
+            ..if session {
+                session_options(state.path(), start("s1"), Default::default())
+            } else {
+                RunOptions::default()
+            }
+        };
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("read the note"),
+            options,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        provider
+            .seen()
+            .iter()
+            .map(|request| (request.stable_prefix_len, request.messages.len()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_session_run_marks_the_whole_message_list_as_stable_on_each_request() {
+        // Two requests: the task, then the task with the tool call and result.
+        assert_eq!(prefix_marks(true, true).await, vec![(1, 1), (3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn the_stable_prefix_mark_needs_a_session_and_prompt_caching() {
+        // Without prompt caching the mark must not reach the adapter: the
+        // Anthropic adapter sets a cache marker for any non-zero value.
+        assert_eq!(prefix_marks(true, false).await, vec![(0, 1), (0, 3)]);
+        // A run without a session option keeps the value 0.
+        assert_eq!(prefix_marks(false, true).await, vec![(0, 1), (0, 3)]);
+        assert_eq!(prefix_marks(false, false).await, vec![(0, 1), (0, 3)]);
     }
 }

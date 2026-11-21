@@ -240,6 +240,10 @@ pub struct AgentConfig {
     pub on_provider_notice: Option<ProviderNoticeHook>,
     /// Bounded retry for *transient* provider failures (vikunja #1240).
     pub provider_retry: ProviderRetryConfig,
+    /// Mark the whole message list as the stable prefix on each request, so
+    /// the provider adapter can place its cache breakpoint at the end of the
+    /// conversation (ADR-036 Decision 7). `false` sends `stable_prefix_len: 0`.
+    pub stable_prefix: bool,
 }
 
 /// How hard to retry a provider failure the adapter classified as transient
@@ -1020,10 +1024,14 @@ async fn run_inner(
             }
         };
         let ctx = Context {
+            stable_prefix_len: if config.stable_prefix {
+                messages.len()
+            } else {
+                0
+            },
             messages: messages.clone(),
             system,
             tools: config.tools.clone(),
-            stable_prefix_len: 0,
         };
         // On a continuation after a `max_tokens` stop, reissue with thinking
         // forced off so reasoning cannot re-consume the output budget and stall

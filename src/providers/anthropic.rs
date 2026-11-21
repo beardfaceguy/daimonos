@@ -1863,6 +1863,49 @@ mod tests {
         assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
     }
 
+    /// ADR-036 Decision 7: a one-shot session run sends the whole message list
+    /// as the stable prefix, so the breakpoint is on the last message.
+    #[test]
+    fn build_request_marks_the_last_message_when_the_whole_list_is_stable() {
+        let ctx = Context {
+            messages: vec![
+                Message::user("first task"),
+                Message::assistant("first answer"),
+                Message::user("the tests failed"),
+            ],
+            system: Some("stable system".into()),
+            tools: vec![ToolSchema {
+                name: "read_file".into(),
+                description: "Read".into(),
+                input_schema: json!({"type":"object"}),
+            }],
+            stable_prefix_len: 3,
+        };
+        let json = serde_json::to_value(build_request_with_cache(
+            &ctx,
+            &CompleteOpts::default(),
+            true,
+        ))
+        .unwrap();
+
+        let marked: Vec<bool> = json["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|block| block["cache_control"]["type"] == "ephemeral")
+            })
+            .collect();
+        assert_eq!(marked, vec![false, false, true]);
+        // With the tool breakpoint, the request uses 2 of the 4 breakpoints
+        // that the provider allows.
+        assert_eq!(json["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+
     #[test]
     fn build_request_no_cache_control_when_stable_prefix_len_zero() {
         let ctx = Context {

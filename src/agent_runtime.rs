@@ -516,6 +516,7 @@ pub async fn run_agent(
         provider: effective_provider,
         output,
         session,
+        prompt_cache: agent.prompt_cache,
     };
     let result = agent_cmd::run_agent_with(
         llm.as_ref(),

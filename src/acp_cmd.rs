@@ -1707,6 +1707,8 @@ fn build_agent_config(
             failover_models,
             ..crate::agent::ProviderRetryConfig::default()
         },
+        // ACP sessions do not mark a stable message prefix (ADR-036 is one-shot only).
+        stable_prefix: false,
         before_tool_call: Some(build_before_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),
