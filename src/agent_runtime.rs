@@ -259,6 +259,7 @@ pub async fn run_agent(
         agent_env,
         debug_thoughts,
         debug_thoughts_path,
+        output,
     } = args;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
@@ -491,8 +492,19 @@ pub async fn run_agent(
         thought_log,
         thinking: agent.thinking.clone(),
     };
-    let result =
-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
+    let options = agent_cmd::RunOptions {
+        provider: effective_provider,
+        output,
+    };
+    let result = agent_cmd::run_agent_with(
+        llm.as_ref(),
+        workspace,
+        cfg,
+        args,
+        options,
+        &mut std::io::stdout(),
+    )
+    .await?;
     check_agent_result(&result)
 }
 

@@ -1,6 +1,16 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Stdout format of a one-shot `agent` run (ADR-036).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum AgentOutputFormat {
+    /// The assistant text, as before ADR-036.
+    #[default]
+    Text,
+    /// One JSON result document and one newline.
+    Json,
+}
+
 #[derive(Debug, Args)]
 pub struct AgentArgs {
     /// Optional initial task. Required unless --interactive launches on a TTY.
@@ -44,6 +54,15 @@ pub struct AgentArgs {
         conflicts_with = "interactive"
     )]
     pub debug_thoughts_path: Option<PathBuf>,
+    /// One-shot stdout format. `json` prints one result document for each run
+    /// whose loop returned a result, including failed runs (ADR-036).
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AgentOutputFormat::Text,
+        conflicts_with_all = ["interactive", "dry_run"]
+    )]
+    pub output: AgentOutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -550,5 +569,33 @@ mod tests {
         assert!(
             Cli::try_parse_from(["daimonos", "--mcp", "--mcp-socket", "/tmp/mcp.sock",]).is_err()
         );
+    }
+
+    #[test]
+    fn agent_output_defaults_to_text_and_accepts_json() {
+        let agent_output = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Agent(args)) => args.output,
+            _ => panic!("expected the agent command"),
+        };
+        assert_eq!(
+            agent_output(&["daimonos", "agent", "task"]),
+            AgentOutputFormat::Text
+        );
+        assert_eq!(
+            agent_output(&["daimonos", "agent", "--output", "json", "task"]),
+            AgentOutputFormat::Json
+        );
+        assert!(Cli::try_parse_from(["daimonos", "agent", "--output", "yaml", "task"]).is_err());
+    }
+
+    #[test]
+    fn agent_output_json_conflicts_with_interactive_and_dry_run() {
+        for flag in ["--interactive", "--dry-run"] {
+            assert!(
+                Cli::try_parse_from(["daimonos", "agent", flag, "--output", "json", "task"])
+                    .is_err(),
+                "{flag} must conflict with --output json"
+            );
+        }
     }
 }

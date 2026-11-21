@@ -37,6 +37,117 @@ pub struct AgentCmdArgs {
     pub thinking: crate::providers::ThinkingLevel,
 }
 
+/// Opt-in one-shot behavior (ADR-036). The default is the behavior of a run
+/// without the new options.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Provider name. Used only in the JSON result document.
+    pub provider: String,
+    pub output: crate::cli::AgentOutputFormat,
+}
+
+/// The `--output json` result document of one invocation (ADR-036,
+/// Decision 13). Field order is the output order. `schema_version` changes
+/// when a field is removed or changes its meaning.
+#[derive(Debug, serde::Serialize)]
+pub struct RunReport {
+    pub schema_version: u32,
+    pub session_id: Option<String>,
+    pub resumed: bool,
+    pub session_saved: Option<bool>,
+    pub session_error: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub stop_reason: String,
+    pub error_message: Option<String>,
+    pub context_overflow: bool,
+    pub final_text: String,
+    pub turns: u32,
+    pub usage: ReportUsage,
+    pub evidence: ReportEvidence,
+    pub duration_ms: u64,
+}
+
+/// Token usage of this invocation only, with the `agent_runs` column names.
+#[derive(Debug, serde::Serialize)]
+pub struct ReportUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: Option<u64>,
+    pub thinking_bytes: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ReportEvidence {
+    pub status: &'static str,
+}
+
+impl RunReport {
+    fn new(
+        options: &RunOptions,
+        model: &str,
+        result: &AgentResult,
+        initial_len: usize,
+        turns: u32,
+        elapsed: std::time::Duration,
+    ) -> Self {
+        // The text blocks of the last assistant message that this invocation
+        // added. Earlier messages of a resumed session are not included.
+        let final_text = result
+            .messages
+            .iter()
+            .skip(initial_len)
+            .rev()
+            .find(|message| matches!(message.role, Role::Assistant))
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let status = match result.evidence.status() {
+            crate::evidence::EvidenceStatus::Unknown => "unknown",
+            crate::evidence::EvidenceStatus::NoMutations => "no_mutations",
+            crate::evidence::EvidenceStatus::Verified => "verified",
+            crate::evidence::EvidenceStatus::Unverified => "unverified",
+        };
+        RunReport {
+            schema_version: 1,
+            session_id: None,
+            resumed: false,
+            session_saved: None,
+            session_error: None,
+            provider: options.provider.clone(),
+            model: model.to_string(),
+            stop_reason: result.stop_reason.as_str().to_string(),
+            error_message: result.error_message.clone(),
+            context_overflow: result.context_overflow,
+            final_text,
+            turns,
+            usage: ReportUsage {
+                input_tokens: result.usage.input,
+                output_tokens: result.usage.output,
+                reasoning_output_tokens: result.usage.reasoning_output,
+                thinking_bytes: result.usage.thinking_bytes,
+                cache_read_tokens: result.usage.cache_read,
+                cache_write_tokens: result.usage.cache_write,
+                cost_usd: result.usage.cost.total_usd,
+            },
+            evidence: ReportEvidence { status },
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
 enum ThoughtCaptureState {
     Active(File),
     Failed(String),
@@ -124,6 +235,21 @@ pub async fn run_agent(
     args: AgentCmdArgs,
     out: &mut dyn Write,
 ) -> Result<AgentResult> {
+    run_agent_with(provider, workspace, cfg, args, RunOptions::default(), out).await
+}
+
+/// [`run_agent`] with the opt-in one-shot options of ADR-036.
+///
+/// Context: docs/contexts/session-durability/CONTEXT.md, ADR-036.
+pub async fn run_agent_with(
+    provider: &dyn LlmProvider,
+    workspace: &Path,
+    cfg: Arc<Config>,
+    args: AgentCmdArgs,
+    options: RunOptions,
+    out: &mut dyn Write,
+) -> Result<AgentResult> {
+    let started = std::time::Instant::now();
     let schemas = tool_facade::active_schemas_for_policy(
         workspace,
         &cfg.prompts.resolved_tool_descriptions,
@@ -216,6 +342,7 @@ pub async fn run_agent(
     crate::provisioning::provision_session(&mut tool_session, &services);
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(tool_session));
     let initial = vec![Message::user(task)];
+    let initial_len = initial.len();
     let external_session_id = crate::analytics::read_agent_session_id_env();
     let prompt_span = PromptSpan::new(PromptMetadata {
         mode: "agent",
@@ -242,10 +369,12 @@ pub async fn run_agent(
         _ => None,
     };
     prompt_span.finish(result.stop_reason.as_str(), error_type);
+    // Messages that this invocation added after its own input. Without a
+    // session, the input is one message, so this is the value of before.
+    let turns = result.messages.len().saturating_sub(initial_len) as u32;
 
     if let Some(store) = args.analytics {
         let task_prefix: String = args.task.chars().take(200).collect();
-        let turns = result.messages.len().saturating_sub(1) as u32;
         store.record_agent_run(&AgentRunRecord {
             external_session_id,
             task_prefix,
@@ -259,6 +388,23 @@ pub async fn run_agent(
             stop_reason: result.stop_reason.as_str().to_string(),
             turns,
         });
+    }
+
+    if options.output == crate::cli::AgentOutputFormat::Json {
+        // The document is the only stdout write of the run (ADR-036). It is
+        // written for each stop reason, before a debug-artifact failure.
+        let report = RunReport::new(
+            &options,
+            &config.opts.model,
+            &result,
+            initial_len,
+            turns,
+            started.elapsed(),
+        );
+        serde_json::to_writer(&mut *out, &report)?;
+        writeln!(out)?;
+        thought_capture_result?;
+        return Ok(result);
     }
 
     // A local debug-artifact failure must be reported, but only after the
@@ -945,5 +1091,252 @@ mod tests {
             tool_result_text.contains("cfg-wired"),
             "exec should resolve cfg_probe_958 via cfg.process.extra_path: {tool_result_text}"
         );
+    }
+
+    // --- ADR-036: --output json ---
+
+    fn json_options() -> RunOptions {
+        RunOptions {
+            provider: "mock".to_string(),
+            output: crate::cli::AgentOutputFormat::Json,
+        }
+    }
+
+    /// Parse stdout that must be exactly one JSON document and one newline.
+    fn single_json_document(out: &[u8]) -> serde_json::Value {
+        let text = std::str::from_utf8(out).unwrap();
+        assert!(text.ends_with('\n'), "stdout must end with one newline");
+        let body = &text[..text.len() - 1];
+        assert!(!body.contains('\n'), "stdout must hold one line: {text:?}");
+        serde_json::from_str(body).expect("stdout must be one JSON document")
+    }
+
+    #[tokio::test]
+    async fn output_json_prints_one_document_for_a_successful_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut response = end_turn_with_text("all good");
+        response.usage = Usage {
+            input: 11,
+            output: 7,
+            reasoning_output: Some(3),
+            // The loop replaces this value with the bytes that the provider
+            // streamed as thinking. This mock streams none.
+            thinking_bytes: 5,
+            cache_read: 13,
+            cache_write: 17,
+            cost: crate::providers::Cost {
+                total_usd: 0.25,
+                ..Default::default()
+            },
+        };
+        let provider = MockProvider::new(vec![response]);
+        let mut a = args("go");
+        a.model = Some("mock-model".to_string());
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            a,
+            json_options(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let doc = single_json_document(&out);
+        assert_eq!(doc["schema_version"], 1);
+        assert_eq!(doc["session_id"], serde_json::Value::Null);
+        assert_eq!(doc["resumed"], false);
+        assert_eq!(doc["session_saved"], serde_json::Value::Null);
+        assert_eq!(doc["session_error"], serde_json::Value::Null);
+        assert_eq!(doc["provider"], "mock");
+        assert_eq!(doc["model"], "mock-model");
+        assert_eq!(doc["stop_reason"], "end_turn");
+        assert_eq!(doc["error_message"], serde_json::Value::Null);
+        assert_eq!(doc["context_overflow"], false);
+        assert_eq!(doc["final_text"], "all good");
+        assert_eq!(doc["turns"], 1);
+        assert_eq!(
+            doc["usage"],
+            serde_json::json!({
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "reasoning_output_tokens": 3,
+                "thinking_bytes": 0,
+                "cache_read_tokens": 13,
+                "cache_write_tokens": 17,
+                "cost_usd": 0.25,
+            })
+        );
+        assert!(doc["evidence"]["status"].is_string());
+        assert!(doc["duration_ms"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn output_json_reports_a_provider_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![LlmResponse::error("api down")]);
+        let mut out = Vec::new();
+        let result = run_agent_with(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("go"),
+            json_options(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        // The exit code stays with `check_agent_result`: the result is `Error`.
+        assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
+
+        let doc = single_json_document(&out);
+        assert_eq!(doc["stop_reason"], "error");
+        assert_eq!(doc["error_message"], "api down");
+        assert_eq!(doc["context_overflow"], false);
+        assert_eq!(doc["final_text"], "");
+    }
+
+    #[tokio::test]
+    async fn output_json_reports_a_context_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![LlmResponse::context_overflow_error(
+            "prompt is too long",
+        )]);
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("go"),
+            json_options(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let doc = single_json_document(&out);
+        assert_eq!(doc["stop_reason"], "error");
+        assert_eq!(doc["context_overflow"], true);
+        assert_eq!(doc["error_message"], "prompt is too long");
+    }
+
+    #[tokio::test]
+    async fn output_json_usage_matches_the_agent_runs_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("analytics.db");
+        let store = Arc::new(AnalyticsStore::new(&db_path, 90).unwrap());
+        let mut response = end_turn_with_text("done");
+        response.usage = Usage {
+            input: 101,
+            output: 23,
+            reasoning_output: Some(4),
+            thinking_bytes: 0,
+            cache_read: 3000,
+            cache_write: 200,
+            cost: crate::providers::Cost {
+                total_usd: 0.5,
+                ..Default::default()
+            },
+        };
+        let provider = MockProvider::new(vec![response]);
+        let mut a = args("go");
+        a.analytics = Some(Arc::clone(&store));
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            a,
+            json_options(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let doc = single_json_document(&out);
+
+        // Read the row through a second connection, not through the store.
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        let row: (i64, i64, Option<i64>, i64, i64, i64, f64, String, i64) = db
+            .query_row(
+                "SELECT input_tokens, output_tokens, reasoning_output_tokens,
+                        thinking_bytes, cache_read_tokens, cache_write_tokens,
+                        cost_usd, stop_reason, turns
+                 FROM agent_runs",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (101, 23, Some(4), 0, 3000, 200, 0.5, "end_turn".into(), 1)
+        );
+        assert_eq!(
+            doc["usage"],
+            serde_json::json!({
+                "input_tokens": row.0,
+                "output_tokens": row.1,
+                "reasoning_output_tokens": row.2,
+                "thinking_bytes": row.3,
+                "cache_read_tokens": row.4,
+                "cache_write_tokens": row.5,
+                "cost_usd": row.6,
+            })
+        );
+        assert_eq!(doc["stop_reason"], row.7.as_str());
+        assert_eq!(doc["turns"], row.8);
+    }
+
+    #[tokio::test]
+    async fn output_json_final_text_is_the_last_assistant_message_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hello\n").unwrap();
+        let provider = MockProvider::new(vec![
+            LlmResponse {
+                retryable: false,
+                content: vec![
+                    ContentBlock::Text("reading the note".to_string()),
+                    ContentBlock::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "note.txt"}),
+                    },
+                ],
+                stop_reason: crate::providers::StopReason::ToolUse,
+                error_message: None,
+                context_overflow: false,
+                usage: Usage::default(),
+            },
+            end_turn_with_text("the note says hello"),
+        ]);
+        let mut out = Vec::new();
+        run_agent_with(
+            &provider,
+            dir.path(),
+            default_cfg(),
+            args("go"),
+            json_options(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let doc = single_json_document(&out);
+        assert_eq!(doc["final_text"], "the note says hello");
+        // assistant (tool call), tool result, assistant (final).
+        assert_eq!(doc["turns"], 3);
     }
 }
