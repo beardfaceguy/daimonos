@@ -418,10 +418,21 @@ pub async fn run_agent_with(
                     tools: crate::oneshot_session::tool_digests(&config.tools),
                 },
             };
+            // A failed provider call ends the history with an empty assistant
+            // message. Providers reject empty assistant content, so it is not
+            // saved: the next resume continues after the last real message.
+            let mut history = result.messages.as_slice();
+            while let [earlier @ .., last] = history {
+                if last.role == Role::Assistant && last.content.is_empty() {
+                    history = earlier;
+                } else {
+                    break;
+                }
+            }
             session.save(
                 &config.opts.model,
                 config.opts.thinking.as_str(),
-                &result.messages,
+                history,
                 workspace,
                 &prefix,
             )
@@ -1507,7 +1518,15 @@ mod tests {
         assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
         let record = oneshot_store(state.path()).load_result("s1").unwrap();
         assert!(record.prefix.is_some());
-        assert_eq!(record.messages.len(), result.messages.len());
+        // The loop ends a failed call with an empty assistant message.
+        // Providers reject empty assistant content, so a resume must not
+        // send it: the saved history ends with the user message.
+        assert!(result.messages.last().unwrap().content.is_empty());
+        assert_eq!(record.messages.len(), 1);
+        assert_eq!(
+            message_json(&record.messages[0]),
+            message_json(&Message::user("first task"))
+        );
     }
 
     /// A provider that removes the session store during the model call, so

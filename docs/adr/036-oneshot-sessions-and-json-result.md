@@ -75,6 +75,17 @@ We will add three opt-in options to one-shot `daimonos agent`: `--session-id <id
 14. With the structured final output of ADR-024, the envelope is the only stdout document. A field `final_output` holds the validated document, or null. The exit codes of ADR-024 do not change. This rule applies when one build has both options.
 15. Without `--output json`, a resumed run prints only the assistant text of this invocation.
 
+### Implementation notes (2026-11-21)
+
+The implementation refined four rules. Each refinement keeps the intent of its decision.
+
+- **Decision 5, provider.** The run compares the saved provider with the provider that the run selects: `--provider`, or the agent env file. It is not only the explicit `--provider` value. The credentials of a run belong to its selected provider, so a saved session of another provider is refused and is never sent there.
+- **Decision 5, model.** The run compares only an explicit `--model` with the record. The model of the agent env file is a default. A resume ignores it and uses the saved model.
+- **Decision 7.** The loop sets the stable-prefix mark only when prompt caching is on. The Anthropic adapter sets a cache marker for each non-zero prefix length. It does not read the prompt-cache setting for messages. Without this condition, a session run with prompt caching off sends a cache marker.
+- **Decision 8.** The save removes empty assistant messages from the end of the history. The loop ends a failed provider call with an empty assistant message, and providers reject empty assistant content.
+
+The field `usage.thinking_bytes` is the count of thinking bytes that the provider streamed. It is 0 when the provider does not stream.
+
 ## Alternatives
 
 - **The caller reads `agent_runs`:** no change in Daimonos, but it couples the caller to an internal schema.
@@ -115,7 +126,7 @@ We will add three opt-in options to one-shot `daimonos agent`: `--session-id <id
 
 ## Anchors
 
-_Anchors:_ src/agent_cmd.rs::run_agent, src/agent_runtime.rs::run_agent, src/agent_runtime.rs::check_agent_result, src/cli.rs::AgentArgs, src/session_store.rs::PersistedSession, src/session_store.rs::SessionStore::claim_writer, src/session_store.rs::SessionStore::load_result, src/session_store.rs::SessionStore::write_record, src/state_root.rs::SessionStoreKind, src/state_root.rs::StateAuthority::verify_session_store, src/agent.rs::run, src/agent.rs::AgentResult, src/tool_output.rs::microcompact_history, src/providers/mod.rs::Context, src/providers/mod.rs::StopReason::as_str, src/providers/anthropic.rs::build_request_with_cache, src/providers/openrouter.rs::apply_prompt_cache, src/prompts.rs::agent_system_for_workspace, src/analytics.rs::AnalyticsStore::record_agent_run, src/analytics.rs::migrate_schema, src/evidence.rs::EvidenceLedger::status, src/chat_cmd.rs::resolve_model
+_Anchors:_ src/agent_cmd.rs::run_agent, src/agent_runtime.rs::run_agent, src/agent_runtime.rs::check_agent_result, src/cli.rs::AgentArgs, src/session_store.rs::PersistedSession, src/session_store.rs::SessionStore::claim_writer, src/session_store.rs::SessionStore::load_result, src/session_store.rs::SessionStore::write_record, src/state_root.rs::SessionStoreKind, src/state_root.rs::StateAuthority::verify_session_store, src/agent.rs::run, src/agent.rs::AgentResult, src/tool_output.rs::microcompact_history, src/providers/mod.rs::Context, src/providers/mod.rs::StopReason::as_str, src/providers/anthropic.rs::build_request_with_cache, src/providers/openrouter.rs::apply_prompt_cache, src/prompts.rs::agent_system_for_workspace, src/analytics.rs::AnalyticsStore::record_agent_run, src/analytics.rs::migrate_schema, src/evidence.rs::EvidenceLedger::status, src/chat_cmd.rs::resolve_model, src/oneshot_session.rs::open, src/oneshot_session.rs::OpenSession::check_tools, src/oneshot_session.rs::PrefixRecord, src/agent_cmd.rs::run_agent_with, src/agent_cmd.rs::RunReport, src/agent_runtime.rs::open_oneshot_session
 
 ## Revisit when
 
@@ -136,4 +147,4 @@ The maintainer resolved these on 2026-11-20. Each answer keeps the rule of the D
 These are open. They did not block acceptance:
 
 6. The reason codes, the field names, the column name, the 128-character limit, and exit code 1 for a failed save are proposed.
-7. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this.
+7. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this. A process test shows that the OpenRouter-compatible adapter sends the two user messages. No real provider was tested with this sequence.

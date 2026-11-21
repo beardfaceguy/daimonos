@@ -422,3 +422,57 @@ def test_resume_json_reports_this_invocation_only(daimonos_binary, tmp_path, fak
     assert doc["usage"]["input_tokens"] == 60
     assert doc["usage"]["cache_read_tokens"] == 940
     assert doc["usage"]["output_tokens"] == 7
+
+
+# --- edge cases of the plan ("Error and edge behavior") ---
+
+def test_a_refused_run_prints_no_json_document(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    # `refusal` checks that stdout is empty: the run did not start, so it has no document.
+    error = refusal(harness.agent("--resume", "run-9", "--output", "json", "more"))
+    assert error["reason"] == "session_not_found"
+    assert provider.requests == []
+
+
+def test_a_session_can_be_resumed_after_a_failed_run(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([http_error(400, "bad request from the fake provider"), text_reply("RECOVERED")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+
+    failed = harness.agent("--session-id", "run-1", "--output", "json", "first task")
+    assert failed.returncode == 1, failed.stderr
+    doc = only_json_document(failed.stdout)
+    assert (doc["stop_reason"], doc["session_saved"]) == ("error", True)
+    # The failed first run consumed the id (ADR-036 Decision 8).
+    assert refusal(harness.agent("--session-id", "run-1", "first task"))["reason"] == "session_exists"
+
+    resumed = harness.agent("--resume", "run-1", "try again")
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout == "RECOVERED\n"
+    # The failed call left no assistant content. The saved history ends with
+    # the first user message, so the resumed request has two user messages in
+    # sequence and no empty assistant message.
+    resumed_messages = provider.requests[-1]["messages"]
+    assert [message["role"] for message in resumed_messages] == ["system", "user", "user"]
+    assert "first task" in ordered(resumed_messages[1])
+    assert "try again" in ordered(resumed_messages[2])
+
+
+def test_a_killed_run_saves_nothing_and_frees_the_id(daimonos_binary, tmp_path, fake_provider):
+    slow, gate = held(text_reply("NEVER RECEIVED"))
+    provider = fake_provider([slow, text_reply("AFTER KILL")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+
+    running = harness.start("--session-id", "run-1", "first task")
+    try:
+        wait_for_requests(provider, 1)
+        running.kill()
+        running.communicate(timeout=30)
+    finally:
+        gate.set()
+    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
+    assert session_rows(database) == [], "a killed run must not leave a record"
+
+    again = harness.agent("--session-id", "run-1", "first task")
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == "AFTER KILL\n"

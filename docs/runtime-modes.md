@@ -35,6 +35,103 @@ describe the selected runtime unambiguously.
 explicitly forces one-shot output when flags are composed; without
 `--interactive`, one-shot mode remains the default.
 
+## One-shot sessions and the JSON result
+
+Three opt-in options change a one-shot `agent` run (ADR-036). A run without
+them behaves as before.
+
+```bash
+daimonos agent --session-id run-42 --output json "Change greet() to return 'hi'."
+daimonos agent --resume run-42 --output json "The tests failed: <output>"
+```
+
+| Option | Effect |
+|---|---|
+| `--session-id <ID>` | Start a named session and save it when the run ends. An existing id is refused. |
+| `--resume <ID>` | Continue the session. The task is the new input. |
+| `--output json` | Print one JSON result document on stdout. |
+
+The three options conflict with `--interactive` and `--dry-run`. `--session-id`
+and `--resume` conflict with each other. The top-level `--session-id` (before
+`agent`) is a different option: it filters `--stats`.
+
+**Sessions**
+
+- An id has 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `-`, and `_`.
+- The store is `~/.daimonos/oneshot-sessions`, or `sessions/oneshot` under
+  `--state-dir`. `chat --list` and `chat --resume` do not see these sessions.
+- A resume uses the saved system prompt, model, and thinking level. It sends the
+  saved messages and the new input. The system prompt is not rebuilt, so a
+  change of the workspace instructions or skills does not reach a resumed
+  session.
+- A resume is refused when `--model` differs from the saved model, when the
+  selected provider differs from the saved provider, or when the tool list
+  differs in order, name, description, or input schema. Start a new session to
+  change one of them.
+- One process owns a session at a time. A second run on the same id is refused
+  while the first run is alive.
+- The run saves the session for each stop reason, also after a provider error.
+  A failed first run therefore consumes its id: continue it with `--resume`.
+  An empty assistant message from a failed call is not saved.
+- A session run has no compaction. A context overflow ends the run with
+  `context_overflow: true`. Start a new session then.
+- A resumed run without `--output json` prints only the assistant text of that
+  invocation.
+- With `DAIMONOS_AGENT_PROMPT_CACHE=on`, a session run marks the whole message
+  list as the stable prefix, so the provider adapter can set its cache
+  breakpoint at the end of the conversation. With the default `off`, a session
+  run sends no cache marker.
+- Each run writes one `agent_runs` row. The column `oneshot_session_id` holds
+  the session id, or NULL.
+
+**Exit codes**
+
+| Case | Exit code | Output |
+|---|---|---|
+| The run ended with `end_turn` | 0 | The document, or the assistant text |
+| The run ended with another stop reason | 1 | The document, when `--output json` is set |
+| The session was not saved | 1 | The document with `session_saved: false`, and a message on stderr |
+| The run was refused before it started | 2 | Nothing on stdout. One JSON line on stderr. |
+
+A refusal has this form on stderr:
+
+```json
+{"error":{"code":"run_configuration_invalid","reason":"session_exists","message":"..."}}
+```
+
+The reasons are `session_id_invalid`, `session_exists`, `session_not_found`,
+`session_owned_elsewhere`, `session_changed`, `session_not_resumable`,
+`session_model_mismatch`, `session_provider_mismatch`, `session_tools_changed`,
+and `state_unusable`.
+
+**JSON result document**
+
+`--output json` prints exactly one JSON document and one newline on stdout for
+each run whose agent loop returned a result. This includes a provider error and
+a context overflow, so a caller can record the tokens of a failed run. A run
+that fails before the loop starts prints no document.
+
+| Field | Type | Content |
+|---|---|---|
+| `schema_version` | integer | `1`. It changes when a field is removed or changes its meaning. |
+| `session_id` | string or null | The id of `--session-id` or `--resume` |
+| `resumed` | boolean | True for `--resume` |
+| `session_saved` | boolean or null | Null without a session option |
+| `session_error` | string or null | The reason of a failed save |
+| `provider`, `model` | string | The provider and the model of the run |
+| `stop_reason` | string | `end_turn`, `tool_use`, `max_tokens`, `refusal`, `error`, or `aborted` |
+| `error_message` | string or null | The provider error |
+| `context_overflow` | boolean | True when the request did not fit the context window |
+| `final_text` | string | The text of the last assistant message of this invocation |
+| `turns` | integer | The messages that this invocation added after its input |
+| `usage` | object | `input_tokens`, `output_tokens`, `reasoning_output_tokens` (or null), `thinking_bytes`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd` |
+| `evidence` | object | `status`: `unknown`, `no_mutations`, `verified`, or `unverified` |
+| `duration_ms` | integer | Wall time of the invocation |
+
+`usage`, `stop_reason`, and `turns` cover this invocation only, and they have
+the same values as the `agent_runs` row of the run. `input_tokens` does not
+include the cached tokens.
+
 Interactive controls include Up/Down prompt history, PageUp/PageDown transcript
 scrolling, Home/End jumps, and `/help`. Pass `--no-color` for monochrome
 rendering. History and scrollback limits are configured under `[tui]`.

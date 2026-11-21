@@ -1,6 +1,6 @@
 # Plan: named one-shot sessions and a JSON result for `daimonos agent`
 
-- **Status:** Approved (maintainer review, 2026-11-20)
+- **Status:** Implemented (2026-11-21). Approved by maintainer review on 2026-11-20.
 - **Date:** 2026-11-20
 - **Spec:** Vikunja #1621. Request: [one-shot resume and JSON handoff](../../handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md).
 - **Decisions:** [ADR-036](../../adr/036-oneshot-sessions-and-json-result.md) (Accepted). It depends on ADR-001, ADR-014, ADR-021, and ADR-033.
@@ -87,6 +87,13 @@ Types and signatures only.
 
 **`src/analytics.rs`**
 - `AgentRunRecord.oneshot_session_id: Option<String>`. One `ALTER TABLE agent_runs ADD COLUMN oneshot_session_id TEXT` in `migrate_schema`.
+
+**Names in the implementation (2026-11-21).** The built names differ from the proposals above in these places. The behavior is the same.
+- `AgentArgs.oneshot_session_id` holds `--session-id`.
+- `agent_cmd::RunOptions (new)` holds `provider`, `output`, `session: Option<OpenSession>`, and `prompt_cache`. `AgentCmdArgs` did not change. `agent_cmd::run_agent_with (new)` takes the options. `run_agent` keeps its signature and calls it with the defaults.
+- `agent_runtime::open_oneshot_session (new)` resolves the store directory and claims the session.
+- `oneshot_session::open` takes the request by value. `OpenSession::check_overrides` and `OpenSession::check_tools` replace `check_prefix`.
+- `AgentConfig.stable_prefix` replaces `mark_history_stable`.
 
 ## Error and edge behavior
 

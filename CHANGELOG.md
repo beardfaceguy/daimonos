@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `daimonos agent --session-id <ID>` and `daimonos agent --resume <ID>`: named
+  one-shot sessions that a later run continues on the same provider and model,
+  with the same system prompt, tool list, and earlier messages (ADR-036).
+- `daimonos agent --output json`: one JSON result document on stdout for each
+  run, with the outcome and the token usage of that invocation. It is also
+  printed after a provider error and a context overflow.
+- `agent_runs.oneshot_session_id`: the named session of a one-shot run.
+
 ## [0.1.5] - 2026-10-18
 
 The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The
