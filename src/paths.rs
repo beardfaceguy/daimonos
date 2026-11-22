@@ -45,6 +45,13 @@ pub(crate) fn agent_sessions_dir() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".daimonos").join("acp-sessions"))
 }
 
+/// Durable store of named one-shot `agent` sessions (ADR-036). Separate from
+/// the chat store, so `chat --resume` cannot continue one with compaction or
+/// another model.
+pub(crate) fn oneshot_sessions_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".daimonos").join("oneshot-sessions"))
+}
+
 /// Durable store owned exclusively by the interactive session daemon.
 pub(crate) fn daemon_sessions_dir() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".daimonos").join("daemon-sessions"))

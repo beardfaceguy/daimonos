@@ -933,6 +933,31 @@ mod tests {
     use crate::providers::test_support::mock_http_server;
     use serde_json::json;
 
+    /// ADR-036: a resume after a failed first call sends two user messages in
+    /// sequence. The adapter sends both, in order.
+    #[test]
+    fn messages_to_wire_keeps_two_user_messages_in_sequence() {
+        let wire = messages_to_wire(
+            Some("system"),
+            &[Message::user("first task"), Message::user("try again")],
+        );
+        let seen: Vec<(String, String)> = wire
+            .iter()
+            .map(|message| {
+                (
+                    message["role"].as_str().unwrap().to_string(),
+                    message["content"].to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].0, "system");
+        assert_eq!(seen[1].0, "user");
+        assert!(seen[1].1.contains("first task"));
+        assert_eq!(seen[2].0, "user");
+        assert!(seen[2].1.contains("try again"));
+    }
+
     #[tokio::test]
     async fn complete_structural_trace_matches_http_request() {
         structural_trace_http_case(false, true, false).await;

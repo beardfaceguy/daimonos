@@ -46,6 +46,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install CLI test prerequisites
         run: sudo apt-get update && sudo apt-get install --yes npm shellcheck
+      - name: Lint the release scripts
+        run: shellcheck .github/scripts/*.sh
       - run: cargo test
 
   mcp-integration:
@@ -116,3 +118,21 @@ jobs:
           name: daimonos-musl
           path: target/x86_64-unknown-linux-musl/release/daimonos
           retention-days: 7
+
+  # Release on merge (Vikunja #1622). After a push to master, when all jobs
+  # above passed: if no tag exists for the version in Cargo.toml, create the tag
+  # at this commit and start release.yml on it. A merge that keeps the version
+  # releases nothing. The rule and its failure cases are in the script.
+  release-on-merge:
+    name: Release on merge
+    runs-on: ubuntu-26.04
+    needs: [fmt, check, test, mcp-integration, android, smoke-test, musl-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: write # create the tag
+      actions: write # start release.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: .github/scripts/release-on-merge.sh
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -30,6 +30,7 @@ mod mcp_bridge;
 mod mcp_config_cmd;
 mod mcp_oauth;
 mod observability;
+mod oneshot_session;
 mod ops;
 mod path_annotations;
 mod path_policy;
@@ -1332,6 +1333,13 @@ async fn main() -> anyhow::Result<()> {
     };
     drop(resource_telemetry);
     observability_runtime.shutdown().await;
+    // ADR-036 Decision 9: a refused one-shot session exits with code 2 and the
+    // `run_configuration_invalid` JSON on stderr. No other error path changes.
+    if let Err(error) = &result {
+        if let Some(refusal) = error.downcast_ref::<oneshot_session::Refusal>() {
+            exit_for_state_failure(refusal.0.clone());
+        }
+    }
     result
 }
 

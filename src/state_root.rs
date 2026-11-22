@@ -211,6 +211,8 @@ pub(crate) enum SessionStoreKind {
     Daemon,
     Acp,
     Chat,
+    /// Named one-shot `agent` sessions (ADR-036).
+    OneShot,
 }
 
 /// Immutable, run-scoped authority over internal state placement. Constructed
@@ -477,6 +479,7 @@ impl StateAuthority {
             SessionStoreKind::Daemon => "daemon",
             SessionStoreKind::Acp => "acp",
             SessionStoreKind::Chat => "chat",
+            SessionStoreKind::OneShot => "oneshot",
         };
         let directory = self.resolve_trusted(&["sessions", name])?;
         self.verify_writable_directory("session store", &directory)?;

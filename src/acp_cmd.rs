@@ -1717,6 +1717,8 @@ fn build_agent_config(
         // WP08: --audit-path currently wires into the one-shot agent frontend
         // only; ACP-session auditing is a future integrator hook.
         audit: None,
+        // ACP sessions do not mark a stable message prefix (ADR-036 is one-shot only).
+        stable_prefix: false,
         before_tool_call: Some(build_before_tool_call_hook(
             Arc::clone(&connection),
             session_id.clone(),

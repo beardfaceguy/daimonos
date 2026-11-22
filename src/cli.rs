@@ -1,6 +1,16 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Stdout format of a one-shot `agent` run (ADR-036).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum AgentOutputFormat {
+    /// The assistant text, as before ADR-036.
+    #[default]
+    Text,
+    /// One JSON result document and one newline.
+    Json,
+}
+
 #[derive(Debug, Args)]
 pub struct AgentArgs {
     /// Optional initial task. Required unless --interactive launches on a TTY.
@@ -102,6 +112,52 @@ pub struct AgentArgs {
     /// and session-daemon frontends never carry this agent-only flag at all.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
     pub worker_config: Option<PathBuf>,
+    /// One-shot stdout format. `json` prints one result document for each run
+    /// whose loop returned a result, including failed runs (ADR-036).
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AgentOutputFormat::Text,
+        // `final_output`: ADR-036 Decision 14 (the document carries the
+        // validated final output) is not built. Until then the combination
+        // is refused, because both options own stdout.
+        conflicts_with_all = ["interactive", "dry_run", "final_output"]
+    )]
+    pub output: AgentOutputFormat,
+    /// Start a named one-shot session and save it when the run ends. A later
+    /// run continues it with --resume. An existing id is refused (ADR-036).
+    /// This is not the top-level --session-id, which filters --stats.
+    #[arg(
+        long = "session-id",
+        value_name = "ID",
+        // A session with structured final output, a controlled model profile,
+        // or workers is not built or tested: the prefix record does not hold
+        // the endpoint of a profile. The combination is refused.
+        conflicts_with_all = [
+            "interactive",
+            "dry_run",
+            "final_output",
+            "model_profile",
+            "worker_config"
+        ]
+    )]
+    pub oneshot_session_id: Option<String>,
+    /// Continue a named one-shot session with the task as the new input. The
+    /// run uses the saved provider, model, and thinking level; a different
+    /// --model or provider is refused (ADR-036).
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with_all = [
+            "interactive",
+            "dry_run",
+            "oneshot_session_id",
+            "final_output",
+            "model_profile",
+            "worker_config"
+        ]
+    )]
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -712,5 +768,124 @@ mod tests {
         assert!(
             Cli::try_parse_from(["daimonos", "--mcp", "--mcp-socket", "/tmp/mcp.sock",]).is_err()
         );
+    }
+
+    #[test]
+    fn agent_output_defaults_to_text_and_accepts_json() {
+        let agent_output = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Agent(args)) => args.output,
+            _ => panic!("expected the agent command"),
+        };
+        assert_eq!(
+            agent_output(&["daimonos", "agent", "task"]),
+            AgentOutputFormat::Text
+        );
+        assert_eq!(
+            agent_output(&["daimonos", "agent", "--output", "json", "task"]),
+            AgentOutputFormat::Json
+        );
+        assert!(Cli::try_parse_from(["daimonos", "agent", "--output", "yaml", "task"]).is_err());
+    }
+
+    #[test]
+    fn agent_output_json_conflicts_with_interactive_and_dry_run() {
+        for flag in ["--interactive", "--dry-run"] {
+            assert!(
+                Cli::try_parse_from(["daimonos", "agent", flag, "--output", "json", "task"])
+                    .is_err(),
+                "{flag} must conflict with --output json"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_session_id_is_separate_from_the_top_level_session_id() {
+        let parse = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let agent = match cli.command {
+                Some(Command::Agent(args)) => args.oneshot_session_id,
+                _ => panic!("expected the agent command"),
+            };
+            (cli.session_id, agent)
+        };
+        assert_eq!(
+            parse(&[
+                "daimonos",
+                "--session-id",
+                "TOP",
+                "agent",
+                "--session-id",
+                "SUB",
+                "t"
+            ]),
+            (Some("TOP".to_string()), Some("SUB".to_string()))
+        );
+        assert_eq!(
+            parse(&["daimonos", "agent", "--session-id", "SUB", "t"]),
+            (None, Some("SUB".to_string()))
+        );
+        assert_eq!(
+            parse(&["daimonos", "--session-id", "TOP", "agent", "t"]),
+            (Some("TOP".to_string()), None)
+        );
+        for flag in ["--interactive", "--dry-run"] {
+            assert!(
+                Cli::try_parse_from(["daimonos", "agent", flag, "--session-id", "SUB", "t"])
+                    .is_err(),
+                "{flag} must conflict with agent --session-id"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_resume_conflicts_with_session_id_interactive_and_dry_run() {
+        let cli = Cli::try_parse_from(["daimonos", "agent", "--resume", "run-1", "more"]).unwrap();
+        match cli.command {
+            Some(Command::Agent(args)) => assert_eq!(args.resume.as_deref(), Some("run-1")),
+            _ => panic!("expected the agent command"),
+        }
+        for extra in [
+            &["--session-id", "run-2"][..],
+            &["--interactive"][..],
+            &["--dry-run"][..],
+        ] {
+            let mut argv = vec!["daimonos", "agent", "--resume", "run-1"];
+            argv.extend_from_slice(extra);
+            argv.push("more");
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{extra:?} must conflict with --resume"
+            );
+        }
+    }
+
+    /// The one-shot session options and `--output json` (ADR-036) are refused
+    /// with the reviewer-runtime options that they were not built with.
+    #[test]
+    fn agent_session_and_json_options_conflict_with_unbuilt_combinations() {
+        let refused = |extra: &[&str]| {
+            let mut argv = vec!["daimonos", "agent"];
+            argv.extend_from_slice(extra);
+            argv.push("task");
+            Cli::try_parse_from(argv).is_err()
+        };
+        for session in [["--session-id", "s1"], ["--resume", "s1"]] {
+            for other in [
+                ["--final-output", "f.json"],
+                ["--model-profile", "p.json"],
+                ["--worker-config", "w.json"],
+            ] {
+                assert!(
+                    refused(&[session[0], session[1], other[0], other[1]]),
+                    "{session:?} with {other:?}"
+                );
+            }
+        }
+        assert!(refused(&["--output", "json", "--final-output", "f.json"]));
+        // Combinations that stay available.
+        assert!(!refused(&["--final-output", "f.json"]));
+        assert!(!refused(&["--output", "json", "--model-profile", "p.json"]));
+        assert!(!refused(&["--output", "json", "--worker-config", "w.json"]));
+        assert!(!refused(&["--session-id", "s1", "--output", "json"]));
     }
 }

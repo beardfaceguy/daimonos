@@ -1961,6 +1961,117 @@ mod tests {
         assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
     }
 
+    /// ADR-036 Decision 7: a one-shot session run sends the whole message list
+    /// as the stable prefix, so the breakpoint is on the last message.
+    #[test]
+    fn build_request_marks_the_last_message_when_the_whole_list_is_stable() {
+        let ctx = Context {
+            messages: vec![
+                Message::user("first task"),
+                Message::assistant("first answer"),
+                Message::user("the tests failed"),
+            ],
+            system: Some("stable system".into()),
+            tools: vec![ToolSchema {
+                name: "read_file".into(),
+                description: "Read".into(),
+                input_schema: json!({"type":"object"}),
+            }],
+            stable_prefix_len: 3,
+        };
+        let json = serde_json::to_value(build_request_with_cache(
+            &ctx,
+            &CompleteOpts::default(),
+            true,
+        ))
+        .unwrap();
+
+        let marked: Vec<bool> = json["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|block| block["cache_control"]["type"] == "ephemeral")
+            })
+            .collect();
+        assert_eq!(marked, vec![false, false, true]);
+        // With the tool breakpoint, the request uses 2 of the 4 breakpoints
+        // that the provider allows.
+        assert_eq!(json["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// ADR-036: a resume after a failed first call sends two user messages in
+    /// sequence. The Messages API combines consecutive turns of one role into
+    /// a single turn, so the adapter sends both, in order, and drops nothing.
+    #[test]
+    fn build_request_keeps_two_user_messages_in_sequence() {
+        let ctx = Context {
+            messages: vec![Message::user("first task"), Message::user("try again")],
+            system: Some("system".into()),
+            tools: vec![],
+            stable_prefix_len: 2,
+        };
+        let json = serde_json::to_value(build_request_with_cache(
+            &ctx,
+            &CompleteOpts::default(),
+            true,
+        ))
+        .unwrap();
+
+        let messages = json["messages"].as_array().unwrap();
+        let seen: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|message| {
+                (
+                    message["role"].as_str().unwrap(),
+                    message["content"][0]["text"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(seen, vec![("user", "first task"), ("user", "try again")]);
+        // The breakpoint is on the last message only.
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    /// A saved history never ends with an assistant message that has no
+    /// content for the provider. This shows why: the adapter drops such a
+    /// message, which would silently change the saved prefix.
+    #[test]
+    fn build_request_drops_an_assistant_message_with_only_provider_state() {
+        let ctx = Context {
+            messages: vec![
+                Message::user("first task"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ProviderState {
+                        provider: "other".into(),
+                        data: json!({"k": "v"}),
+                    }],
+                },
+                Message::user("try again"),
+            ],
+            system: None,
+            tools: vec![],
+            stable_prefix_len: 0,
+        };
+        let json = serde_json::to_value(build_request(&ctx, &CompleteOpts::default())).unwrap();
+        let roles: Vec<&str> = json["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "user"]);
+    }
+
     #[test]
     fn build_request_no_cache_control_when_stable_prefix_len_zero() {
         let ctx = Context {

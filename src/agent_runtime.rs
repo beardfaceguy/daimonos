@@ -326,6 +326,9 @@ pub async fn run_agent(
         final_output,
         capability_probe_payload,
         worker_config,
+        output,
+        oneshot_session_id,
+        resume,
     } = args;
     // WP09 (FR-04 reqs 14-17, ADR-027): the capability probe requires FR-01
     // structured final output AND a complete controlled model profile (PM
@@ -355,6 +358,13 @@ pub async fn run_agent(
         Some(path) => Some(load_controlled_profile(path)?),
         None => None,
     };
+    let session_request = oneshot_session_id
+        .map(crate::oneshot_session::SessionRequest::Start)
+        .or(resume.map(crate::oneshot_session::SessionRequest::Resume));
+    if let Some(request) = &session_request {
+        // ADR-036: a bad id is refused before any store or provider access.
+        crate::oneshot_session::validate_id(request.id())?;
+    }
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Pre-resolution intent capture: the operator asked for interactive but
     // no TTY is attached. Only the Print fallback's require_agent_task error
@@ -692,6 +702,15 @@ pub async fn run_agent(
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+    // An explicit --model. The model of the agent env file is a default, not
+    // a request, so a resume does not compare it with the saved model.
+    let explicit_model = model.clone();
+    // ADR-036 with WP07: under a controlled profile, the JSON result document
+    // names the provider label of the profile, not the agent env provider.
+    let report_provider = controlled_profile
+        .as_ref()
+        .map(|profile| profile.spec.provider_label.clone())
+        .unwrap_or_else(|| effective_provider.clone());
     // WP10 (R1, ADR-028): capture the resolved model credential BEFORE the
     // provider consumes it, so a worker whose explicit env value or argv entry
     // discloses it can be refused before any worker launches. Default provider:
@@ -793,6 +812,31 @@ pub async fn run_agent(
         capability_probe_sink: capability_probe_sink.clone(),
         worker_config: worker_config_runtime.clone(),
     };
+    // The endpoints that `build_provider` uses: the primary base URL and each
+    // secondary provider that is not the selected provider.
+    let endpoint = crate::oneshot_session::endpoint_digest(
+        &agent.base_url,
+        agent
+            .secondary_providers
+            .iter()
+            .filter(|secondary| secondary.name != effective_provider)
+            .map(|secondary| (secondary.name.as_str(), secondary.base_url.as_str())),
+    );
+    let session = match session_request {
+        Some(request) => {
+            let session = open_oneshot_session(&cfg, request)?;
+            session.check_overrides(explicit_model.as_deref(), &effective_provider, &endpoint)?;
+            Some(session)
+        }
+        None => None,
+    };
+    let options = agent_cmd::RunOptions {
+        provider: report_provider,
+        output,
+        session,
+        prompt_cache: agent.prompt_cache,
+        endpoint,
+    };
     // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
     // and any required-audit write failure surfaced as exit 23 — BEFORE the
     // run's assistant output reaches stdout, so a finish-time audit failure can
@@ -803,7 +847,9 @@ pub async fn run_agent(
     let result = if let Some(audit) = &audit {
         use std::io::Write as _;
         let mut buffer: Vec<u8> = Vec::new();
-        let result = agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut buffer).await;
+        let result =
+            agent_cmd::run_agent_with(llm.as_ref(), workspace, cfg, args, options, &mut buffer)
+                .await;
         // WP09 (G1): peek (not take) the probe verdict so the terminal audit
         // record agrees with the process exit that `emit_probe_outcome` will
         // produce below; `emit_probe_outcome` still consumes the sink after.
@@ -827,7 +873,15 @@ pub async fn run_agent(
         stdout.flush()?;
         result
     } else {
-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
+        agent_cmd::run_agent_with(
+            llm.as_ref(),
+            workspace,
+            cfg,
+            args,
+            options,
+            &mut std::io::stdout(),
+        )
+        .await
     };
     // WP10 (FR-05, ADR-028): a required worker failure (initialization, call,
     // liveness, or teardown) ends the run with the reviewed `worker_unavailable`
@@ -1050,6 +1104,30 @@ fn finalize_run_audit(
         eprintln!("{}", failure.diagnostic_json());
         std::process::exit(failure.exit_code());
     }
+}
+
+/// Claim a named one-shot session in its own store (ADR-036 Decision 2):
+/// `sessions/oneshot` under a selected state root, else
+/// `~/.daimonos/oneshot-sessions`.
+fn open_oneshot_session(
+    cfg: &config::Config,
+    request: crate::oneshot_session::SessionRequest,
+) -> Result<crate::oneshot_session::OpenSession, crate::oneshot_session::Refusal> {
+    use crate::oneshot_session::Refusal;
+    let directory = match &cfg.state_authority {
+        Some(authority) => {
+            authority.verify_session_store(crate::state_root::SessionStoreKind::OneShot)?
+        }
+        None => paths::oneshot_sessions_dir().ok_or_else(|| {
+            Refusal::state_unusable("no home directory for the one-shot session store")
+        })?,
+    };
+    let store = crate::session_store::SessionStore::new(directory)
+        .with_private_state(cfg.state_authority.is_some())
+        .with_busy_timeout(std::time::Duration::from_millis(
+            cfg.session.session_store_busy_timeout_ms,
+        ));
+    crate::oneshot_session::open(store, request)
 }
 
 pub async fn run_chat(
