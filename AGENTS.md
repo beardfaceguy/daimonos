@@ -157,6 +157,7 @@ daimonos/
 │                                  #   repowise + the graphify KGL substrate)
 ├── .github/
 │   ├── RELEASE_TEMPLATE.md
+│   ├── scripts/                   # release-version.sh, release-on-merge.sh (see Releases)
 │   └── workflows/                 # ci.yml, deploy.yml, distro.yml, release.yml
 ├── graphify-out/                  # Local KGL substrate, gitignored (ADR 012)
 ├── .repowise/                     # Local repowise index, gitignored
@@ -512,6 +513,30 @@ echo '{"batch":[{"c":4,"p":"Cargo.toml"},{"c":6,"p":"fn main","n":5}]}' | \
 After changing the ACP engine, a live check means installing the binary and
 restarting the ACP client (Zed) — the client spawns `daimonos acp` itself, so a
 stale binary silently keeps serving the old behavior.
+
+## Releases
+
+CI releases on a merge to `master` that changes the version (Vikunja #1622).
+
+- **Rule.** After a push to `master`, when all CI jobs passed, the job
+  `Release on merge` reads the version in `Cargo.toml`. If no tag `v<version>`
+  exists, it creates the tag at that commit and starts `release.yml` on it. If
+  the tag exists, it does nothing.
+- **To release,** set the same new version in `Cargo.toml`, `Cargo.lock`
+  (package `daimonos`), and `server.json`, and add a `## [<version>]` section to
+  `CHANGELOG.md`. Do this in the PR that must ship, or in a separate release
+  PR. `.github/scripts/release-version.sh` checks that the four files agree,
+  and `tests/test_release_version.py` runs that check on each PR.
+- **A PR that keeps the version releases nothing.** Its changes ship with the
+  next version change. Put their changelog entries under `## [Unreleased]`.
+- **`release.yml`** builds five targets, tests the binary, creates the GitHub
+  Release, and publishes to the MCP Registry.
+- **If the release run fails,** the tag exists without a release, and later
+  merges do not try again. The job `Release on merge` fails when the release
+  run does not start. Run the failed jobs of the release run again, or start a
+  new run with `gh workflow run release.yml --ref v<version> -f tag=v<version>`.
+- A version with build metadata (`+...`) is not supported.
+- A version with a `-` (for example `0.2.0-rc.1`) becomes a prerelease.
 
 ## Vikunja project management
 
