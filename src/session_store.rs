@@ -146,6 +146,10 @@ pub struct PersistedSession {
     pub client_user_message_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assistant_outcomes: Vec<AssistantOutcome>,
+    /// The request prefix of a one-shot session (ADR-036). `None` for chat,
+    /// ACP, and daemon records. Optional, so the record version stays 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<crate::oneshot_session::PrefixRecord>,
     pub messages: Vec<Message>,
 }
 
@@ -548,6 +552,34 @@ impl SessionStore {
         )
     }
 
+    /// Save a one-shot session through its claimed writer (ADR-036). The
+    /// caller treats every outcome other than `Saved` as a failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_oneshot_generation_result(
+        &self,
+        writer: &SessionWriter,
+        generation: u64,
+        model: &str,
+        thinking: &str,
+        messages: &[Message],
+        cwd: &Path,
+        prefix: &crate::oneshot_session::PrefixRecord,
+    ) -> std::io::Result<SessionWriteOutcome> {
+        let record = PersistedSession {
+            version: SESSION_PERSIST_VERSION,
+            generation,
+            session_id: writer.session_id.clone(),
+            model: model.to_string(),
+            thinking: Some(thinking.to_string()),
+            cwd: Some(cwd.to_path_buf()),
+            client_user_message_ids: Vec::new(),
+            assistant_outcomes: Vec::new(),
+            prefix: Some(prefix.clone()),
+            messages: messages.to_vec(),
+        };
+        self.write_record(record, usize::MAX, Some(generation), Some(writer))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn save_record(
         &self,
@@ -571,6 +603,7 @@ impl SessionStore {
             cwd,
             client_user_message_ids: client_user_message_ids.to_vec(),
             assistant_outcomes: assistant_outcomes.to_vec(),
+            prefix: None,
             messages: messages.to_vec(),
         };
         if let Err(e) = self.write_record(record, usize::MAX, None, None) {
@@ -604,6 +637,7 @@ impl SessionStore {
             cwd: cwd.clone(),
             client_user_message_ids: client_user_message_ids.to_vec(),
             assistant_outcomes: assistant_outcomes.to_vec(),
+            prefix: None,
             messages: messages.to_vec(),
         };
         self.write_record(record, max_preview_bytes, generation, writer)
@@ -1371,6 +1405,7 @@ mod tests {
             cwd: None,
             client_user_message_ids: Vec::new(),
             assistant_outcomes: Vec::new(),
+            prefix: None,
             messages: Vec::new(),
         };
 

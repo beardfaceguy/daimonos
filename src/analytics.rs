@@ -153,6 +153,9 @@ pub struct DailyStats {
 #[derive(Debug, Clone)]
 pub struct AgentRunRecord {
     pub external_session_id: Option<String>,
+    /// Id of the named one-shot session of this run (ADR-036), so a caller
+    /// can total the attempts of one session. `None` without a session.
+    pub oneshot_session_id: Option<String>,
     /// First 200 chars of the task (for reporting), never full task text.
     pub task_prefix: String,
     pub input_tokens: u64,
@@ -226,7 +229,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     cache_write_tokens INTEGER NOT NULL,
     cost_usd REAL NOT NULL,
     stop_reason TEXT NOT NULL,
-    turns INTEGER NOT NULL DEFAULT 0
+    turns INTEGER NOT NULL DEFAULT 0,
+    oneshot_session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ar_timestamp ON agent_runs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_ar_session ON agent_runs(session_id);
@@ -243,6 +247,8 @@ fn migrate_schema(conn: &Connection) -> Result<(), String> {
         "CREATE INDEX IF NOT EXISTS idx_tc_external_session ON tool_calls(external_session_id)",
         "ALTER TABLE agent_runs ADD COLUMN reasoning_output_tokens INTEGER",
         "ALTER TABLE agent_runs ADD COLUMN thinking_bytes INTEGER NOT NULL DEFAULT 0",
+        // ADR-036: the named one-shot session of a run.
+        "ALTER TABLE agent_runs ADD COLUMN oneshot_session_id TEXT",
     ];
     for sql in migrations {
         if let Err(e) = conn.execute_batch(sql) {
@@ -437,8 +443,8 @@ impl AnalyticsStore {
             "INSERT INTO agent_runs (timestamp, session_id, external_session_id,
              task_prefix, input_tokens, output_tokens, reasoning_output_tokens,
              thinking_bytes, cache_read_tokens, cache_write_tokens, cost_usd,
-             stop_reason, turns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             stop_reason, turns, oneshot_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 now,
                 self.session_id,
@@ -453,6 +459,7 @@ impl AnalyticsStore {
                 rec.cost_usd,
                 rec.stop_reason,
                 rec.turns as i32,
+                rec.oneshot_session_id.as_deref(),
             ],
         );
     }
@@ -1344,6 +1351,7 @@ mod tests {
 
     fn sample_agent_run() -> AgentRunRecord {
         AgentRunRecord {
+            oneshot_session_id: None,
             external_session_id: None,
             task_prefix: "test task".into(),
             input_tokens: 1000,
@@ -1374,6 +1382,7 @@ mod tests {
     fn record_agent_run_stores_all_token_fields() {
         let (_dir, store) = test_store();
         store.record_agent_run(&AgentRunRecord {
+            oneshot_session_id: None,
             input_tokens: 1111,
             output_tokens: 2222,
             reasoning_output_tokens: Some(77),
@@ -1415,6 +1424,7 @@ mod tests {
         let (_dir, store) = test_store();
         store.record_agent_run(&sample_agent_run());
         store.record_agent_run(&AgentRunRecord {
+            oneshot_session_id: None,
             reasoning_output_tokens: Some(0),
             ..sample_agent_run()
         });
@@ -1434,6 +1444,7 @@ mod tests {
     fn record_agent_run_stores_cost_and_stop_reason() {
         let (_dir, store) = test_store();
         store.record_agent_run(&AgentRunRecord {
+            oneshot_session_id: None,
             cost_usd: 0.5678,
             stop_reason: "max_tokens".into(),
             ..sample_agent_run()
@@ -1453,6 +1464,7 @@ mod tests {
     fn record_agent_run_stores_external_session_id() {
         let (_dir, store) = test_store();
         store.record_agent_run(&AgentRunRecord {
+            oneshot_session_id: None,
             external_session_id: Some("ext-session-xyz".into()),
             ..sample_agent_run()
         });
@@ -1470,6 +1482,7 @@ mod tests {
     fn agent_runs_summary_aggregates_correctly() {
         let (_dir, store) = test_store();
         store.record_agent_run(&AgentRunRecord {
+            oneshot_session_id: None,
             input_tokens: 1000,
             output_tokens: 500,
             cache_read_tokens: 200,
@@ -1478,6 +1491,7 @@ mod tests {
             ..sample_agent_run()
         });
         store.record_agent_run(&AgentRunRecord {
+            oneshot_session_id: None,
             input_tokens: 2000,
             output_tokens: 1000,
             cache_read_tokens: 400,
@@ -1520,6 +1534,7 @@ mod tests {
     fn stats_report_shows_cache_hit_rate() {
         let (_dir, store) = test_store();
         store.record_agent_run(&AgentRunRecord {
+            oneshot_session_id: None,
             input_tokens: 800,
             cache_read_tokens: 200,
             ..sample_agent_run()

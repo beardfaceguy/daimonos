@@ -211,6 +211,7 @@ mod tests {
             cwd: Some(std::path::PathBuf::from("/workspace")),
             client_user_message_ids: vec!["user-1".to_string()],
             assistant_outcomes: Vec::new(),
+            prefix: None,
             messages: vec![crate::providers::Message::user("hello")],
         }
     }

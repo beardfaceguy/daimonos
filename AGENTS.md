@@ -225,13 +225,14 @@ daimonos/
     │                              #   plan entries, usage accounting, retries
     ├── agent_runtime.rs           # Mode entrypoints (run_agent/run_chat/run_acp) +
     │                              #   provider construction from the agent env
-    ├── agent_cmd.rs               # One-shot `agent` frontend
+    ├── agent_cmd.rs               # One-shot `agent` frontend, JSON result document (ADR-036)
+    ├── oneshot_session.rs         # Named, resumable one-shot sessions: prefix record, refusals (ADR-036)
     ├── chat_cmd.rs                # Interactive `chat` REPL (reedline)
     ├── acp_cmd.rs                 # Native ACP engine over stdio (Zed & other ACP clients)
     ├── agent_env.rs               # Agent env file: provider, model, keys, approvals, compaction
     ├── compaction.rs              # Context-window compaction (ADR-002)
     ├── safety.rs                  # Approval modes, allow/deny gates, persisted approvals
-    ├── session_store.rs           # On-disk conversation persistence (chat + ACP sessions)
+    ├── session_store.rs           # On-disk conversation persistence (chat, ACP, and one-shot sessions)
     ├── mcp_bridge.rs              # Outbound MCP client: external MCP servers as agent tools (ADR-003)
     ├── zed_config.rs              # Reads Zed `context_servers` settings as an MCP fallback
     ├── providers/
