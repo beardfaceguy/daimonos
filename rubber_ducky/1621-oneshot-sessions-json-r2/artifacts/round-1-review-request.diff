@@ -1,0 +1,3504 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index f413092..c904952 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -225,13 +225,14 @@ daimonos/
+     │                              #   plan entries, usage accounting, retries
+     ├── agent_runtime.rs           # Mode entrypoints (run_agent/run_chat/run_acp) +
+     │                              #   provider construction from the agent env
+-    ├── agent_cmd.rs               # One-shot `agent` frontend
++    ├── agent_cmd.rs               # One-shot `agent` frontend, JSON result document (ADR-036)
++    ├── oneshot_session.rs         # Named, resumable one-shot sessions: prefix record, refusals (ADR-036)
+     ├── chat_cmd.rs                # Interactive `chat` REPL (reedline)
+     ├── acp_cmd.rs                 # Native ACP engine over stdio (Zed & other ACP clients)
+     ├── agent_env.rs               # Agent env file: provider, model, keys, approvals, compaction
+     ├── compaction.rs              # Context-window compaction (ADR-002)
+     ├── safety.rs                  # Approval modes, allow/deny gates, persisted approvals
+-    ├── session_store.rs           # On-disk conversation persistence (chat + ACP sessions)
++    ├── session_store.rs           # On-disk conversation persistence (chat, ACP, and one-shot sessions)
+     ├── mcp_bridge.rs              # Outbound MCP client: external MCP servers as agent tools (ADR-003)
+     ├── zed_config.rs              # Reads Zed `context_servers` settings as an MCP fallback
+     ├── providers/
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fe15163..37dd756 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- `daimonos agent --session-id <ID>` and `daimonos agent --resume <ID>`: named
++  one-shot sessions that a later run continues on the same provider and model,
++  with the same system prompt, tool list, and earlier messages (ADR-036).
++- `daimonos agent --output json`: one JSON result document on stdout for each
++  run, with the outcome and the token usage of that invocation. It is also
++  printed after a provider error and a context overflow.
++- `agent_runs.oneshot_session_id`: the named session of a one-shot run.
++
+ ## [0.1.5] - 2026-10-18
+ 
+ The first release since v0.1.4 (May 2026). It spans about 250 merged PRs. The
+diff --git a/CONTEXT-MAP.md b/CONTEXT-MAP.md
+index f054eca..13c965f 100644
+--- a/CONTEXT-MAP.md
++++ b/CONTEXT-MAP.md
+@@ -1,11 +1,11 @@
+ # Context map
+ 
+-Date: 2026-10-28
++Date: 2026-11-20
+ 
+ | Context | Glossary | Decisions |
+ |---------|----------|-----------|
+ | Pinned git reads | [Git reads](docs/contexts/git-read/CONTEXT.md) | [ADR-017](docs/adr/017-git-read-tool.md), [Proposed ADR-018](docs/adr/018-strict-git-pinning.md), [Proposed ADR-019](docs/adr/019-ignore-repository-filters.md) |
+-| Session durability | [Glossary](docs/contexts/session-durability/CONTEXT.md) | [ADR-014](docs/adr/014-sqlite-session-memory.md), [ADR-015](docs/adr/015-session-protocol-v3.md), [ADR-016](docs/adr/016-cancelled-turn-partial-commit.md), [ADR-020](docs/adr/020-durable-turn-checkpoints.md), [ADR-033](docs/adr/033-live-session-owner-lock.md) |
++| Session durability | [Glossary](docs/contexts/session-durability/CONTEXT.md) | [ADR-014](docs/adr/014-sqlite-session-memory.md), [ADR-015](docs/adr/015-session-protocol-v3.md), [ADR-016](docs/adr/016-cancelled-turn-partial-commit.md), [ADR-020](docs/adr/020-durable-turn-checkpoints.md), [ADR-033](docs/adr/033-live-session-owner-lock.md), [ADR-036](docs/adr/036-oneshot-sessions-and-json-result.md) |
+ | Reviewer runtime | [Glossary](docs/contexts/reviewer-runtime/CONTEXT.md) | [Accepted ADR inventory, 021–032](docs/handoffs/2026-10-28-dbunk-remaining-work.md#adr-inventory) |
+ 
+ This map covers git reads, session durability, and accepted reviewer-runtime decisions. Other contexts are not mapped here yet.
+diff --git a/docs/adr/036-oneshot-sessions-and-json-result.md b/docs/adr/036-oneshot-sessions-and-json-result.md
+new file mode 100644
+index 0000000..8ca83c3
+--- /dev/null
++++ b/docs/adr/036-oneshot-sessions-and-json-result.md
+@@ -0,0 +1,150 @@
++# ADR-036: One-shot agent runs can be named, resumed, and reported as JSON
++
++- **Status:** Accepted
++- **Date:** 2026-11-19
++- **Deciders:** Repository maintainer, by explicit user decision on 2026-11-20. The maintainer resolved open questions 1 to 5 on the same day.
++- **Consulted:** None recorded.
++- **Informed:** None recorded.
++- **Spec:** Vikunja #1621. Request: [one-shot resume and JSON handoff](../handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md).
++- **Dependencies:** ADR-014, ADR-021, ADR-033 (all accepted).
++- **Supersedes:** None. Amends ADR-024 for one option combination (Decision 14).
++- **Superseded by:** None
++
++## Context
++
++One-shot `daimonos agent "<task>"` starts a new conversation on each call. It builds the system prompt from the workspace, runs the loop, prints the assistant text, and writes one `agent_runs` row. It does not save the conversation.
++An external orchestrator runs Daimonos as a worker. After a failed test stage it wants to send only the failure output to the same conversation on the same model, so that the provider serves the earlier conversation from its prompt cache. It also needs the outcome and the token counts of each run without reading the analytics database.
++`chat` saves and resumes through `SessionStore::save`. That path is best-effort, takes no writer, and lets `--model` replace the saved model.
++
++Three facts from the code and the provider documentation limit the design. They come from a reading of the code. No provider request was measured.
++
++1. Prompt caching is off by default (`DAIMONOS_AGENT_PROMPT_CACHE`). When it is on, the agent loop always sends `stable_prefix_len: 0`. The Anthropic adapter then marks only the last tool definition. The system prompt and the messages are not cached on direct Anthropic. The OpenRouter adapter marks the last message for `anthropic/` models. An identical prefix alone does not give a cache read on direct Anthropic.
++2. The loop prunes old tool results in place (`microcompact_history`) when the kept results pass `intra_turn_result_budget_tokens` (default 40,000). This rewrites earlier messages. The request says that one-shot mode has no compaction. That is correct for ADR-002 compaction and not for this pruning.
++3. Anthropic documents the cache order as tools, then system, then messages. A change of the thinking setting invalidates the message cache. The default cache lifetime is 5 minutes. ([Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), read 2026-11-19.)
++
++How can a one-shot run be continued and reported so that a caller can depend on the saved state, the request prefix, and the result?
++
++## Decision drivers
++
++- A run without the new options must not change.
++- A resumed request reproduces the earlier prefix, or the run refuses. No silent difference.
++- The caller can depend on the save and on the result document.
++- One store implementation and one ownership rule (ADR-014, ADR-033).
++- The caller does not read Daimonos tables.
++
++## Decision
++
++We will add three opt-in options to one-shot `daimonos agent`: `--session-id <id>`, `--resume <id>`, and `--output json`.
++
++### Sessions
++
++1. `--session-id <id>` starts a new named session. `--resume <id>` continues one. The two options conflict with each other, with `--interactive`, and with `--dry-run`. The id uses the `SessionStore` id alphabet, with at most 128 characters (proposed). The top-level `--session-id` keeps its meaning: it filters `--stats`. The position separates the two options: before `agent`, or after it.
++2. The session uses the `SessionStore` type in its own directory: `~/.daimonos/oneshot-sessions`, or `sessions/oneshot` under a selected state root (new `SessionStoreKind::OneShot`). `chat --list` and `chat --resume` do not see these sessions.
++3. `PersistedSession` gets one optional field, the **prefix record**: the provider name, the system prompt text, and the ordered tool list with a SHA-256 digest of each tool's description and input schema. The model and the thinking level use the existing fields. The record version stays 1.
++4. A new session claims the writer with no expected generation. A resume loads the record and claims the writer at the loaded generation. `claim_writer` takes the owner lock, so a second live process is refused (ADR-033).
++5. A resume uses the saved provider, model, and thinking level. A `--model` or `--provider` value that differs from the record is refused. The system prompt is the saved text. It is not rebuilt. The run computes its tool list and compares it with the record. A difference in order, name, or digest is refused, and the message names the first tool that differs.
++6. The resumed conversation is the saved messages plus the new input as one user message. A session run has no ADR-002 compaction policy. Result pruning (Context, fact 2) does not change.
++7. In a session run, the loop marks the full message list as the stable prefix (`stable_prefix_len` = message count) on each request. The provider adapter translates that (ADR-001). This has no effect while prompt caching is off. A run without a session option keeps the value 0.
++8. The run saves the session after the loop returns, for each stop reason, through the claimed writer at the next generation. Any result other than `Saved` is a failure and the process exits with code 1 (proposed).
++9. A refusal before the run exits with code 2 and prints the existing `run_configuration_invalid` JSON on stderr. Reason codes (proposed): `session_id_invalid`, `session_exists`, `session_not_found`, `session_owned_elsewhere`, `session_changed`, `session_not_resumable`, `session_model_mismatch`, `session_provider_mismatch`, `session_tools_changed`.
++10. A context overflow ends the run with `stop_reason: error` and `context_overflow: true`. The run does not compact and does not retry. The caller starts a new session.
++11. Each invocation writes one `agent_runs` row, as today. The row gets a nullable column `oneshot_session_id` (proposed), added through `migrate_schema`.
++
++### JSON result
++
++12. `--output json` prints one JSON document and one newline on stdout when the loop returned a result, for each stop reason. It prints nothing else on stdout. A run that fails before the loop starts prints no document. The exit code rules of `check_agent_result` do not change.
++13. The document has these fields (names proposed):
++
++| Field | Type | Content |
++|---|---|---|
++| `schema_version` | integer | `1` |
++| `session_id` | string or null | The id of `--session-id` or `--resume` |
++| `resumed` | boolean | True for `--resume` |
++| `session_saved` | boolean or null | Null without a session option |
++| `session_error` | string or null | The save failure |
++| `provider`, `model` | string | The provider and model that served the run |
++| `stop_reason` | string | `StopReason::as_str`, the same value as the `agent_runs` row |
++| `error_message` | string or null | From the result |
++| `context_overflow` | boolean | From the result |
++| `final_text` | string | The text blocks of the last assistant message of this invocation |
++| `turns` | integer | The same value as the `agent_runs` row |
++| `usage` | object | `input_tokens`, `output_tokens`, `reasoning_output_tokens` (or null), `thinking_bytes`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`. This invocation only. |
++| `evidence` | object | `status`: `unknown`, `no_mutations`, `verified`, or `unverified` |
++| `duration_ms` | integer | Wall time of the invocation |
++
++14. With the structured final output of ADR-024, the envelope is the only stdout document. A field `final_output` holds the validated document, or null. The exit codes of ADR-024 do not change. This rule applies when one build has both options.
++15. Without `--output json`, a resumed run prints only the assistant text of this invocation.
++
++### Implementation notes (2026-11-21)
++
++The implementation refined four rules. Each refinement keeps the intent of its decision.
++
++- **Decision 5, provider.** The run compares the saved provider with the provider that the run selects: `--provider`, or the agent env file. It is not only the explicit `--provider` value. The credentials of a run belong to its selected provider, so a saved session of another provider is refused and is never sent there.
++- **Decision 5, model.** The run compares only an explicit `--model` with the record. The model of the agent env file is a default. A resume ignores it and uses the saved model.
++- **Decision 7.** The loop sets the stable-prefix mark only when prompt caching is on. The Anthropic adapter sets a cache marker for each non-zero prefix length. It does not read the prompt-cache setting for messages. Without this condition, a session run with prompt caching off sends a cache marker.
++- **Decision 8.** The save removes empty assistant messages from the end of the history. The loop ends a failed provider call with an empty assistant message, and providers reject empty assistant content.
++
++The field `usage.thinking_bytes` is the count of thinking bytes that the provider streamed. It is 0 when the provider does not stream.
++
++## Alternatives
++
++- **The caller reads `agent_runs`:** no change in Daimonos, but it couples the caller to an internal schema.
++- **Put one-shot sessions in the chat store directory:** one directory less. `chat --resume` can then continue the session with compaction and another model, and the chat save takes no writer.
++- **Rebuild the system prompt and refuse if it differs:** no stored prompt text. A change of a skill or an instruction file in the workspace then blocks each retry.
++- **Store the full tool schemas and reuse them:** a resume survives a tool change, but the model is then offered tools that the runtime does not have.
++- **Let `--model` win, as `chat` does:** the cache is lost without a message.
++- **Record the id in `external_session_id`:** no schema change, and `--stats --session-id` works. The outer runtime owns that column through `DAIMONOS_AGENT_SESSION_ID`, so two ids can collide.
++- **Save only after a successful run:** the id stays free after a failure. The caller pays again for the work of the failed attempt.
++- **Leave the cache intent at 0:** less change. On direct Anthropic a resume then reads only the tool definitions from the cache.
++- **A JSON event stream:** more than the caller needs.
++
++## Consequences
++
++- A session record holds the system prompt and the conversation, with file content, in a 0700 directory and 0600 files. This ADR adds no retention and no delete command. The store grows.
++- A resumed run uses the old system prompt. A changed skill or instruction applies only to a new session.
++- A change of a tool schema (an upgrade, a configuration change, a new workspace signal) makes existing sessions non-resumable.
++- A cache read is not guaranteed. The provider lifetime can end (5 minutes by default on Anthropic). Result pruning rewrites messages. A coordination notice or a loop-detector steer changes the system text for one request.
++- With prompt caching on, each request of a session run pays the provider's cache-write price for its new part. A session that is never resumed costs more than a run of today.
++- A failed run consumes the session id.
++- `agent_runs` has three id columns.
++- `--session-id` has two meanings. The position before or after `agent` selects the meaning.
++- With `--output json`, no code on the print path may write to stdout.
++
++## Confirmation
++
++- Existing one-shot tests pass without a change.
++- A mock-provider test: run with `--session-id`, then `--resume`. The system prompt, the tool array, and the earlier messages of the resumed request are byte-identical to the last request of the first run. One user message is added.
++- Tests for each refusal of Decision 9, with the record unchanged after the refusal.
++- A test with a held owner lock: the second `--resume` exits with code 2.
++- A test with a failing store: the process exits non-zero, and the document has `session_saved: false`.
++- Tests of the stdout bytes with `--output json` for success, provider error, and context overflow. One of them runs a tool whose child process writes to stdout.
++- A test compares `usage`, `stop_reason`, and `turns` with the `agent_runs` row.
++- An Anthropic request-builder test: a session run marks the last message.
++- A state-root test: the session database is under `sessions/oneshot`.
++- A CLI parse test: the top-level `--session-id` and `agent --session-id` parse as two separate values.
++- `cargo test` and `python3 -m pytest tests/ -v` pass.
++
++## Anchors
++
++_Anchors:_ src/agent_cmd.rs::run_agent, src/agent_runtime.rs::run_agent, src/agent_runtime.rs::check_agent_result, src/cli.rs::AgentArgs, src/session_store.rs::PersistedSession, src/session_store.rs::SessionStore::claim_writer, src/session_store.rs::SessionStore::load_result, src/session_store.rs::SessionStore::write_record, src/state_root.rs::SessionStoreKind, src/state_root.rs::StateAuthority::verify_session_store, src/agent.rs::run, src/agent.rs::AgentResult, src/tool_output.rs::microcompact_history, src/providers/mod.rs::Context, src/providers/mod.rs::StopReason::as_str, src/providers/anthropic.rs::build_request_with_cache, src/providers/openrouter.rs::apply_prompt_cache, src/prompts.rs::agent_system_for_workspace, src/analytics.rs::AnalyticsStore::record_agent_run, src/analytics.rs::migrate_schema, src/evidence.rs::EvidenceLedger::status, src/chat_cmd.rs::resolve_model, src/oneshot_session.rs::open, src/oneshot_session.rs::OpenSession::check_tools, src/oneshot_session.rs::PrefixRecord, src/agent_cmd.rs::run_agent_with, src/agent_cmd.rs::RunReport, src/agent_runtime.rs::open_oneshot_session
++
++## Revisit when
++
++- One-shot runs get model failover. The `model` field must then name each model that served a call.
++- The one-shot session store needs retention.
++- A caller needs a resume across a tool-schema change.
++
++## Open questions
++
++The maintainer resolved these on 2026-11-20. Each answer keeps the rule of the Decision section:
++
++1. **Store directory.** A separate directory with the same store type (Decision 2).
++2. **Cache intent.** In scope. Session runs mark the message list as the stable prefix (Decision 7).
++3. **Save after a failed run.** The run saves for each stop reason (Decision 8).
++4. **Option name.** `--session-id` on `agent` (Decision 1). A probe with clap 4.6.1 showed that the top-level option and the `agent` option parse as two separate values.
++5. **Result pruning.** It stays on in session runs (Decision 6).
++
++These are open. They did not block acceptance:
++
++6. The reason codes, the field names, the column name, the 128-character limit, and exit code 1 for a failed save are proposed.
++7. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this. A process test shows that the OpenRouter-compatible adapter sends the two user messages. No real provider was tested with this sequence.
+diff --git a/docs/contexts/session-durability/CONTEXT.md b/docs/contexts/session-durability/CONTEXT.md
+index a3c12a8..bb349ee 100644
+--- a/docs/contexts/session-durability/CONTEXT.md
++++ b/docs/contexts/session-durability/CONTEXT.md
+@@ -1,6 +1,6 @@
+ # Session durability
+ 
+-Date: 2026-11-08
++Date: 2026-11-21
+ 
+ - **Canonical history:** The live AgentSession messages after a terminal turn commit.
+ - **Turn journal:** The authoritative in-memory suffix for a staged prompt or retry.
+@@ -9,6 +9,8 @@ Date: 2026-11-08
+ - **Owner lock:** The `flock` that the live writing process holds on `locks/<session-id>.lock`. Another process cannot claim the session while it is held. The OS releases it when the owner exits.
+ - **Writer epoch:** The store's ownership fence. An old runtime cannot overwrite a new owner's saves.
+ - **Capture generation:** The monotonically ordered payload identity that prevents a late write from replacing a newer snapshot.
++- **One-shot session (ADR-036):** A named `daimonos agent` conversation that a later invocation can continue with `--resume`. It has one writer and its own store directory.
++- **Prefix record (ADR-036):** The part of a one-shot session record that lets a resume reproduce the request prefix: provider, system prompt text, and one digest for each tool schema, in order.
+ - **Shutdown drain:** Waiting for the active-turn permit through its terminal persistence write, within the existing teardown deadline.
+ 
+ [ADR-014](../../adr/014-sqlite-session-memory.md) defines storage ownership.
+@@ -16,6 +18,7 @@ Date: 2026-11-08
+ [ADR-016](../../adr/016-cancelled-turn-partial-commit.md) defines interruption materialization.
+ [ADR-020](../../adr/020-durable-turn-checkpoints.md) records recovery checkpoints.
+ [ADR-033](../../adr/033-live-session-owner-lock.md) gives a live session one owning process.
++[ADR-036](../../adr/036-oneshot-sessions-and-json-result.md) adds named and resumable one-shot sessions.
+ [The investigation log](../../investigations/2026-10-28-acp-crash-history.md) records the reproduction and repair checks.
+ 
+-_Anchors:_ src/session_store.rs::SessionStore::claim_writer, src/agent.rs::TurnJournalWriter, src/session_core.rs::SessionCore::configure_turn_checkpoint, src/session_core.rs::TurnController::wait_idle, src/acp_cmd.rs::shutdown_session_handles_with
++_Anchors:_ src/session_store.rs::SessionStore::claim_writer, src/agent.rs::TurnJournalWriter, src/session_core.rs::SessionCore::configure_turn_checkpoint, src/session_core.rs::TurnController::wait_idle, src/acp_cmd.rs::shutdown_session_handles_with, src/oneshot_session.rs::open, src/oneshot_session.rs::PrefixRecord
+diff --git a/docs/handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md b/docs/handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md
+new file mode 100644
+index 0000000..c1cebf3
+--- /dev/null
++++ b/docs/handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md
+@@ -0,0 +1,97 @@
++# Handoff: resumable one-shot sessions and a JSON result for `daimonos agent`
++
++You are working in the daimonos repository. Follow `AGENTS.md` as usual: start in Vikunja, read the accepted ADRs, then the code. This handoff asks for two opt-in additions to the one-shot `daimonos agent` mode. When neither new flag is passed, behavior must stay exactly as it is today.
++
++## Who needs this and why
++
++Konzern (github.com/meetalix/konzern) is a local orchestrator that runs coding work as a pipeline of stages. Its agent stages hand a finished prompt and a model to a **worker agent harness**, and Daimonos is one of the harnesses it will call, as an external program at a pinned version. Konzern's side of that boundary is `src/konzern/agents.py` (`AgentRequest` in, `AgentResponse` out). Konzern's main goal is cutting token cost without losing accuracy.
++
++Two gaps block that today:
++
++1. **Retries resend everything.** When a program stage (tests, lint) fails after an agent stage, Konzern sends the agent the failure output and asks it to try again. Today each `daimonos agent` call starts a new conversation, so the agent pays for the full prompt again and re-reads the files it already read. Konzern has decided to **resume the same session on the same model** for retries, sending only the failure output, so the earlier conversation is served from the provider's prompt cache. When Konzern moves to a stronger model, it starts a fresh session on purpose.
++2. **No machine-readable result.** One-shot mode prints only the assistant's text. Konzern needs the outcome and the token counts for every run (its run log records tokens per stage). The only way to get them today is to read Daimonos's internal analytics database (`agent_runs`), which would couple Konzern to Daimonos's schema.
++
++## Process
++
++- File a Vikunja task (project 172, "Agentic CLI tool", or 183, "daimonos-agent", whichever fits your conventions) and reference it in commits.
++- Both changes add a public CLI contract and change the one-shot session lifecycle, so write **ADR-036** (status Proposed) before building, in the style of ADRs 021–035. Get the maintainer's approval, then build.
++- New crates need confirmation (review checklist). Model-facing text belongs in `prompts/`, not Rust literals.
++- Tests in the same change: Rust tests for the new paths, and pytest where the MCP side is touched. Both `cargo test` and `python3 -m pytest tests/ -v` must pass.
++
++## Change 1: name and resume one-shot sessions
++
++**Today:** `agent_cmd::run_agent` (`src/agent_cmd.rs`) builds `initial = vec![Message::user(task)]`, runs `agent::run`, prints assistant text, and records an `agent_runs` analytics row. The conversation is not saved. `chat` already persists and resumes through `SessionStore::save` / `load` (`src/session_store.rs`, `src/chat_cmd.rs`, Vikunja #963). Reuse that store; don't add a second one.
++
++**Requested behavior** (flag spellings are proposals; settle them in the ADR):
++
++- `daimonos agent --session-id <id> "<task>"` runs a new one-shot session under the caller's id, and saves the conversation and the model when the run ends. If a session with that id already exists, fail with a clear error; never overwrite.
++- `daimonos agent --resume <id> "<new input>"` loads the saved conversation, appends the new input as a user message, runs, and saves again.
++- **Same model only.** A resumed session runs on the model it was saved with. If `--model` is passed and differs, fail with a clear error. (`chat --resume` lets `--model` win; for one-shot callers a silent model change would throw away the cache the resume exists for.)
++- **Cache-friendly prefix.** The resumed request must start with the same bytes as the earlier one: the same system prompt, the same tool schemas in the same order, and the same earlier messages. Today the system prompt is rebuilt per run by `prompts::agent_system_for_workspace`, which reads the workspace. The agent has usually just edited that workspace, so a rebuilt prompt can differ and miss the cache. Save the system prompt (or what's needed to rebuild it exactly) with the session, and reuse it on resume. If the tool schema set differs on resume, fail rather than continue on a silently different prefix.
++- **Saving must not be best-effort here.** `SessionStore::save` logs and swallows failures, which suits chat. When `--session-id` or `--resume` is used, the caller depends on the save, so a failed save must exit non-zero.
++- **Context growth.** One-shot mode runs with no compaction (`AgentConfig::default()`). Keep it that way for resumed sessions: compaction rewrites the prefix and defeats the cache. If a resumed run hits a context overflow (`AgentResult.context_overflow`), end with that as the stop reason so the caller can start a fresh session.
++- **Concurrency.** One writer per session id. Use the existing generation / owner-lock rules (ADR-015, ADR-033) to reject a concurrent resume of the same id instead of interleaving.
++- **State placement.** Under a caller-owned state root (ADR-021), the session store must live under that root.
++- **Analytics.** Keep recording one `agent_runs` row per invocation, with the session id recorded so a caller can total a session's attempts.
++
++## Change 2: `--output json` for one-shot runs
++
++**Requested behavior:**
++
++- `daimonos agent --output json ...` prints exactly **one JSON document and a newline** on stdout, and nothing else on stdout. The assistant's text goes inside the document; logs and diagnostics stay on stderr.
++- Print the document whenever a run started, **including when it failed** (provider error, refusal, context overflow), so the caller can still record the tokens spent. Only argument or configuration errors that stop a run from starting may skip it (stderr message, non-zero exit). Keep today's exit-code semantics from `check_agent_result`.
++- Suggested fields (settle names and types in the ADR, version them, and document them in `docs/runtime-modes.md`):
++
++```json
++{
++  "schema_version": 1,
++  "session_id": "konzern-run-42-code",
++  "resumed": true,
++  "provider": "anthropic",
++  "model": "claude-...",
++  "stop_reason": "end_turn",
++  "error_message": null,
++  "context_overflow": false,
++  "final_text": "Changed greet() to return 'hi'; tests pass.",
++  "turns": 5,
++  "usage": {
++    "input_tokens": 1830,
++    "output_tokens": 412,
++    "reasoning_output_tokens": 0,
++    "cache_read_tokens": 41200,
++    "cache_write_tokens": 2100,
++    "cost_usd": 0.0731
++  },
++  "evidence": { "workspace_changed": true, "verifier_passed": true },
++  "duration_ms": 18450
++}
++```
++
++- `usage` covers **this invocation only**, not the whole session. Konzern totals attempts itself.
++- `model` is the model that actually served the run. One-shot mode has failover off (`failover_models` is empty by default), so today that's the requested model. If failover is ever enabled for one-shot runs, report every model that served a call.
++- `evidence` comes from `AgentResult.evidence` (Vikunja #1198); include whatever it reliably reports.
++
++**Open question for the ADR:** how this combines with ADR-024's structured final output (WP05), which emits only the validated document on stdout. One option is to keep `--output json` as the envelope and put the validated document in a `final_output` field when both are enabled. Decide it in ADR-036 rather than leaving it to the implementation.
++
++## Acceptance checks
++
++- Without the new flags, one-shot output and behavior are unchanged (existing tests pass unmodified).
++- `--session-id` saves a session; reusing an existing id fails without overwriting.
++- `--resume` continues the saved conversation. A test with a mock provider shows the resumed request's system prompt, tools and earlier messages are byte-identical to the first run's, and only the new user message is added.
++- `--resume` with a different `--model` fails with a clear error.
++- A failed save under `--session-id` or `--resume` exits non-zero.
++- `--output json` prints one parseable document on stdout for success, provider error and context overflow, with per-invocation usage that matches the `agent_runs` row.
++- A concurrent second `--resume` of the same id is rejected.
++
++## Out of scope here
++
++These are already planned elsewhere or tracked separately:
++
++- Structured done / failed / needs-a-decision outcome: ADR-024, WP05.
++- Explicit-only discovery, so a caller's prompt isn't joined by the workspace's own AGENTS.md and skills: ADR-021, WP11.
++- Model-request ceiling: ADR-024.
++- Recording the model on each `agent_runs` row, and reading the task from a file or stdin.
++
++## When you're done
++
++Report back with: the ADR number and status, the Vikunja task, the PR, the final flag names, and an example JSON document from a real run.
+diff --git a/docs/plans/2026-11-19-oneshot-sessions-and-json-result/PLAN.md b/docs/plans/2026-11-19-oneshot-sessions-and-json-result/PLAN.md
+new file mode 100644
+index 0000000..a2c11b6
+--- /dev/null
++++ b/docs/plans/2026-11-19-oneshot-sessions-and-json-result/PLAN.md
+@@ -0,0 +1,157 @@
++# Plan: named one-shot sessions and a JSON result for `daimonos agent`
++
++- **Status:** Implemented (2026-11-21). Approved by maintainer review on 2026-11-20.
++- **Date:** 2026-11-20
++- **Spec:** Vikunja #1621. Request: [one-shot resume and JSON handoff](../../handoffs/2026-11-20-daimonos-handoff-oneshot-resume-and-json.md).
++- **Decisions:** [ADR-036](../../adr/036-oneshot-sessions-and-json-result.md) (Accepted). It depends on ADR-001, ADR-014, ADR-021, and ADR-033.
++- **Branch:** `feat/1621-oneshot-sessions-json`
++
++Paths and symbols in this plan were read at `230df9d`. A name marked `(new)` does not exist yet. A name marked `(proposed)` can change in review.
++
++## Goal
++
++A caller can continue a one-shot run on the same provider and model with only the new input, and can read the outcome and the token usage of each run from stdout.
++The acceptance checks of the request document are the success measure.
++
++## In scope
++
++1. `daimonos agent --output json`.
++2. `daimonos agent --session-id <id>` and `daimonos agent --resume <id>`.
++3. The stable-prefix mark for session runs (ADR-036 Decision 7).
++4. The `agent_runs` column for the one-shot session id.
++5. Documents: `docs/runtime-modes.md`, `CHANGELOG.md`, the session-durability glossary, and the source tree in `AGENTS.md`.
++
++## Out of scope
++
++- The `final_output` field (ADR-036 Decision 14). `--final-output` is not on `master`. This build does not emit the field.
++- Structured done, failed, or needs-a-decision outcomes (ADR-024, WP05).
++- Explicit-only discovery (ADR-021, WP11).
++- The model-request ceiling (ADR-024).
++- Reading the task from a file or stdin.
++- Retention or a delete command for one-shot sessions.
++- Model failover for one-shot runs.
++- A change to result pruning, to `chat`, to ACP, or to the session daemon.
++- A change of the default of `DAIMONOS_AGENT_PROMPT_CACHE`.
++
++## Design rules
++
++1. A run without the three new options executes the same code path as today and produces the same bytes on stdout. Existing tests pass without a change.
++2. One store implementation. One-shot sessions use `SessionStore` with a claimed writer. They do not use the best-effort `SessionStore::save`.
++3. A resume reproduces the prefix or refuses. The saved system prompt text is sent as saved. The tool list is computed and compared, never loaded.
++4. Session handling is in the one-shot frontend (`src/agent_cmd.rs`) and one new module. The agent loop gets one new input, the stable-prefix mark.
++5. Provider wire format stays in `src/providers/*` (ADR-001). The loop sets `Context::stable_prefix_len`. The adapters translate it.
++6. With `--output json`, the print path writes to stdout exactly once.
++7. No new crate. `sha2`, `hex`, `serde_json`, and `clap` are dependencies today.
++8. The new code has no model-facing text.
++
++## Interfaces
++
++Types and signatures only.
++
++**`src/cli.rs::AgentArgs`**
++- `session_id: Option<String>`, `--session-id <ID>`. Conflicts with `resume`, `interactive`, `dry_run`.
++- `resume: Option<String>`, `--resume <ID>`. Conflicts with `interactive`, `dry_run`.
++- `output: AgentOutputFormat (new)`, `--output <text|json>`, default `text`. Conflicts with `interactive`, `dry_run`.
++
++**`src/oneshot_session.rs (new)`**
++- `enum SessionRequest { Start(String), Resume(String) }`
++- `struct PrefixRecord { provider: String, system: String, tools: Vec<ToolDigest> }`, `struct ToolDigest { name: String, sha256: String }`. Both derive `Serialize` and `Deserialize`.
++- `fn tool_digests(tools: &[ToolSchema]) -> Vec<ToolDigest>`. The digest input is the description and the serialized input schema.
++- `struct Refusal(RunFailure)`, an error type. One constructor for each reason code of ADR-036 Decision 9.
++- `struct OpenSession`. It holds the store, the writer, the next generation, the saved messages, and the prefix record.
++- `fn open(store: SessionStore, request: &SessionRequest) -> Result<OpenSession, Refusal>`
++- `fn check_prefix(&self, provider: &str, model: &str, tools: &[ToolSchema]) -> Result<(), Refusal>`
++- `fn save(&self, model: &str, thinking: &str, messages: &[Message], cwd: &Path, prefix: &PrefixRecord) -> Result<(), String>`
++
++**`src/session_store.rs`**
++- `PersistedSession.prefix: Option<PrefixRecord>`, with `#[serde(default, skip_serializing_if = "Option::is_none")]`. `SESSION_PERSIST_VERSION` stays 1.
++- `SessionStore::save_oneshot_generation_result (new)`: the writer, the generation, the model, the thinking level, the messages, the working directory, and the prefix record. It returns `std::io::Result<SessionWriteOutcome>`.
++
++**`src/state_root.rs`, `src/paths.rs`**
++- `SessionStoreKind::OneShot`, directory name `oneshot`.
++- `paths::oneshot_sessions_dir() (new) -> Option<PathBuf>`: `~/.daimonos/oneshot-sessions`.
++
++**`src/agent.rs`**
++- `AgentConfig.mark_history_stable: bool (proposed)`, default `false`. When it is true, each request sets `stable_prefix_len` to the message count.
++
++**`src/agent_cmd.rs`**
++- `AgentCmdArgs` gets `provider: String`, `session: Option<SessionRequest>`, `sessions_dir: Option<PathBuf>`, `private_state: bool`, and `output: AgentOutputFormat`.
++- `struct RunReport (new)`, derives `Serialize`. Its fields are the table of ADR-036 Decision 13.
++- `run_agent` keeps its signature. With a session it returns `Err` after it writes the document, when the save failed.
++
++**`src/agent_runtime.rs::run_agent`**
++- It resolves the store directory. For a resume, it compares an explicit `--model` or `--provider` with the record before it builds the provider.
++
++**`src/main.rs`**
++- An `oneshot_session::Refusal` from the agent command exits through `exit_for_state_failure`. No other error path changes.
++
++**`src/analytics.rs`**
++- `AgentRunRecord.oneshot_session_id: Option<String>`. One `ALTER TABLE agent_runs ADD COLUMN oneshot_session_id TEXT` in `migrate_schema`.
++
++**Names in the implementation (2026-11-21).** The built names differ from the proposals above in these places. The behavior is the same.
++- `AgentArgs.oneshot_session_id` holds `--session-id`.
++- `agent_cmd::RunOptions (new)` holds `provider`, `output`, `session: Option<OpenSession>`, and `prompt_cache`. `AgentCmdArgs` did not change. `agent_cmd::run_agent_with (new)` takes the options. `run_agent` keeps its signature and calls it with the defaults.
++- `agent_runtime::open_oneshot_session (new)` resolves the store directory and claims the session.
++- `oneshot_session::open` takes the request by value. `OpenSession::check_overrides` and `OpenSession::check_tools` replace `check_prefix`.
++- `AgentConfig.stable_prefix` replaces `mark_history_stable`.
++
++## Error and edge behavior
++
++| Case | Result |
++|---|---|
++| Id is empty, has a character outside `[A-Za-z0-9_-]`, or has more than 128 characters | Exit 2, `session_id_invalid`. No store access. |
++| `--session-id` and the id exists | Exit 2, `session_exists`. The record does not change. |
++| `--resume` and the id does not exist | Exit 2, `session_not_found`. |
++| Another live process owns the id | Exit 2, `session_owned_elsewhere`, with the owner PID when it is known. |
++| The generation changed between load and claim | Exit 2, `session_changed`. |
++| The record has no prefix record, or a version that this build cannot read | Exit 2, `session_not_resumable`. |
++| `--resume` with a `--model` that differs from the record | Exit 2, `session_model_mismatch`. The message names both models. |
++| `--resume` with a `--provider` that differs from the record | Exit 2, `session_provider_mismatch`. |
++| The tool list differs in count, order, name, or digest | Exit 2, `session_tools_changed`. The message names the first tool that differs. |
++| The store directory is not usable | Exit 2, `state_unusable`. |
++| Provider error, refusal, or `max_tokens` in a session run | The session is saved. The document is printed. The exit code follows `check_agent_result`. |
++| Context overflow | `stop_reason: "error"`, `context_overflow: true`. No compaction and no retry. The session is saved. Exit 1. |
++| The save fails or does not return `Saved` | The document has `session_saved: false` and `session_error`. Exit 1. Without `--output json`, stderr names the failure. |
++| The thought log fails | As today: an error after analytics. With `--output json` the document is printed first. |
++| `--output json` and the run fails before the loop | No document. A message on stderr. Non-zero exit. |
++| A tool child process writes to stdout | The bytes do not reach the stdout of `daimonos`. A test proves it. |
++| The process is killed during a run | No save. The owner lock is released by the OS. A new `--session-id` run with that id can start, because no record exists. |
++| A resume after a failed run whose history ends with a user message | The new input is added as one more user message. See Risks. |
++
++Every refusal prints the `run_configuration_invalid` JSON on stderr with the reason code, and prints nothing on stdout.
++
++## Slices
++
++Each slice is one red-green sequence of tests and ends with `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
++
++1. **JSON result.** `--output json` for success, provider error, and context overflow. `session_id` and `session_saved` are null. Check: the stdout byte tests and the comparison with the `agent_runs` row.
++2. **Start a session.** `--session-id`, the store directory, the prefix record, the save, `session_exists`, `session_id_invalid`, the failed-save exit code, the analytics column. Check: a record exists after the run, and a second run with the same id is refused with the record unchanged.
++3. **Resume a session.** `--resume`, the prefix check, the mismatch refusals, the owner-lock refusal, and the output of only the new assistant text. Check: the mock-provider test of the request prefix.
++4. **Stable-prefix mark.** `mark_history_stable` in session runs. Check: the Anthropic request-builder test, and a test that a run without a session keeps the value 0.
++5. **Process tests and documents.** A pytest file `tests/test_agent_oneshot_sessions.py (new)` runs the binary against a local fake OpenRouter endpoint: start, resume, concurrent resume, selected state root, and JSON stdout. Then the documents of "In scope" item 5.
++
++## Rollout
++
++- No flag. The three options are opt-in.
++- The `agent_runs` column is added by the existing idempotent migration. An older binary ignores the column.
++- The session record field is optional. An older binary reads a record that has it, because `PersistedSession` does not deny unknown fields.
++- Rollback: revert the change. The directory `oneshot-sessions` and the column stay and have no effect.
++- Last step: one real run with the configured provider gives the example JSON document for the report. It costs a small amount of provider usage.
++
++## Risks
++
++| Risk | Response |
++|---|---|
++| The dbunk branches change `src/agent_cmd.rs`, `src/cli.rs`, and `src/agent_runtime.rs` (PR #282). A later merge conflicts. | Keep the change in the new module where possible. The call sites in the shared files stay small. |
++| Two user messages in sequence after a failed run. It is not verified that each provider accepts this. | Slice 3 adds a test of the request for this case with the Anthropic and OpenRouter request builders. If an adapter rejects it, stop and ask for a decision. |
++| A cache read does not occur in practice (lifetime, pruning, notices). | The plan does not promise a cache read. The real run of the last step reports `cache_read_tokens` of a resume. |
++| A code path writes to stdout in JSON mode. | The process test compares the complete stdout with one parsed document. |
++| The store grows without limit. | Named in the documents. Retention is out of scope. |
++
++## Review checklist
++
++- [ ] Each acceptance check of the request document maps to a test of slices 1 to 5.
++- [ ] Each Confirmation item of ADR-036 has a test.
++- [ ] Each row of "Error and edge behavior" has a test, or the row says why not.
++- [ ] `cargo test` and `python3 -m pytest tests/ -v` pass.
++- [ ] Existing one-shot tests are unchanged.
+diff --git a/docs/runtime-modes.md b/docs/runtime-modes.md
+index 08ecc9b..3b78139 100644
+--- a/docs/runtime-modes.md
++++ b/docs/runtime-modes.md
+@@ -35,6 +35,103 @@ describe the selected runtime unambiguously.
+ explicitly forces one-shot output when flags are composed; without
+ `--interactive`, one-shot mode remains the default.
+ 
++## One-shot sessions and the JSON result
++
++Three opt-in options change a one-shot `agent` run (ADR-036). A run without
++them behaves as before.
++
++```bash
++daimonos agent --session-id run-42 --output json "Change greet() to return 'hi'."
++daimonos agent --resume run-42 --output json "The tests failed: <output>"
++```
++
++| Option | Effect |
++|---|---|
++| `--session-id <ID>` | Start a named session and save it when the run ends. An existing id is refused. |
++| `--resume <ID>` | Continue the session. The task is the new input. |
++| `--output json` | Print one JSON result document on stdout. |
++
++The three options conflict with `--interactive` and `--dry-run`. `--session-id`
++and `--resume` conflict with each other. The top-level `--session-id` (before
++`agent`) is a different option: it filters `--stats`.
++
++**Sessions**
++
++- An id has 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `-`, and `_`.
++- The store is `~/.daimonos/oneshot-sessions`, or `sessions/oneshot` under
++  `--state-dir`. `chat --list` and `chat --resume` do not see these sessions.
++- A resume uses the saved system prompt, model, and thinking level. It sends the
++  saved messages and the new input. The system prompt is not rebuilt, so a
++  change of the workspace instructions or skills does not reach a resumed
++  session.
++- A resume is refused when `--model` differs from the saved model, when the
++  selected provider differs from the saved provider, or when the tool list
++  differs in order, name, description, or input schema. Start a new session to
++  change one of them.
++- One process owns a session at a time. A second run on the same id is refused
++  while the first run is alive.
++- The run saves the session for each stop reason, also after a provider error.
++  A failed first run therefore consumes its id: continue it with `--resume`.
++  An empty assistant message from a failed call is not saved.
++- A session run has no compaction. A context overflow ends the run with
++  `context_overflow: true`. Start a new session then.
++- A resumed run without `--output json` prints only the assistant text of that
++  invocation.
++- With `DAIMONOS_AGENT_PROMPT_CACHE=on`, a session run marks the whole message
++  list as the stable prefix, so the provider adapter can set its cache
++  breakpoint at the end of the conversation. With the default `off`, a session
++  run sends no cache marker.
++- Each run writes one `agent_runs` row. The column `oneshot_session_id` holds
++  the session id, or NULL.
++
++**Exit codes**
++
++| Case | Exit code | Output |
++|---|---|---|
++| The run ended with `end_turn` | 0 | The document, or the assistant text |
++| The run ended with another stop reason | 1 | The document, when `--output json` is set |
++| The session was not saved | 1 | The document with `session_saved: false`, and a message on stderr |
++| The run was refused before it started | 2 | Nothing on stdout. One JSON line on stderr. |
++
++A refusal has this form on stderr:
++
++```json
++{"error":{"code":"run_configuration_invalid","reason":"session_exists","message":"..."}}
++```
++
++The reasons are `session_id_invalid`, `session_exists`, `session_not_found`,
++`session_owned_elsewhere`, `session_changed`, `session_not_resumable`,
++`session_model_mismatch`, `session_provider_mismatch`, `session_tools_changed`,
++and `state_unusable`.
++
++**JSON result document**
++
++`--output json` prints exactly one JSON document and one newline on stdout for
++each run whose agent loop returned a result. This includes a provider error and
++a context overflow, so a caller can record the tokens of a failed run. A run
++that fails before the loop starts prints no document.
++
++| Field | Type | Content |
++|---|---|---|
++| `schema_version` | integer | `1`. It changes when a field is removed or changes its meaning. |
++| `session_id` | string or null | The id of `--session-id` or `--resume` |
++| `resumed` | boolean | True for `--resume` |
++| `session_saved` | boolean or null | Null without a session option |
++| `session_error` | string or null | The reason of a failed save |
++| `provider`, `model` | string | The provider and the model of the run |
++| `stop_reason` | string | `end_turn`, `tool_use`, `max_tokens`, `refusal`, `error`, or `aborted` |
++| `error_message` | string or null | The provider error |
++| `context_overflow` | boolean | True when the request did not fit the context window |
++| `final_text` | string | The text of the last assistant message of this invocation |
++| `turns` | integer | The messages that this invocation added after its input |
++| `usage` | object | `input_tokens`, `output_tokens`, `reasoning_output_tokens` (or null), `thinking_bytes`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd` |
++| `evidence` | object | `status`: `unknown`, `no_mutations`, `verified`, or `unverified` |
++| `duration_ms` | integer | Wall time of the invocation |
++
++`usage`, `stop_reason`, and `turns` cover this invocation only, and they have
++the same values as the `agent_runs` row of the run. `input_tokens` does not
++include the cached tokens.
++
+ Interactive controls include Up/Down prompt history, PageUp/PageDown transcript
+ scrolling, Home/End jumps, and `/help`. Pass `--no-color` for monochrome
+ rendering. History and scrollback limits are configured under `[tui]`.
+diff --git a/src/acp_cmd.rs b/src/acp_cmd.rs
+index ce3dd11..748690d 100644
+--- a/src/acp_cmd.rs
++++ b/src/acp_cmd.rs
+@@ -1707,6 +1707,8 @@ fn build_agent_config(
+             failover_models,
+             ..crate::agent::ProviderRetryConfig::default()
+         },
++        // ACP sessions do not mark a stable message prefix (ADR-036 is one-shot only).
++        stable_prefix: false,
+         before_tool_call: Some(build_before_tool_call_hook(
+             Arc::clone(&connection),
+             session_id.clone(),
+diff --git a/src/agent.rs b/src/agent.rs
+index 3265913..fdc2bc4 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -240,6 +240,10 @@ pub struct AgentConfig {
+     pub on_provider_notice: Option<ProviderNoticeHook>,
+     /// Bounded retry for *transient* provider failures (vikunja #1240).
+     pub provider_retry: ProviderRetryConfig,
++    /// Mark the whole message list as the stable prefix on each request, so
++    /// the provider adapter can place its cache breakpoint at the end of the
++    /// conversation (ADR-036 Decision 7). `false` sends `stable_prefix_len: 0`.
++    pub stable_prefix: bool,
+ }
+ 
+ /// How hard to retry a provider failure the adapter classified as transient
+@@ -1020,10 +1024,14 @@ async fn run_inner(
+             }
+         };
+         let ctx = Context {
++            stable_prefix_len: if config.stable_prefix {
++                messages.len()
++            } else {
++                0
++            },
+             messages: messages.clone(),
+             system,
+             tools: config.tools.clone(),
+-            stable_prefix_len: 0,
+         };
+         // On a continuation after a `max_tokens` stop, reissue with thinking
+         // forced off so reasoning cannot re-consume the output budget and stall
+diff --git a/src/agent_cmd.rs b/src/agent_cmd.rs
+index dd6d188..254a9ca 100644
+--- a/src/agent_cmd.rs
++++ b/src/agent_cmd.rs
+@@ -37,6 +37,123 @@ pub struct AgentCmdArgs {
+     pub thinking: crate::providers::ThinkingLevel,
+ }
+ 
++/// Opt-in one-shot behavior (ADR-036). The default is the behavior of a run
++/// without the new options.
++#[derive(Default)]
++pub struct RunOptions {
++    /// Provider name. Used only in the JSON result document.
++    pub provider: String,
++    pub output: crate::cli::AgentOutputFormat,
++    /// A claimed named session (`--session-id` or `--resume`).
++    pub session: Option<crate::oneshot_session::OpenSession>,
++    /// The provider was built with prompt caching on
++    /// (`DAIMONOS_AGENT_PROMPT_CACHE`).
++    pub prompt_cache: bool,
++}
++
++/// The `--output json` result document of one invocation (ADR-036,
++/// Decision 13). Field order is the output order. `schema_version` changes
++/// when a field is removed or changes its meaning.
++#[derive(Debug, serde::Serialize)]
++pub struct RunReport {
++    pub schema_version: u32,
++    pub session_id: Option<String>,
++    pub resumed: bool,
++    pub session_saved: Option<bool>,
++    pub session_error: Option<String>,
++    pub provider: String,
++    pub model: String,
++    pub stop_reason: String,
++    pub error_message: Option<String>,
++    pub context_overflow: bool,
++    pub final_text: String,
++    pub turns: u32,
++    pub usage: ReportUsage,
++    pub evidence: ReportEvidence,
++    pub duration_ms: u64,
++}
++
++/// Token usage of this invocation only, with the `agent_runs` column names.
++#[derive(Debug, serde::Serialize)]
++pub struct ReportUsage {
++    pub input_tokens: u64,
++    pub output_tokens: u64,
++    pub reasoning_output_tokens: Option<u64>,
++    pub thinking_bytes: u64,
++    pub cache_read_tokens: u64,
++    pub cache_write_tokens: u64,
++    pub cost_usd: f64,
++}
++
++#[derive(Debug, serde::Serialize)]
++pub struct ReportEvidence {
++    pub status: &'static str,
++}
++
++impl RunReport {
++    fn new(
++        options: &RunOptions,
++        model: &str,
++        result: &AgentResult,
++        session_save: Option<&std::result::Result<(), String>>,
++        initial_len: usize,
++        turns: u32,
++        elapsed: std::time::Duration,
++    ) -> Self {
++        // The text blocks of the last assistant message that this invocation
++        // added. Earlier messages of a resumed session are not included.
++        let final_text = result
++            .messages
++            .iter()
++            .skip(initial_len)
++            .rev()
++            .find(|message| matches!(message.role, Role::Assistant))
++            .map(|message| {
++                message
++                    .content
++                    .iter()
++                    .filter_map(|block| match block {
++                        ContentBlock::Text(text) => Some(text.as_str()),
++                        _ => None,
++                    })
++                    .collect::<Vec<_>>()
++                    .join("\n")
++            })
++            .unwrap_or_default();
++        let status = match result.evidence.status() {
++            crate::evidence::EvidenceStatus::Unknown => "unknown",
++            crate::evidence::EvidenceStatus::NoMutations => "no_mutations",
++            crate::evidence::EvidenceStatus::Verified => "verified",
++            crate::evidence::EvidenceStatus::Unverified => "unverified",
++        };
++        RunReport {
++            schema_version: 1,
++            session_id: options.session.as_ref().map(|s| s.id().to_string()),
++            resumed: options.session.as_ref().is_some_and(|s| s.is_resume()),
++            session_saved: session_save.map(|save| save.is_ok()),
++            session_error: session_save.and_then(|save| save.as_ref().err().cloned()),
++            provider: options.provider.clone(),
++            model: model.to_string(),
++            stop_reason: result.stop_reason.as_str().to_string(),
++            error_message: result.error_message.clone(),
++            context_overflow: result.context_overflow,
++            final_text,
++            turns,
++            usage: ReportUsage {
++                input_tokens: result.usage.input,
++                output_tokens: result.usage.output,
++                reasoning_output_tokens: result.usage.reasoning_output,
++                thinking_bytes: result.usage.thinking_bytes,
++                cache_read_tokens: result.usage.cache_read,
++                cache_write_tokens: result.usage.cache_write,
++                cost_usd: result.usage.cost.total_usd,
++            },
++            evidence: ReportEvidence { status },
++            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
++        }
++    }
++}
++
+ enum ThoughtCaptureState {
+     Active(File),
+     Failed(String),
+@@ -124,6 +241,21 @@ pub async fn run_agent(
+     args: AgentCmdArgs,
+     out: &mut dyn Write,
+ ) -> Result<AgentResult> {
++    run_agent_with(provider, workspace, cfg, args, RunOptions::default(), out).await
++}
++
++/// [`run_agent`] with the opt-in one-shot options of ADR-036.
++///
++/// Context: docs/contexts/session-durability/CONTEXT.md, ADR-036.
++pub async fn run_agent_with(
++    provider: &dyn LlmProvider,
++    workspace: &Path,
++    cfg: Arc<Config>,
++    args: AgentCmdArgs,
++    options: RunOptions,
++    out: &mut dyn Write,
++) -> Result<AgentResult> {
++    let started = std::time::Instant::now();
+     let schemas = tool_facade::active_schemas_for_policy(
+         workspace,
+         &cfg.prompts.resolved_tool_descriptions,
+@@ -161,7 +293,27 @@ pub async fn run_agent(
+         tools.extend(mcp.tools());
+     }
+ 
+-    let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
++    // ADR-036 Decision 5: a resumed session keeps its request prefix. It runs
++    // on the saved model and thinking level with the saved system prompt, and
++    // a different tool list is refused before any provider call.
++    if let Some(session) = &options.session {
++        session.check_tools(&tools)?;
++    }
++    let saved = options.session.as_ref().and_then(|session| session.saved());
++    let model = match saved {
++        Some(saved) => saved.model.clone(),
++        None => args.model.unwrap_or_else(|| "claude-opus-4-8".to_string()),
++    };
++    let thinking = match saved {
++        Some(saved) => saved.thinking.clone(),
++        None => args.thinking,
++    };
++    // The saved text, not a rebuilt one: the agent usually changed the
++    // workspace, and a rebuilt prompt can differ and miss the prompt cache.
++    let system = match saved {
++        Some(saved) => saved.prefix.system.clone(),
++        None => crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await,
++    };
+     let before_tool_call = args.safety.map(|p| p.into_before_hook());
+     let thought_capture = match args.thought_log {
+         Some(path) => Some(Arc::new(ThoughtCapture::open(path.clone()).map_err(
+@@ -178,11 +330,11 @@ pub async fn run_agent(
+         }) as crate::agent::StreamHook
+     });
+     let config = AgentConfig {
+-        system: Some(crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await),
++        system: Some(system),
+         tools,
+         opts: CompleteOpts {
+             model,
+-            thinking: args.thinking,
++            thinking,
+             ..CompleteOpts::default()
+         },
+         before_tool_call,
+@@ -192,6 +344,10 @@ pub async fn run_agent(
+             label: "agent".to_string(),
+         }),
+         remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
++        // ADR-036 Decision 7. Only with prompt caching on: the Anthropic
++        // adapter sets a cache marker for any non-zero prefix length, and the
++        // mark must have no effect while prompt caching is off.
++        stable_prefix: options.session.is_some() && options.prompt_cache,
+         ..AgentConfig::default()
+     };
+ 
+@@ -215,7 +371,12 @@ pub async fn run_agent(
+     let mut tool_session = Session::new(workspace.to_path_buf(), cfg);
+     crate::provisioning::provision_session(&mut tool_session, &services);
+     let session = std::sync::Arc::new(tokio::sync::Mutex::new(tool_session));
+-    let initial = vec![Message::user(task)];
++    // A resume continues the saved messages with the new input (Decision 6).
++    let mut initial = saved
++        .map(|saved| saved.messages.clone())
++        .unwrap_or_default();
++    initial.push(Message::user(task));
++    let initial_len = initial.len();
+     let external_session_id = crate::analytics::read_agent_session_id_env();
+     let prompt_span = PromptSpan::new(PromptMetadata {
+         mode: "agent",
+@@ -243,11 +404,54 @@ pub async fn run_agent(
+     };
+     prompt_span.finish(result.stop_reason.as_str(), error_type);
+ 
++    // ADR-036 Decision 8: a named session is saved after the loop returns, for
++    // each stop reason, so a failed attempt can be continued. The caller
++    // depends on the save, so a failure is reported and fails the run.
++    let session_save: Option<std::result::Result<(), String>> =
++        options.session.as_ref().map(|session| {
++            // A resume keeps the prefix record that it loaded and checked.
++            let prefix = match session.saved() {
++                Some(saved) => saved.prefix.clone(),
++                None => crate::oneshot_session::PrefixRecord {
++                    provider: options.provider.clone(),
++                    system: config.system.clone().unwrap_or_default(),
++                    tools: crate::oneshot_session::tool_digests(&config.tools),
++                },
++            };
++            // A failed provider call ends the history with an empty assistant
++            // message. Providers reject empty assistant content, so it is not
++            // saved: the next resume continues after the last real message.
++            let mut history = result.messages.as_slice();
++            while let [earlier @ .., last] = history {
++                if last.role == Role::Assistant && last.content.is_empty() {
++                    history = earlier;
++                } else {
++                    break;
++                }
++            }
++            session.save(
++                &config.opts.model,
++                config.opts.thinking.as_str(),
++                history,
++                workspace,
++                &prefix,
++            )
++        });
++    let session_failure = match (&options.session, &session_save) {
++        (Some(session), Some(Err(error))) => {
++            Some(format!("session {} was not saved: {error}", session.id()))
++        }
++        _ => None,
++    };
++    // Messages that this invocation added after its own input. Without a
++    // session, the input is one message, so this is the value of before.
++    let turns = result.messages.len().saturating_sub(initial_len) as u32;
++
+     if let Some(store) = args.analytics {
+         let task_prefix: String = args.task.chars().take(200).collect();
+-        let turns = result.messages.len().saturating_sub(1) as u32;
+         store.record_agent_run(&AgentRunRecord {
+             external_session_id,
++            oneshot_session_id: options.session.as_ref().map(|s| s.id().to_string()),
+             task_prefix,
+             input_tokens: result.usage.input,
+             output_tokens: result.usage.output,
+@@ -261,11 +465,39 @@ pub async fn run_agent(
+         });
+     }
+ 
++    if options.output == crate::cli::AgentOutputFormat::Json {
++        // The document is the only stdout write of the run (ADR-036). It is
++        // written for each stop reason, before a debug-artifact failure.
++        let report = RunReport::new(
++            &options,
++            &config.opts.model,
++            &result,
++            session_save.as_ref(),
++            initial_len,
++            turns,
++            started.elapsed(),
++        );
++        serde_json::to_writer(&mut *out, &report)?;
++        writeln!(out)?;
++        thought_capture_result?;
++        if let Some(failure) = session_failure {
++            anyhow::bail!(failure);
++        }
++        return Ok(result);
++    }
++
+     // A local debug-artifact failure must be reported, but only after the
+     // completed provider run has closed its span and reached analytics.
+     thought_capture_result?;
+ 
+-    for msg in &result.messages {
++    // Decision 15: a resumed run prints only the assistant text that this
++    // invocation added. Every other run prints as before.
++    let already_printed = if options.session.as_ref().is_some_and(|s| s.is_resume()) {
++        initial_len
++    } else {
++        0
++    };
++    for msg in result.messages.iter().skip(already_printed) {
+         if matches!(msg.role, Role::Assistant) {
+             for block in &msg.content {
+                 if let ContentBlock::Text(t) = block {
+@@ -275,6 +507,9 @@ pub async fn run_agent(
+         }
+     }
+ 
++    if let Some(failure) = session_failure {
++        anyhow::bail!(failure);
++    }
+     Ok(result)
+ }
+ 
+@@ -946,4 +1181,853 @@ mod tests {
+             "exec should resolve cfg_probe_958 via cfg.process.extra_path: {tool_result_text}"
+         );
+     }
++
++    // --- ADR-036: --output json ---
++
++    /// The default configuration without outbound MCP servers. The default
++    /// reads the MCP servers of the host user's editor settings, so the tool
++    /// list would depend on the host and on which servers connect.
++    fn hermetic_cfg() -> Arc<Config> {
++        let mut cfg = Config::default();
++        cfg.agent.mcp.enabled = false;
++        Arc::new(cfg)
++    }
++
++    fn json_options() -> RunOptions {
++        RunOptions {
++            provider: "mock".to_string(),
++            output: crate::cli::AgentOutputFormat::Json,
++            session: None,
++            prompt_cache: false,
++        }
++    }
++
++    /// Parse stdout that must be exactly one JSON document and one newline.
++    fn single_json_document(out: &[u8]) -> serde_json::Value {
++        let text = std::str::from_utf8(out).unwrap();
++        assert!(text.ends_with('\n'), "stdout must end with one newline");
++        let body = &text[..text.len() - 1];
++        assert!(!body.contains('\n'), "stdout must hold one line: {text:?}");
++        serde_json::from_str(body).expect("stdout must be one JSON document")
++    }
++
++    #[tokio::test]
++    async fn output_json_prints_one_document_for_a_successful_run() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut response = end_turn_with_text("all good");
++        response.usage = Usage {
++            input: 11,
++            output: 7,
++            reasoning_output: Some(3),
++            // The loop replaces this value with the bytes that the provider
++            // streamed as thinking. This mock streams none.
++            thinking_bytes: 5,
++            cache_read: 13,
++            cache_write: 17,
++            cost: crate::providers::Cost {
++                total_usd: 0.25,
++                ..Default::default()
++            },
++        };
++        let provider = MockProvider::new(vec![response]);
++        let mut a = args("go");
++        a.model = Some("mock-model".to_string());
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            dir.path(),
++            hermetic_cfg(),
++            a,
++            json_options(),
++            &mut out,
++        )
++        .await
++        .unwrap();
++
++        let doc = single_json_document(&out);
++        assert_eq!(doc["schema_version"], 1);
++        assert_eq!(doc["session_id"], serde_json::Value::Null);
++        assert_eq!(doc["resumed"], false);
++        assert_eq!(doc["session_saved"], serde_json::Value::Null);
++        assert_eq!(doc["session_error"], serde_json::Value::Null);
++        assert_eq!(doc["provider"], "mock");
++        assert_eq!(doc["model"], "mock-model");
++        assert_eq!(doc["stop_reason"], "end_turn");
++        assert_eq!(doc["error_message"], serde_json::Value::Null);
++        assert_eq!(doc["context_overflow"], false);
++        assert_eq!(doc["final_text"], "all good");
++        assert_eq!(doc["turns"], 1);
++        assert_eq!(
++            doc["usage"],
++            serde_json::json!({
++                "input_tokens": 11,
++                "output_tokens": 7,
++                "reasoning_output_tokens": 3,
++                "thinking_bytes": 0,
++                "cache_read_tokens": 13,
++                "cache_write_tokens": 17,
++                "cost_usd": 0.25,
++            })
++        );
++        assert!(doc["evidence"]["status"].is_string());
++        assert!(doc["duration_ms"].is_u64());
++    }
++
++    #[tokio::test]
++    async fn output_json_reports_a_provider_error() {
++        let dir = tempfile::tempdir().unwrap();
++        let provider = MockProvider::new(vec![LlmResponse::error("api down")]);
++        let mut out = Vec::new();
++        let result = run_agent_with(
++            &provider,
++            dir.path(),
++            hermetic_cfg(),
++            args("go"),
++            json_options(),
++            &mut out,
++        )
++        .await
++        .unwrap();
++        // The exit code stays with `check_agent_result`: the result is `Error`.
++        assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
++
++        let doc = single_json_document(&out);
++        assert_eq!(doc["stop_reason"], "error");
++        assert_eq!(doc["error_message"], "api down");
++        assert_eq!(doc["context_overflow"], false);
++        assert_eq!(doc["final_text"], "");
++    }
++
++    #[tokio::test]
++    async fn output_json_reports_a_context_overflow() {
++        let dir = tempfile::tempdir().unwrap();
++        let provider = MockProvider::new(vec![LlmResponse::context_overflow_error(
++            "prompt is too long",
++        )]);
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            dir.path(),
++            hermetic_cfg(),
++            args("go"),
++            json_options(),
++            &mut out,
++        )
++        .await
++        .unwrap();
++
++        let doc = single_json_document(&out);
++        assert_eq!(doc["stop_reason"], "error");
++        assert_eq!(doc["context_overflow"], true);
++        assert_eq!(doc["error_message"], "prompt is too long");
++    }
++
++    #[tokio::test]
++    async fn output_json_usage_matches_the_agent_runs_row() {
++        let dir = tempfile::tempdir().unwrap();
++        let db_path = dir.path().join("analytics.db");
++        let store = Arc::new(AnalyticsStore::new(&db_path, 90).unwrap());
++        let mut response = end_turn_with_text("done");
++        response.usage = Usage {
++            input: 101,
++            output: 23,
++            reasoning_output: Some(4),
++            thinking_bytes: 0,
++            cache_read: 3000,
++            cache_write: 200,
++            cost: crate::providers::Cost {
++                total_usd: 0.5,
++                ..Default::default()
++            },
++        };
++        let provider = MockProvider::new(vec![response]);
++        let mut a = args("go");
++        a.analytics = Some(Arc::clone(&store));
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            dir.path(),
++            hermetic_cfg(),
++            a,
++            json_options(),
++            &mut out,
++        )
++        .await
++        .unwrap();
++        let doc = single_json_document(&out);
++
++        // Read the row through a second connection, not through the store.
++        let db = rusqlite::Connection::open(&db_path).unwrap();
++        let row: (i64, i64, Option<i64>, i64, i64, i64, f64, String, i64) = db
++            .query_row(
++                "SELECT input_tokens, output_tokens, reasoning_output_tokens,
++                        thinking_bytes, cache_read_tokens, cache_write_tokens,
++                        cost_usd, stop_reason, turns
++                 FROM agent_runs",
++                [],
++                |r| {
++                    Ok((
++                        r.get(0)?,
++                        r.get(1)?,
++                        r.get(2)?,
++                        r.get(3)?,
++                        r.get(4)?,
++                        r.get(5)?,
++                        r.get(6)?,
++                        r.get(7)?,
++                        r.get(8)?,
++                    ))
++                },
++            )
++            .unwrap();
++        assert_eq!(
++            row,
++            (101, 23, Some(4), 0, 3000, 200, 0.5, "end_turn".into(), 1)
++        );
++        assert_eq!(
++            doc["usage"],
++            serde_json::json!({
++                "input_tokens": row.0,
++                "output_tokens": row.1,
++                "reasoning_output_tokens": row.2,
++                "thinking_bytes": row.3,
++                "cache_read_tokens": row.4,
++                "cache_write_tokens": row.5,
++                "cost_usd": row.6,
++            })
++        );
++        assert_eq!(doc["stop_reason"], row.7.as_str());
++        assert_eq!(doc["turns"], row.8);
++    }
++
++    #[tokio::test]
++    async fn output_json_final_text_is_the_last_assistant_message_only() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::write(dir.path().join("note.txt"), "hello\n").unwrap();
++        let provider = MockProvider::new(vec![
++            LlmResponse {
++                retryable: false,
++                content: vec![
++                    ContentBlock::Text("reading the note".to_string()),
++                    ContentBlock::ToolCall {
++                        id: "call-1".to_string(),
++                        name: "read_file".to_string(),
++                        input: serde_json::json!({"path": "note.txt"}),
++                    },
++                ],
++                stop_reason: crate::providers::StopReason::ToolUse,
++                error_message: None,
++                context_overflow: false,
++                usage: Usage::default(),
++            },
++            end_turn_with_text("the note says hello"),
++        ]);
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            dir.path(),
++            hermetic_cfg(),
++            args("go"),
++            json_options(),
++            &mut out,
++        )
++        .await
++        .unwrap();
++
++        let doc = single_json_document(&out);
++        assert_eq!(doc["final_text"], "the note says hello");
++        // assistant (tool call), tool result, assistant (final).
++        assert_eq!(doc["turns"], 3);
++    }
++
++    // --- ADR-036: --session-id ---
++
++    use crate::oneshot_session::{self, SessionRequest};
++    use crate::session_store::SessionStore;
++
++    fn oneshot_store(dir: &Path) -> SessionStore {
++        SessionStore::new(dir.to_path_buf())
++    }
++
++    fn session_options(
++        state: &Path,
++        request: SessionRequest,
++        output: crate::cli::AgentOutputFormat,
++    ) -> RunOptions {
++        RunOptions {
++            provider: "mock".to_string(),
++            output,
++            session: Some(oneshot_session::open_when_free(state, request).unwrap()),
++            prompt_cache: false,
++        }
++    }
++
++    fn start(id: &str) -> SessionRequest {
++        SessionRequest::Start(id.to_string())
++    }
++
++    #[tokio::test]
++    async fn session_run_saves_the_conversation_and_the_prefix() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let provider = MockProvider::new(vec![end_turn_with_text("done")]);
++        let mut a = args("first task");
++        a.model = Some("mock-model".to_string());
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            a,
++            session_options(state.path(), start("s1"), Default::default()),
++            &mut out,
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(out, b"done\n");
++        let record = oneshot_store(state.path()).load_result("s1").unwrap();
++        assert_eq!(record.model, "mock-model");
++        assert_eq!(record.thinking.as_deref(), Some("medium"));
++        assert_eq!(record.cwd.as_deref(), Some(workspace.path()));
++        assert_eq!(record.messages.len(), 2);
++        let prefix = record
++            .prefix
++            .expect("a one-shot record has a prefix record");
++        assert_eq!(prefix.provider, "mock");
++        assert!(!prefix.system.is_empty());
++        assert!(prefix.tools.iter().any(|tool| tool.name == "read_file"));
++    }
++
++    #[tokio::test]
++    async fn session_run_saves_after_a_provider_error() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let provider = MockProvider::new(vec![LlmResponse::error("api down")]);
++        let mut out = Vec::new();
++        let result = run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("first task"),
++            session_options(state.path(), start("s1"), Default::default()),
++            &mut out,
++        )
++        .await
++        .unwrap();
++        assert_eq!(result.stop_reason, crate::providers::StopReason::Error);
++        let record = oneshot_store(state.path()).load_result("s1").unwrap();
++        assert!(record.prefix.is_some());
++        // The loop ends a failed call with an empty assistant message.
++        // Providers reject empty assistant content, so a resume must not
++        // send it: the saved history ends with the user message.
++        assert!(result.messages.last().unwrap().content.is_empty());
++        assert_eq!(record.messages.len(), 1);
++        assert_eq!(
++            message_json(&record.messages[0]),
++            message_json(&Message::user("first task"))
++        );
++    }
++
++    /// A provider that removes the session store during the model call, so
++    /// the save after the loop cannot find its writer.
++    struct StoreRemovingProvider {
++        store: std::path::PathBuf,
++    }
++
++    #[async_trait]
++    impl LlmProvider for StoreRemovingProvider {
++        async fn complete(&self, _: &Context, _: &CompleteOpts) -> LlmResponse {
++            std::fs::remove_dir_all(&self.store).unwrap();
++            end_turn_with_text("done")
++        }
++    }
++
++    #[tokio::test]
++    async fn a_failed_session_save_is_an_error_after_the_json_document() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let store_dir = state.path().join("store");
++        let provider = StoreRemovingProvider {
++            store: store_dir.clone(),
++        };
++        let mut out = Vec::new();
++        let run = run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("first task"),
++            session_options(&store_dir, start("s1"), crate::cli::AgentOutputFormat::Json),
++            &mut out,
++        )
++        .await;
++        let Err(error) = run else {
++            panic!("a failed save must fail the run");
++        };
++        assert!(
++            error.to_string().contains("session s1 was not saved"),
++            "{error}"
++        );
++
++        let doc = single_json_document(&out);
++        assert_eq!(doc["session_id"], "s1");
++        assert_eq!(doc["resumed"], false);
++        assert_eq!(doc["session_saved"], false);
++        assert!(doc["session_error"].is_string());
++        assert_eq!(doc["stop_reason"], "end_turn");
++    }
++
++    #[tokio::test]
++    async fn session_run_reports_the_session_in_json_and_in_analytics() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let db_path = state.path().join("analytics.db");
++        let analytics = Arc::new(AnalyticsStore::new(&db_path, 90).unwrap());
++        let provider = MockProvider::new(vec![
++            end_turn_with_text("with session"),
++            end_turn_with_text("without session"),
++        ]);
++        let mut a = args("first task");
++        a.analytics = Some(Arc::clone(&analytics));
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            a,
++            session_options(
++                &state.path().join("store"),
++                start("s1"),
++                crate::cli::AgentOutputFormat::Json,
++            ),
++            &mut out,
++        )
++        .await
++        .unwrap();
++        let doc = single_json_document(&out);
++        assert_eq!(doc["session_id"], "s1");
++        assert_eq!(doc["session_saved"], true);
++        assert_eq!(doc["session_error"], serde_json::Value::Null);
++
++        let mut b = args("second task");
++        b.analytics = Some(Arc::clone(&analytics));
++        run_agent(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            b,
++            &mut Vec::new(),
++        )
++        .await
++        .unwrap();
++
++        let db = rusqlite::Connection::open(&db_path).unwrap();
++        let ids: Vec<Option<String>> = db
++            .prepare("SELECT oneshot_session_id FROM agent_runs ORDER BY id")
++            .unwrap()
++            .query_map([], |row| row.get(0))
++            .unwrap()
++            .map(Result::unwrap)
++            .collect();
++        assert_eq!(ids, vec![Some("s1".to_string()), None]);
++    }
++
++    // --- ADR-036: --resume ---
++
++    fn resume(id: &str) -> SessionRequest {
++        SessionRequest::Resume(id.to_string())
++    }
++
++    /// What one provider call received, in a comparable form.
++    #[derive(Debug, Clone, PartialEq)]
++    struct SeenRequest {
++        system: Option<String>,
++        tools: Vec<String>,
++        messages: Vec<String>,
++        stable_prefix_len: usize,
++        model: String,
++        thinking: &'static str,
++    }
++
++    struct RecordingProvider {
++        responses: Mutex<VecDeque<LlmResponse>>,
++        seen: Mutex<Vec<SeenRequest>>,
++    }
++
++    impl RecordingProvider {
++        fn new(responses: Vec<LlmResponse>) -> Self {
++            Self {
++                responses: Mutex::new(VecDeque::from(responses)),
++                seen: Mutex::new(Vec::new()),
++            }
++        }
++
++        fn seen(&self) -> Vec<SeenRequest> {
++            self.seen.lock().unwrap().clone()
++        }
++    }
++
++    fn message_json(message: &Message) -> String {
++        serde_json::to_string(message).unwrap()
++    }
++
++    #[async_trait]
++    impl LlmProvider for RecordingProvider {
++        async fn complete(&self, ctx: &Context, opts: &CompleteOpts) -> LlmResponse {
++            self.seen.lock().unwrap().push(SeenRequest {
++                system: ctx.system.clone(),
++                tools: ctx
++                    .tools
++                    .iter()
++                    .map(|tool| {
++                        serde_json::json!({
++                            "name": tool.name,
++                            "description": tool.description,
++                            "input_schema": tool.input_schema,
++                        })
++                        .to_string()
++                    })
++                    .collect(),
++                messages: ctx.messages.iter().map(message_json).collect(),
++                stable_prefix_len: ctx.stable_prefix_len,
++                model: opts.model.clone(),
++                thinking: opts.thinking.as_str(),
++            });
++            self.responses
++                .lock()
++                .unwrap()
++                .pop_front()
++                .unwrap_or_else(|| LlmResponse::error("RecordingProvider exhausted"))
++        }
++    }
++
++    #[tokio::test]
++    async fn resume_sends_the_saved_prefix_and_one_new_user_message() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let provider = RecordingProvider::new(vec![
++            end_turn_with_text("first answer"),
++            end_turn_with_text("second answer"),
++        ]);
++        let first = run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("first task"),
++            session_options(state.path(), start("s1"), Default::default()),
++            &mut Vec::new(),
++        )
++        .await
++        .unwrap();
++
++        // The agent usually edits the workspace. A new workspace skill changes
++        // a rebuilt system prompt, so it shows that the resume does not rebuild.
++        let skill = workspace.path().join(".agents/skills/probe");
++        std::fs::create_dir_all(&skill).unwrap();
++        std::fs::write(
++            skill.join("SKILL.md"),
++            "---\nname: probe\ndescription: resume prefix probe\n---\nbody\n",
++        )
++        .unwrap();
++        let rebuilt =
++            crate::prompts::agent_system_for_workspace(&hermetic_cfg(), Some(workspace.path()))
++                .await;
++
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("second task"),
++            session_options(state.path(), resume("s1"), Default::default()),
++            &mut out,
++        )
++        .await
++        .unwrap();
++
++        let seen = provider.seen();
++        assert_eq!(seen.len(), 2);
++        assert_ne!(
++            seen[0].system.as_deref(),
++            Some(rebuilt.as_str()),
++            "control: the workspace change must alter a rebuilt system prompt"
++        );
++        assert_eq!(seen[1].system, seen[0].system);
++        assert_eq!(seen[1].tools, seen[0].tools);
++        let earlier: Vec<String> = first.messages.iter().map(message_json).collect();
++        assert_eq!(seen[1].messages.len(), earlier.len() + 1);
++        assert_eq!(seen[1].messages[..earlier.len()], earlier[..]);
++        assert_eq!(
++            seen[1].messages[earlier.len()],
++            message_json(&Message::user("second task"))
++        );
++        // Decision 15: only the assistant text of this invocation.
++        assert_eq!(out, b"second answer\n");
++
++        let record = oneshot_store(state.path()).load_result("s1").unwrap();
++        assert_eq!(record.generation, 2);
++        assert_eq!(record.messages.len(), earlier.len() + 2);
++    }
++
++    #[tokio::test]
++    async fn resume_runs_on_the_saved_model_and_thinking_level() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let provider = RecordingProvider::new(vec![
++            end_turn_with_text("first answer"),
++            end_turn_with_text("second answer"),
++        ]);
++        let mut a = args("first task");
++        a.model = Some("model-one".to_string());
++        a.thinking = crate::providers::ThinkingLevel::High;
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            a,
++            session_options(state.path(), start("s1"), Default::default()),
++            &mut Vec::new(),
++        )
++        .await
++        .unwrap();
++
++        // The values of the agent env file can differ at resume time.
++        let mut b = args("second task");
++        b.model = Some("model-two".to_string());
++        b.thinking = crate::providers::ThinkingLevel::Low;
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            b,
++            session_options(state.path(), resume("s1"), Default::default()),
++            &mut Vec::new(),
++        )
++        .await
++        .unwrap();
++
++        let seen = provider.seen();
++        assert_eq!(
++            (seen[1].model.as_str(), seen[1].thinking),
++            ("model-one", "high")
++        );
++        let record = oneshot_store(state.path()).load_result("s1").unwrap();
++        assert_eq!(record.model, "model-one");
++        assert_eq!(record.thinking.as_deref(), Some("high"));
++    }
++
++    #[tokio::test]
++    async fn resume_json_counts_only_this_invocation() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let provider = RecordingProvider::new(vec![
++            end_turn_with_text("first answer"),
++            end_turn_with_text("second answer"),
++        ]);
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("first task"),
++            session_options(state.path(), start("s1"), Default::default()),
++            &mut Vec::new(),
++        )
++        .await
++        .unwrap();
++        let mut out = Vec::new();
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("second task"),
++            session_options(
++                state.path(),
++                resume("s1"),
++                crate::cli::AgentOutputFormat::Json,
++            ),
++            &mut out,
++        )
++        .await
++        .unwrap();
++
++        let doc = single_json_document(&out);
++        assert_eq!(doc["session_id"], "s1");
++        assert_eq!(doc["resumed"], true);
++        assert_eq!(doc["session_saved"], true);
++        assert_eq!(doc["final_text"], "second answer");
++        assert_eq!(doc["turns"], 1);
++    }
++
++    #[tokio::test]
++    async fn resume_context_overflow_ends_the_run_and_saves_the_session() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        let provider = RecordingProvider::new(vec![
++            end_turn_with_text("first answer"),
++            LlmResponse::context_overflow_error("prompt is too long"),
++        ]);
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("first task"),
++            session_options(state.path(), start("s1"), Default::default()),
++            &mut Vec::new(),
++        )
++        .await
++        .unwrap();
++        let mut out = Vec::new();
++        let result = run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("second task"),
++            session_options(
++                state.path(),
++                resume("s1"),
++                crate::cli::AgentOutputFormat::Json,
++            ),
++            &mut out,
++        )
++        .await
++        .unwrap();
++
++        // Decision 10: no compaction and no retry. One call for each run.
++        assert_eq!(provider.seen().len(), 2);
++        assert!(result.context_overflow);
++        let doc = single_json_document(&out);
++        assert_eq!(doc["stop_reason"], "error");
++        assert_eq!(doc["context_overflow"], true);
++        assert_eq!(doc["session_saved"], true);
++        assert_eq!(
++            oneshot_store(state.path())
++                .load_result("s1")
++                .unwrap()
++                .generation,
++            2
++        );
++    }
++
++    #[tokio::test]
++    async fn resume_with_a_different_tool_list_is_refused_before_the_provider() {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        // A session whose saved tool list is not the tool list of this build.
++        {
++            let session = oneshot_session::open_when_free(state.path(), start("s1")).unwrap();
++            let other_tools = [ToolSchema {
++                name: "not_a_real_tool".to_string(),
++                description: "saved by another build".to_string(),
++                input_schema: serde_json::json!({"type": "object"}),
++            }];
++            session
++                .save(
++                    "mock-model",
++                    "medium",
++                    &[
++                        Message::user("first task"),
++                        Message::assistant("first answer"),
++                    ],
++                    workspace.path(),
++                    &oneshot_session::PrefixRecord {
++                        provider: "mock".to_string(),
++                        system: "saved system".to_string(),
++                        tools: oneshot_session::tool_digests(&other_tools),
++                    },
++                )
++                .unwrap();
++        }
++        let provider = RecordingProvider::new(vec![end_turn_with_text("never sent")]);
++        let mut out = Vec::new();
++        let run = run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("second task"),
++            session_options(state.path(), resume("s1"), Default::default()),
++            &mut out,
++        )
++        .await;
++        let Err(error) = run else {
++            panic!("a different tool list must refuse the resume");
++        };
++        let refusal = error
++            .downcast_ref::<oneshot_session::Refusal>()
++            .expect("the error must be a session refusal");
++        assert_eq!(refusal.code(), "session_tools_changed");
++        assert!(
++            provider.seen().is_empty(),
++            "no provider call after a refusal"
++        );
++        assert!(out.is_empty());
++        let record = oneshot_store(state.path()).load_result("s1").unwrap();
++        assert_eq!(record.generation, 1, "a refused resume must not save");
++    }
++
++    // --- ADR-036 Decision 7: the stable-prefix mark ---
++
++    fn read_note_then_answer() -> Vec<LlmResponse> {
++        vec![
++            LlmResponse {
++                retryable: false,
++                content: vec![ContentBlock::ToolCall {
++                    id: "call-1".to_string(),
++                    name: "read_file".to_string(),
++                    input: serde_json::json!({"path": "note.txt"}),
++                }],
++                stop_reason: crate::providers::StopReason::ToolUse,
++                error_message: None,
++                context_overflow: false,
++                usage: Usage::default(),
++            },
++            end_turn_with_text("done"),
++        ]
++    }
++
++    /// For each provider call: (stable_prefix_len, message count).
++    async fn prefix_marks(session: bool, prompt_cache: bool) -> Vec<(usize, usize)> {
++        let workspace = tempfile::tempdir().unwrap();
++        let state = tempfile::tempdir().unwrap();
++        std::fs::write(workspace.path().join("note.txt"), "hello\n").unwrap();
++        let provider = RecordingProvider::new(read_note_then_answer());
++        let options = RunOptions {
++            prompt_cache,
++            ..if session {
++                session_options(state.path(), start("s1"), Default::default())
++            } else {
++                RunOptions::default()
++            }
++        };
++        run_agent_with(
++            &provider,
++            workspace.path(),
++            hermetic_cfg(),
++            args("read the note"),
++            options,
++            &mut Vec::new(),
++        )
++        .await
++        .unwrap();
++        provider
++            .seen()
++            .iter()
++            .map(|request| (request.stable_prefix_len, request.messages.len()))
++            .collect()
++    }
++
++    #[tokio::test]
++    async fn a_session_run_marks_the_whole_message_list_as_stable_on_each_request() {
++        // Two requests: the task, then the task with the tool call and result.
++        assert_eq!(prefix_marks(true, true).await, vec![(1, 1), (3, 3)]);
++    }
++
++    #[tokio::test]
++    async fn the_stable_prefix_mark_needs_a_session_and_prompt_caching() {
++        // Without prompt caching the mark must not reach the adapter: the
++        // Anthropic adapter sets a cache marker for any non-zero value.
++        assert_eq!(prefix_marks(true, false).await, vec![(0, 1), (0, 3)]);
++        // A run without a session option keeps the value 0.
++        assert_eq!(prefix_marks(false, true).await, vec![(0, 1), (0, 3)]);
++        assert_eq!(prefix_marks(false, false).await, vec![(0, 1), (0, 3)]);
++    }
+ }
+diff --git a/src/agent_runtime.rs b/src/agent_runtime.rs
+index 8c04a24..046ed5d 100644
+--- a/src/agent_runtime.rs
++++ b/src/agent_runtime.rs
+@@ -259,7 +259,17 @@ pub async fn run_agent(
+         agent_env,
+         debug_thoughts,
+         debug_thoughts_path,
++        output,
++        oneshot_session_id,
++        resume,
+     } = args;
++    let session_request = oneshot_session_id
++        .map(crate::oneshot_session::SessionRequest::Start)
++        .or(resume.map(crate::oneshot_session::SessionRequest::Resume));
++    if let Some(request) = &session_request {
++        // ADR-036: a bad id is refused before any store or provider access.
++        crate::oneshot_session::validate_id(request.id())?;
++    }
+     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+     // Pre-resolution intent capture: the operator asked for interactive but
+     // no TTY is attached. Only the Print fallback's require_agent_task error
+@@ -453,6 +463,9 @@ pub async fn run_agent(
+     let agent = load_agent_env(agent_env, &cfg)?;
+     let cfg = with_skill_dir(cfg, &agent)?;
+     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
++    // An explicit --model. The model of the agent env file is a default, not
++    // a request, so a resume does not compare it with the saved model.
++    let explicit_model = model.clone();
+     let effective_model = model.unwrap_or_else(|| agent.model.clone());
+     let llm = build_provider(
+         &effective_provider,
+@@ -491,11 +504,56 @@ pub async fn run_agent(
+         thought_log,
+         thinking: agent.thinking.clone(),
+     };
+-    let result =
+-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await?;
++    let session = match session_request {
++        Some(request) => {
++            let session = open_oneshot_session(&cfg, request)?;
++            session.check_overrides(explicit_model.as_deref(), &effective_provider)?;
++            Some(session)
++        }
++        None => None,
++    };
++    let options = agent_cmd::RunOptions {
++        provider: effective_provider,
++        output,
++        session,
++        prompt_cache: agent.prompt_cache,
++    };
++    let result = agent_cmd::run_agent_with(
++        llm.as_ref(),
++        workspace,
++        cfg,
++        args,
++        options,
++        &mut std::io::stdout(),
++    )
++    .await?;
+     check_agent_result(&result)
+ }
+ 
++/// Claim a named one-shot session in its own store (ADR-036 Decision 2):
++/// `sessions/oneshot` under a selected state root, else
++/// `~/.daimonos/oneshot-sessions`.
++fn open_oneshot_session(
++    cfg: &config::Config,
++    request: crate::oneshot_session::SessionRequest,
++) -> Result<crate::oneshot_session::OpenSession, crate::oneshot_session::Refusal> {
++    use crate::oneshot_session::Refusal;
++    let directory = match &cfg.state_authority {
++        Some(authority) => {
++            authority.verify_session_store(crate::state_root::SessionStoreKind::OneShot)?
++        }
++        None => paths::oneshot_sessions_dir().ok_or_else(|| {
++            Refusal::state_unusable("no home directory for the one-shot session store")
++        })?,
++    };
++    let store = crate::session_store::SessionStore::new(directory)
++        .with_private_state(cfg.state_authority.is_some())
++        .with_busy_timeout(std::time::Duration::from_millis(
++            cfg.session.session_store_busy_timeout_ms,
++        ));
++    crate::oneshot_session::open(store, request)
++}
++
+ pub async fn run_chat(
+     args: ChatArgs,
+     workspace: &Path,
+diff --git a/src/analytics.rs b/src/analytics.rs
+index 4fbf12f..185cd1b 100644
+--- a/src/analytics.rs
++++ b/src/analytics.rs
+@@ -153,6 +153,9 @@ pub struct DailyStats {
+ #[derive(Debug, Clone)]
+ pub struct AgentRunRecord {
+     pub external_session_id: Option<String>,
++    /// Id of the named one-shot session of this run (ADR-036), so a caller
++    /// can total the attempts of one session. `None` without a session.
++    pub oneshot_session_id: Option<String>,
+     /// First 200 chars of the task (for reporting), never full task text.
+     pub task_prefix: String,
+     pub input_tokens: u64,
+@@ -226,7 +229,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
+     cache_write_tokens INTEGER NOT NULL,
+     cost_usd REAL NOT NULL,
+     stop_reason TEXT NOT NULL,
+-    turns INTEGER NOT NULL DEFAULT 0
++    turns INTEGER NOT NULL DEFAULT 0,
++    oneshot_session_id TEXT
+ );
+ CREATE INDEX IF NOT EXISTS idx_ar_timestamp ON agent_runs(timestamp);
+ CREATE INDEX IF NOT EXISTS idx_ar_session ON agent_runs(session_id);
+@@ -243,6 +247,8 @@ fn migrate_schema(conn: &Connection) -> Result<(), String> {
+         "CREATE INDEX IF NOT EXISTS idx_tc_external_session ON tool_calls(external_session_id)",
+         "ALTER TABLE agent_runs ADD COLUMN reasoning_output_tokens INTEGER",
+         "ALTER TABLE agent_runs ADD COLUMN thinking_bytes INTEGER NOT NULL DEFAULT 0",
++        // ADR-036: the named one-shot session of a run.
++        "ALTER TABLE agent_runs ADD COLUMN oneshot_session_id TEXT",
+     ];
+     for sql in migrations {
+         if let Err(e) = conn.execute_batch(sql) {
+@@ -437,8 +443,8 @@ impl AnalyticsStore {
+             "INSERT INTO agent_runs (timestamp, session_id, external_session_id,
+              task_prefix, input_tokens, output_tokens, reasoning_output_tokens,
+              thinking_bytes, cache_read_tokens, cache_write_tokens, cost_usd,
+-             stop_reason, turns)
+-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
++             stop_reason, turns, oneshot_session_id)
++             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             params![
+                 now,
+                 self.session_id,
+@@ -453,6 +459,7 @@ impl AnalyticsStore {
+                 rec.cost_usd,
+                 rec.stop_reason,
+                 rec.turns as i32,
++                rec.oneshot_session_id.as_deref(),
+             ],
+         );
+     }
+@@ -1344,6 +1351,7 @@ mod tests {
+ 
+     fn sample_agent_run() -> AgentRunRecord {
+         AgentRunRecord {
++            oneshot_session_id: None,
+             external_session_id: None,
+             task_prefix: "test task".into(),
+             input_tokens: 1000,
+@@ -1374,6 +1382,7 @@ mod tests {
+     fn record_agent_run_stores_all_token_fields() {
+         let (_dir, store) = test_store();
+         store.record_agent_run(&AgentRunRecord {
++            oneshot_session_id: None,
+             input_tokens: 1111,
+             output_tokens: 2222,
+             reasoning_output_tokens: Some(77),
+@@ -1415,6 +1424,7 @@ mod tests {
+         let (_dir, store) = test_store();
+         store.record_agent_run(&sample_agent_run());
+         store.record_agent_run(&AgentRunRecord {
++            oneshot_session_id: None,
+             reasoning_output_tokens: Some(0),
+             ..sample_agent_run()
+         });
+@@ -1434,6 +1444,7 @@ mod tests {
+     fn record_agent_run_stores_cost_and_stop_reason() {
+         let (_dir, store) = test_store();
+         store.record_agent_run(&AgentRunRecord {
++            oneshot_session_id: None,
+             cost_usd: 0.5678,
+             stop_reason: "max_tokens".into(),
+             ..sample_agent_run()
+@@ -1453,6 +1464,7 @@ mod tests {
+     fn record_agent_run_stores_external_session_id() {
+         let (_dir, store) = test_store();
+         store.record_agent_run(&AgentRunRecord {
++            oneshot_session_id: None,
+             external_session_id: Some("ext-session-xyz".into()),
+             ..sample_agent_run()
+         });
+@@ -1470,6 +1482,7 @@ mod tests {
+     fn agent_runs_summary_aggregates_correctly() {
+         let (_dir, store) = test_store();
+         store.record_agent_run(&AgentRunRecord {
++            oneshot_session_id: None,
+             input_tokens: 1000,
+             output_tokens: 500,
+             cache_read_tokens: 200,
+@@ -1478,6 +1491,7 @@ mod tests {
+             ..sample_agent_run()
+         });
+         store.record_agent_run(&AgentRunRecord {
++            oneshot_session_id: None,
+             input_tokens: 2000,
+             output_tokens: 1000,
+             cache_read_tokens: 400,
+@@ -1520,6 +1534,7 @@ mod tests {
+     fn stats_report_shows_cache_hit_rate() {
+         let (_dir, store) = test_store();
+         store.record_agent_run(&AgentRunRecord {
++            oneshot_session_id: None,
+             input_tokens: 800,
+             cache_read_tokens: 200,
+             ..sample_agent_run()
+diff --git a/src/cli.rs b/src/cli.rs
+index e3c6d5a..0544616 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -1,6 +1,16 @@
+ use clap::{Args, Parser, Subcommand};
+ use std::path::PathBuf;
+ 
++/// Stdout format of a one-shot `agent` run (ADR-036).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
++pub enum AgentOutputFormat {
++    /// The assistant text, as before ADR-036.
++    #[default]
++    Text,
++    /// One JSON result document and one newline.
++    Json,
++}
++
+ #[derive(Debug, Args)]
+ pub struct AgentArgs {
+     /// Optional initial task. Required unless --interactive launches on a TTY.
+@@ -44,6 +54,33 @@ pub struct AgentArgs {
+         conflicts_with = "interactive"
+     )]
+     pub debug_thoughts_path: Option<PathBuf>,
++    /// One-shot stdout format. `json` prints one result document for each run
++    /// whose loop returned a result, including failed runs (ADR-036).
++    #[arg(
++        long,
++        value_enum,
++        default_value_t = AgentOutputFormat::Text,
++        conflicts_with_all = ["interactive", "dry_run"]
++    )]
++    pub output: AgentOutputFormat,
++    /// Start a named one-shot session and save it when the run ends. A later
++    /// run continues it with --resume. An existing id is refused (ADR-036).
++    /// This is not the top-level --session-id, which filters --stats.
++    #[arg(
++        long = "session-id",
++        value_name = "ID",
++        conflicts_with_all = ["interactive", "dry_run"]
++    )]
++    pub oneshot_session_id: Option<String>,
++    /// Continue a named one-shot session with the task as the new input. The
++    /// run uses the saved provider, model, and thinking level; a different
++    /// --model or provider is refused (ADR-036).
++    #[arg(
++        long,
++        value_name = "ID",
++        conflicts_with_all = ["interactive", "dry_run", "oneshot_session_id"]
++    )]
++    pub resume: Option<String>,
+ }
+ 
+ #[derive(Debug, Args)]
+@@ -551,4 +588,93 @@ mod tests {
+             Cli::try_parse_from(["daimonos", "--mcp", "--mcp-socket", "/tmp/mcp.sock",]).is_err()
+         );
+     }
++
++    #[test]
++    fn agent_output_defaults_to_text_and_accepts_json() {
++        let agent_output = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
++            Some(Command::Agent(args)) => args.output,
++            _ => panic!("expected the agent command"),
++        };
++        assert_eq!(
++            agent_output(&["daimonos", "agent", "task"]),
++            AgentOutputFormat::Text
++        );
++        assert_eq!(
++            agent_output(&["daimonos", "agent", "--output", "json", "task"]),
++            AgentOutputFormat::Json
++        );
++        assert!(Cli::try_parse_from(["daimonos", "agent", "--output", "yaml", "task"]).is_err());
++    }
++
++    #[test]
++    fn agent_output_json_conflicts_with_interactive_and_dry_run() {
++        for flag in ["--interactive", "--dry-run"] {
++            assert!(
++                Cli::try_parse_from(["daimonos", "agent", flag, "--output", "json", "task"])
++                    .is_err(),
++                "{flag} must conflict with --output json"
++            );
++        }
++    }
++
++    #[test]
++    fn agent_session_id_is_separate_from_the_top_level_session_id() {
++        let parse = |argv: &[&str]| {
++            let cli = Cli::try_parse_from(argv).unwrap();
++            let agent = match cli.command {
++                Some(Command::Agent(args)) => args.oneshot_session_id,
++                _ => panic!("expected the agent command"),
++            };
++            (cli.session_id, agent)
++        };
++        assert_eq!(
++            parse(&[
++                "daimonos",
++                "--session-id",
++                "TOP",
++                "agent",
++                "--session-id",
++                "SUB",
++                "t"
++            ]),
++            (Some("TOP".to_string()), Some("SUB".to_string()))
++        );
++        assert_eq!(
++            parse(&["daimonos", "agent", "--session-id", "SUB", "t"]),
++            (None, Some("SUB".to_string()))
++        );
++        assert_eq!(
++            parse(&["daimonos", "--session-id", "TOP", "agent", "t"]),
++            (Some("TOP".to_string()), None)
++        );
++        for flag in ["--interactive", "--dry-run"] {
++            assert!(
++                Cli::try_parse_from(["daimonos", "agent", flag, "--session-id", "SUB", "t"])
++                    .is_err(),
++                "{flag} must conflict with agent --session-id"
++            );
++        }
++    }
++
++    #[test]
++    fn agent_resume_conflicts_with_session_id_interactive_and_dry_run() {
++        let cli = Cli::try_parse_from(["daimonos", "agent", "--resume", "run-1", "more"]).unwrap();
++        match cli.command {
++            Some(Command::Agent(args)) => assert_eq!(args.resume.as_deref(), Some("run-1")),
++            _ => panic!("expected the agent command"),
++        }
++        for extra in [
++            &["--session-id", "run-2"][..],
++            &["--interactive"][..],
++            &["--dry-run"][..],
++        ] {
++            let mut argv = vec!["daimonos", "agent", "--resume", "run-1"];
++            argv.extend_from_slice(extra);
++            argv.push("more");
++            assert!(
++                Cli::try_parse_from(argv).is_err(),
++                "{extra:?} must conflict with --resume"
++            );
++        }
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index dd5422f..fd50c97 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -28,6 +28,7 @@ mod mcp_bridge;
+ mod mcp_config_cmd;
+ mod mcp_oauth;
+ mod observability;
++mod oneshot_session;
+ mod ops;
+ mod path_policy;
+ mod paths;
+@@ -889,6 +890,13 @@ async fn main() -> anyhow::Result<()> {
+     };
+     drop(resource_telemetry);
+     observability_runtime.shutdown().await;
++    // ADR-036 Decision 9: a refused one-shot session exits with code 2 and the
++    // `run_configuration_invalid` JSON on stderr. No other error path changes.
++    if let Err(error) = &result {
++        if let Some(refusal) = error.downcast_ref::<oneshot_session::Refusal>() {
++            exit_for_state_failure(refusal.0.clone());
++        }
++    }
+     result
+ }
+ 
+diff --git a/src/oneshot_session.rs b/src/oneshot_session.rs
+new file mode 100644
+index 0000000..3dc2673
+--- /dev/null
++++ b/src/oneshot_session.rs
+@@ -0,0 +1,610 @@
++//! Named and resumable one-shot `daimonos agent` sessions (ADR-036).
++//!
++//! Context: docs/contexts/session-durability/CONTEXT.md, ADR-033, ADR-036.
++//!
++//! A one-shot session is one conversation that a later invocation continues
++//! with `--resume`. It has one writer (the ADR-033 owner lock) and its own
++//! store directory. A resume must reproduce the request prefix (system prompt,
++//! tool list, earlier messages) or refuse: a silently different prefix misses
++//! the provider prompt cache that the resume exists for.
++
++use std::path::Path;
++
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++
++use crate::providers::{Message, ThinkingLevel, ToolSchema};
++use crate::session_store::{
++    PersistedSession, SessionStore, SessionStoreError, SessionWriteOutcome, SessionWriter,
++};
++use crate::state_root::RunFailure;
++
++/// Longest accepted session id, in characters (ADR-036 Decision 1).
++pub const MAX_SESSION_ID_CHARS: usize = 128;
++
++/// What the caller asked for: `--session-id` or `--resume`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum SessionRequest {
++    Start(String),
++    Resume(String),
++}
++
++impl SessionRequest {
++    pub fn id(&self) -> &str {
++        match self {
++            Self::Start(id) | Self::Resume(id) => id,
++        }
++    }
++
++    pub fn is_resume(&self) -> bool {
++        matches!(self, Self::Resume(_))
++    }
++}
++
++/// One tool of the request prefix: its name and a digest of its definition.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ToolDigest {
++    pub name: String,
++    /// Hex SHA-256 of the description, a zero byte, and the serialized schema.
++    pub sha256: String,
++}
++
++/// The part of a session record that lets a resume reproduce the request
++/// prefix. The model and the thinking level are fields of the record itself.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PrefixRecord {
++    pub provider: String,
++    /// The system prompt text, sent again as saved. It is never rebuilt,
++    /// because the builder reads a workspace that the agent just edited.
++    pub system: String,
++    /// The tool list in request order.
++    pub tools: Vec<ToolDigest>,
++}
++
++/// Digest each tool definition, in request order.
++pub fn tool_digests(tools: &[ToolSchema]) -> Vec<ToolDigest> {
++    tools
++        .iter()
++        .map(|tool| {
++            let mut hasher = Sha256::new();
++            hasher.update(tool.description.as_bytes());
++            hasher.update([0u8]);
++            // `serde_json::Value` serializes object keys in a stable order,
++            // so equal schemas give equal bytes.
++            hasher.update(serde_json::to_vec(&tool.input_schema).unwrap_or_default());
++            ToolDigest {
++                name: tool.name.clone(),
++                sha256: hex::encode(hasher.finalize()),
++            }
++        })
++        .collect()
++}
++
++/// A session request that the run refuses before it calls the model. The
++/// process exits with code 2 and the `run_configuration_invalid` JSON.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Refusal(pub RunFailure);
++
++impl std::fmt::Display for Refusal {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        self.0.fmt(formatter)
++    }
++}
++
++impl std::error::Error for Refusal {}
++
++impl From<RunFailure> for Refusal {
++    fn from(failure: RunFailure) -> Self {
++        Self(failure)
++    }
++}
++
++impl Refusal {
++    fn new(code: &'static str, message: impl Into<String>) -> Self {
++        Self(RunFailure::configuration_invalid(code, message))
++    }
++
++    #[cfg(test)]
++    pub fn code(&self) -> &'static str {
++        self.0.code
++    }
++
++    pub fn state_unusable(message: impl Into<String>) -> Self {
++        Self(RunFailure::state_unusable(message))
++    }
++
++    pub fn model_mismatch(id: &str, saved: &str, requested: &str) -> Self {
++        Self::new(
++            "session_model_mismatch",
++            format!(
++                "session {id} was saved with model {saved}; --model {requested} differs. \
++                 Start a new session to change the model."
++            ),
++        )
++    }
++
++    pub fn provider_mismatch(id: &str, saved: &str, requested: &str) -> Self {
++        Self::new(
++            "session_provider_mismatch",
++            format!(
++                "session {id} was saved with provider {saved}; this run selects provider \
++                 {requested}. Start a new session to change the provider."
++            ),
++        )
++    }
++}
++
++/// Check the id before any store access (ADR-036 Decision 1).
++pub fn validate_id(id: &str) -> Result<(), Refusal> {
++    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
++    if id.is_empty() || id.chars().count() > MAX_SESSION_ID_CHARS || !id.chars().all(allowed) {
++        return Err(Refusal::new(
++            "session_id_invalid",
++            format!(
++                "a session id has 1 to {MAX_SESSION_ID_CHARS} characters from A-Z, a-z, 0-9, \
++                 '-' and '_'"
++            ),
++        ));
++    }
++    Ok(())
++}
++
++/// The saved state that a resume continues.
++#[derive(Debug, Clone)]
++pub struct SavedSession {
++    pub model: String,
++    pub thinking: ThinkingLevel,
++    pub messages: Vec<Message>,
++    pub prefix: PrefixRecord,
++}
++
++/// A claimed session: this process is its one writer until the value drops.
++pub struct OpenSession {
++    request: SessionRequest,
++    store: SessionStore,
++    writer: SessionWriter,
++    next_generation: u64,
++    saved: Option<SavedSession>,
++}
++
++impl OpenSession {
++    pub fn id(&self) -> &str {
++        self.request.id()
++    }
++
++    pub fn is_resume(&self) -> bool {
++        self.request.is_resume()
++    }
++
++    /// The saved state of a resumed session. `None` for a new session.
++    pub fn saved(&self) -> Option<&SavedSession> {
++        self.saved.as_ref()
++    }
++
++    /// Refuse a resume on another model or provider (ADR-036 Decision 5).
++    ///
++    /// `model` is an explicit `--model` value. A model default of the agent
++    /// env file is not a request: the resume uses the saved model. `provider`
++    /// is the provider that this run selects (`--provider` or the agent env
++    /// file). Its credentials belong to that provider, so a saved session of
++    /// another provider is refused and never sent there.
++    pub fn check_overrides(&self, model: Option<&str>, provider: &str) -> Result<(), Refusal> {
++        let Some(saved) = &self.saved else {
++            return Ok(());
++        };
++        if provider != saved.prefix.provider {
++            return Err(Refusal::provider_mismatch(
++                self.id(),
++                &saved.prefix.provider,
++                provider,
++            ));
++        }
++        match model {
++            Some(model) if model != saved.model => {
++                Err(Refusal::model_mismatch(self.id(), &saved.model, model))
++            }
++            _ => Ok(()),
++        }
++    }
++
++    /// Refuse a resume whose tool list differs from the saved prefix
++    /// (ADR-036 Decision 5). A new session always passes.
++    pub fn check_tools(&self, tools: &[ToolSchema]) -> Result<(), Refusal> {
++        let Some(saved) = &self.saved else {
++            return Ok(());
++        };
++        let current = tool_digests(tools);
++        let saved_tools = &saved.prefix.tools;
++        let first_difference = saved_tools
++            .iter()
++            .zip(&current)
++            .position(|(saved, current)| saved != current);
++        let detail = match first_difference {
++            Some(index) if saved_tools[index].name == current[index].name => format!(
++                "the definition of tool {} at position {index} changed",
++                current[index].name
++            ),
++            Some(index) => format!(
++                "position {index} has tool {}, the session has {}",
++                current[index].name, saved_tools[index].name
++            ),
++            None if current.len() > saved_tools.len() => format!(
++                "tool {} at position {} is not in the session",
++                current[saved_tools.len()].name,
++                saved_tools.len()
++            ),
++            None if current.len() < saved_tools.len() => format!(
++                "tool {} at position {} of the session is not available",
++                saved_tools[current.len()].name,
++                current.len()
++            ),
++            None => return Ok(()),
++        };
++        Err(Refusal::new(
++            "session_tools_changed",
++            format!(
++                "session {} cannot continue with a different tool list: {detail}",
++                self.id()
++            ),
++        ))
++    }
++
++    /// Save the conversation through the claimed writer at the next
++    /// generation. Any result other than a completed save is an error
++    /// (ADR-036 Decision 8).
++    pub fn save(
++        &self,
++        model: &str,
++        thinking: &str,
++        messages: &[Message],
++        cwd: &Path,
++        prefix: &PrefixRecord,
++    ) -> Result<(), String> {
++        match self.store.save_oneshot_generation_result(
++            &self.writer,
++            self.next_generation,
++            model,
++            thinking,
++            messages,
++            cwd,
++            prefix,
++        ) {
++            Ok(SessionWriteOutcome::Saved(_)) => Ok(()),
++            Ok(SessionWriteOutcome::Stale { stored_generation }) => Err(format!(
++                "the session changed during the run (stored generation {stored_generation})"
++            )),
++            Ok(SessionWriteOutcome::Superseded) => {
++                Err("another writer took the session during the run".to_string())
++            }
++            Err(error) => Err(error.to_string()),
++        }
++    }
++}
++
++/// Claim a session for this process (ADR-036 Decision 4).
++///
++/// A new session claims the writer with no expected generation, so an existing
++/// record refuses it. A resume loads the record and claims the writer at the
++/// loaded generation. The claim takes the ADR-033 owner lock.
++pub fn open(store: SessionStore, request: SessionRequest) -> Result<OpenSession, Refusal> {
++    let id = request.id().to_string();
++    validate_id(&id)?;
++    let (expected_generation, saved) = match &request {
++        SessionRequest::Start(_) => (None, None),
++        SessionRequest::Resume(_) => {
++            let record = store
++                .load_result(&id)
++                .map_err(|error| store_refusal(&id, error))?;
++            let generation = record.generation;
++            (Some(generation), Some(saved_session(&id, record)?))
++        }
++    };
++    let writer = store
++        .claim_writer(&id, expected_generation)
++        .map_err(|error| store_refusal(&id, error))?;
++    Ok(OpenSession {
++        request,
++        store,
++        writer,
++        next_generation: expected_generation.unwrap_or(0).saturating_add(1),
++        saved,
++    })
++}
++
++fn saved_session(id: &str, record: PersistedSession) -> Result<SavedSession, Refusal> {
++    let Some(prefix) = record.prefix else {
++        return Err(Refusal::new(
++            "session_not_resumable",
++            format!("session {id} has no prefix record; it was not saved by a one-shot run"),
++        ));
++    };
++    let thinking = record
++        .thinking
++        .as_deref()
++        .and_then(|level| ThinkingLevel::from_input(level).ok());
++    let Some(thinking) = thinking else {
++        return Err(Refusal::new(
++            "session_not_resumable",
++            format!("session {id} has no usable thinking level"),
++        ));
++    };
++    Ok(SavedSession {
++        model: record.model,
++        thinking,
++        messages: record.messages,
++        prefix,
++    })
++}
++
++fn store_refusal(id: &str, error: SessionStoreError) -> Refusal {
++    match error {
++        SessionStoreError::UnsafeId => Refusal::new(
++            "session_id_invalid",
++            format!("session id {id} is not valid"),
++        ),
++        SessionStoreError::AlreadyExists => Refusal::new(
++            "session_exists",
++            format!("session {id} exists; use --resume {id} to continue it"),
++        ),
++        SessionStoreError::NotFound => Refusal::new(
++            "session_not_found",
++            format!("session {id} does not exist; use --session-id {id} to start it"),
++        ),
++        SessionStoreError::OwnedElsewhere { pid } => Refusal::new(
++            "session_owned_elsewhere",
++            match pid {
++                Some(pid) => format!("session {id} is in use by process {pid}"),
++                None => format!("session {id} is in use by another process"),
++            },
++        ),
++        SessionStoreError::WriterChanged { .. } => Refusal::new(
++            "session_changed",
++            format!("session {id} changed while this run started; try again"),
++        ),
++        error @ (SessionStoreError::FutureVersion { .. }
++        | SessionStoreError::UnsupportedVersion { .. }
++        | SessionStoreError::Corrupt(_)) => Refusal::new(
++            "session_not_resumable",
++            format!("session {id} cannot be read by this build: {error}"),
++        ),
++        error @ (SessionStoreError::Database(_) | SessionStoreError::Io(_)) => {
++            Refusal::state_unusable(format!("one-shot session store: {error}"))
++        }
++    }
++}
++
++/// Test helper: [`open`], with a bounded wait while the owner lock is held.
++///
++/// The owner lock is a `flock`. A child that another test thread forked keeps
++/// the lock's open file description until it calls `exec`, so in the
++/// multi-threaded test binary a lock can outlive a dropped session for a
++/// moment. Tests that are not about lock ownership wait for that moment.
++#[cfg(test)]
++pub(crate) fn open_when_free(dir: &Path, request: SessionRequest) -> Result<OpenSession, Refusal> {
++    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
++    loop {
++        match open(SessionStore::new(dir.to_path_buf()), request.clone()) {
++            Err(refusal)
++                if refusal.code() == "session_owned_elsewhere"
++                    && std::time::Instant::now() < deadline =>
++            {
++                std::thread::sleep(std::time::Duration::from_millis(10));
++            }
++            other => return other,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn tool(name: &str, description: &str, schema: serde_json::Value) -> ToolSchema {
++        ToolSchema {
++            name: name.to_string(),
++            description: description.to_string(),
++            input_schema: schema,
++        }
++    }
++
++    fn tools() -> Vec<ToolSchema> {
++        vec![
++            tool("alpha", "first", serde_json::json!({"type": "object"})),
++            tool("beta", "second", serde_json::json!({"type": "object"})),
++        ]
++    }
++
++    fn prefix(tools: &[ToolSchema]) -> PrefixRecord {
++        PrefixRecord {
++            provider: "mock".to_string(),
++            system: "system text".to_string(),
++            tools: tool_digests(tools),
++        }
++    }
++
++    fn store(dir: &Path) -> SessionStore {
++        SessionStore::new(dir.to_path_buf())
++    }
++
++    /// Start a session and save one exchange, then release the writer.
++    fn saved(dir: &Path, id: &str) {
++        let session = open(store(dir), SessionRequest::Start(id.to_string())).unwrap();
++        session
++            .save(
++                "model-a",
++                "medium",
++                &[Message::user("task"), Message::assistant("done")],
++                dir,
++                &prefix(&tools()),
++            )
++            .unwrap();
++    }
++
++    #[test]
++    fn id_rules_are_checked_before_the_store() {
++        let dir = tempfile::tempdir().unwrap();
++        let missing = dir.path().join("never-created");
++        for id in ["", "has space", "dot.dot", "a/b", &"x".repeat(129)] {
++            let error = open(store(&missing), SessionRequest::Start(id.to_string()))
++                .err()
++                .unwrap();
++            assert_eq!(error.code(), "session_id_invalid", "id {id:?}");
++            assert_eq!(error.0.exit_code, 2);
++        }
++        assert!(!missing.exists(), "an invalid id must not touch the store");
++        assert!(validate_id(&"x".repeat(128)).is_ok());
++        assert!(validate_id("run-42_code").is_ok());
++    }
++
++    #[test]
++    fn a_new_session_saves_and_a_resume_loads_it() {
++        let dir = tempfile::tempdir().unwrap();
++        saved(dir.path(), "s1");
++
++        let resumed = open_when_free(dir.path(), SessionRequest::Resume("s1".into())).unwrap();
++        let state = resumed.saved().unwrap();
++        assert_eq!(state.model, "model-a");
++        assert_eq!(state.thinking.as_str(), "medium");
++        assert_eq!(state.messages.len(), 2);
++        assert_eq!(state.prefix, prefix(&tools()));
++        assert!(resumed.is_resume());
++    }
++
++    #[test]
++    fn starting_an_existing_id_is_refused_and_keeps_the_record() {
++        let dir = tempfile::tempdir().unwrap();
++        saved(dir.path(), "s1");
++        let before = store(dir.path()).load_result("s1").unwrap();
++
++        let error = open_when_free(dir.path(), SessionRequest::Start("s1".into()))
++            .err()
++            .unwrap();
++        assert_eq!(error.code(), "session_exists");
++
++        let after = store(dir.path()).load_result("s1").unwrap();
++        assert_eq!(after.generation, before.generation);
++        assert_eq!(after.messages.len(), before.messages.len());
++    }
++
++    #[test]
++    fn resuming_an_unknown_id_is_refused() {
++        let dir = tempfile::tempdir().unwrap();
++        let error = open_when_free(dir.path(), SessionRequest::Resume("nope".into()))
++            .err()
++            .unwrap();
++        assert_eq!(error.code(), "session_not_found");
++    }
++
++    #[test]
++    fn a_record_without_a_prefix_is_not_resumable() {
++        let dir = tempfile::tempdir().unwrap();
++        // A chat-style record: same store type, no prefix record.
++        store(dir.path()).save("chat-1", "model-a", &[Message::user("hi")]);
++        let error = open_when_free(dir.path(), SessionRequest::Resume("chat-1".into()))
++            .err()
++            .unwrap();
++        assert_eq!(error.code(), "session_not_resumable");
++    }
++
++    #[test]
++    fn a_second_live_owner_is_refused() {
++        let dir = tempfile::tempdir().unwrap();
++        saved(dir.path(), "s1");
++        let _first = open(store(dir.path()), SessionRequest::Resume("s1".into())).unwrap();
++        let error = open(store(dir.path()), SessionRequest::Resume("s1".into()))
++            .err()
++            .unwrap();
++        assert_eq!(error.code(), "session_owned_elsewhere");
++    }
++
++    #[test]
++    fn each_save_advances_the_generation() {
++        let dir = tempfile::tempdir().unwrap();
++        saved(dir.path(), "s1");
++        let first = store(dir.path()).load_result("s1").unwrap().generation;
++        {
++            let resumed = open_when_free(dir.path(), SessionRequest::Resume("s1".into())).unwrap();
++            resumed
++                .save(
++                    "model-a",
++                    "medium",
++                    &[Message::user("task"), Message::assistant("done")],
++                    dir.path(),
++                    &prefix(&tools()),
++                )
++                .unwrap();
++        }
++        let second = store(dir.path()).load_result("s1").unwrap().generation;
++        assert_eq!(second, first + 1);
++    }
++
++    #[test]
++    fn tool_list_differences_are_refused_and_name_the_first_tool() {
++        let dir = tempfile::tempdir().unwrap();
++        saved(dir.path(), "s1");
++        let resumed = open_when_free(dir.path(), SessionRequest::Resume("s1".into())).unwrap();
++        assert!(resumed.check_tools(&tools()).is_ok());
++
++        let mut reordered = tools();
++        reordered.reverse();
++        let mut changed = tools();
++        changed[1].description = "second, edited".to_string();
++        let mut schema_changed = tools();
++        schema_changed[0].input_schema = serde_json::json!({"type": "object", "x": 1});
++        let mut extra = tools();
++        extra.push(tool("gamma", "third", serde_json::json!({})));
++        let fewer = vec![tools().remove(0)];
++        for (case, list, names) in [
++            ("order", reordered, "beta"),
++            ("description", changed, "beta"),
++            ("schema", schema_changed, "alpha"),
++            ("extra", extra, "gamma"),
++            ("fewer", fewer, "beta"),
++        ] {
++            let error = resumed.check_tools(&list).err().unwrap();
++            assert_eq!(error.code(), "session_tools_changed", "{case}");
++            assert!(
++                error.0.message.contains(names),
++                "{case}: {}",
++                error.0.message
++            );
++        }
++    }
++
++    #[test]
++    fn a_new_session_accepts_any_tool_list() {
++        let dir = tempfile::tempdir().unwrap();
++        let session = open_when_free(dir.path(), SessionRequest::Start("s1".into())).unwrap();
++        assert!(session.check_tools(&tools()).is_ok());
++        assert!(session.saved().is_none());
++    }
++
++    #[test]
++    fn a_resume_on_another_model_or_provider_is_refused() {
++        let dir = tempfile::tempdir().unwrap();
++        saved(dir.path(), "s1");
++        let resumed = open_when_free(dir.path(), SessionRequest::Resume("s1".into())).unwrap();
++        let saved_provider = resumed.saved().unwrap().prefix.provider.clone();
++
++        assert!(resumed.check_overrides(None, &saved_provider).is_ok());
++        assert!(resumed
++            .check_overrides(Some("model-a"), &saved_provider)
++            .is_ok());
++        let model = resumed
++            .check_overrides(Some("model-b"), &saved_provider)
++            .unwrap_err();
++        assert_eq!(model.code(), "session_model_mismatch");
++        assert!(model.to_string().contains("model-a") && model.to_string().contains("model-b"));
++        let provider = resumed
++            .check_overrides(None, "another-provider")
++            .unwrap_err();
++        assert_eq!(provider.code(), "session_provider_mismatch");
++    }
++
++    #[test]
++    fn a_new_session_accepts_any_model_and_provider() {
++        let dir = tempfile::tempdir().unwrap();
++        let session = open_when_free(dir.path(), SessionRequest::Start("s1".into())).unwrap();
++        assert!(session.check_overrides(Some("any"), "any").is_ok());
++    }
++}
+diff --git a/src/paths.rs b/src/paths.rs
+index 104923b..fb5ed09 100644
+--- a/src/paths.rs
++++ b/src/paths.rs
+@@ -45,6 +45,13 @@ pub(crate) fn agent_sessions_dir() -> Option<PathBuf> {
+     home_dir().map(|home| home.join(".daimonos").join("acp-sessions"))
+ }
+ 
++/// Durable store of named one-shot `agent` sessions (ADR-036). Separate from
++/// the chat store, so `chat --resume` cannot continue one with compaction or
++/// another model.
++pub(crate) fn oneshot_sessions_dir() -> Option<PathBuf> {
++    home_dir().map(|home| home.join(".daimonos").join("oneshot-sessions"))
++}
++
+ /// Durable store owned exclusively by the interactive session daemon.
+ pub(crate) fn daemon_sessions_dir() -> Option<PathBuf> {
+     home_dir().map(|home| home.join(".daimonos").join("daemon-sessions"))
+diff --git a/src/providers/anthropic.rs b/src/providers/anthropic.rs
+index 81e1a22..ef72886 100644
+--- a/src/providers/anthropic.rs
++++ b/src/providers/anthropic.rs
+@@ -1863,6 +1863,49 @@ mod tests {
+         assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+     }
+ 
++    /// ADR-036 Decision 7: a one-shot session run sends the whole message list
++    /// as the stable prefix, so the breakpoint is on the last message.
++    #[test]
++    fn build_request_marks_the_last_message_when_the_whole_list_is_stable() {
++        let ctx = Context {
++            messages: vec![
++                Message::user("first task"),
++                Message::assistant("first answer"),
++                Message::user("the tests failed"),
++            ],
++            system: Some("stable system".into()),
++            tools: vec![ToolSchema {
++                name: "read_file".into(),
++                description: "Read".into(),
++                input_schema: json!({"type":"object"}),
++            }],
++            stable_prefix_len: 3,
++        };
++        let json = serde_json::to_value(build_request_with_cache(
++            &ctx,
++            &CompleteOpts::default(),
++            true,
++        ))
++        .unwrap();
++
++        let marked: Vec<bool> = json["messages"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|message| {
++                message["content"]
++                    .as_array()
++                    .unwrap()
++                    .iter()
++                    .any(|block| block["cache_control"]["type"] == "ephemeral")
++            })
++            .collect();
++        assert_eq!(marked, vec![false, false, true]);
++        // With the tool breakpoint, the request uses 2 of the 4 breakpoints
++        // that the provider allows.
++        assert_eq!(json["tools"][0]["cache_control"]["type"], "ephemeral");
++    }
++
+     #[test]
+     fn build_request_no_cache_control_when_stable_prefix_len_zero() {
+         let ctx = Context {
+diff --git a/src/session_interchange.rs b/src/session_interchange.rs
+index ed9fab4..c35abc7 100644
+--- a/src/session_interchange.rs
++++ b/src/session_interchange.rs
+@@ -211,6 +211,7 @@ mod tests {
+             cwd: Some(std::path::PathBuf::from("/workspace")),
+             client_user_message_ids: vec!["user-1".to_string()],
+             assistant_outcomes: Vec::new(),
++            prefix: None,
+             messages: vec![crate::providers::Message::user("hello")],
+         }
+     }
+diff --git a/src/session_store.rs b/src/session_store.rs
+index f1d9267..14932f7 100644
+--- a/src/session_store.rs
++++ b/src/session_store.rs
+@@ -146,6 +146,10 @@ pub struct PersistedSession {
+     pub client_user_message_ids: Vec<String>,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub assistant_outcomes: Vec<AssistantOutcome>,
++    /// The request prefix of a one-shot session (ADR-036). `None` for chat,
++    /// ACP, and daemon records. Optional, so the record version stays 1.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub prefix: Option<crate::oneshot_session::PrefixRecord>,
+     pub messages: Vec<Message>,
+ }
+ 
+@@ -548,6 +552,34 @@ impl SessionStore {
+         )
+     }
+ 
++    /// Save a one-shot session through its claimed writer (ADR-036). The
++    /// caller treats every outcome other than `Saved` as a failure.
++    #[allow(clippy::too_many_arguments)]
++    pub fn save_oneshot_generation_result(
++        &self,
++        writer: &SessionWriter,
++        generation: u64,
++        model: &str,
++        thinking: &str,
++        messages: &[Message],
++        cwd: &Path,
++        prefix: &crate::oneshot_session::PrefixRecord,
++    ) -> std::io::Result<SessionWriteOutcome> {
++        let record = PersistedSession {
++            version: SESSION_PERSIST_VERSION,
++            generation,
++            session_id: writer.session_id.clone(),
++            model: model.to_string(),
++            thinking: Some(thinking.to_string()),
++            cwd: Some(cwd.to_path_buf()),
++            client_user_message_ids: Vec::new(),
++            assistant_outcomes: Vec::new(),
++            prefix: Some(prefix.clone()),
++            messages: messages.to_vec(),
++        };
++        self.write_record(record, usize::MAX, Some(generation), Some(writer))
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     fn save_record(
+         &self,
+@@ -571,6 +603,7 @@ impl SessionStore {
+             cwd,
+             client_user_message_ids: client_user_message_ids.to_vec(),
+             assistant_outcomes: assistant_outcomes.to_vec(),
++            prefix: None,
+             messages: messages.to_vec(),
+         };
+         if let Err(e) = self.write_record(record, usize::MAX, None, None) {
+@@ -604,6 +637,7 @@ impl SessionStore {
+             cwd: cwd.clone(),
+             client_user_message_ids: client_user_message_ids.to_vec(),
+             assistant_outcomes: assistant_outcomes.to_vec(),
++            prefix: None,
+             messages: messages.to_vec(),
+         };
+         self.write_record(record, max_preview_bytes, generation, writer)
+@@ -1371,6 +1405,7 @@ mod tests {
+             cwd: None,
+             client_user_message_ids: Vec::new(),
+             assistant_outcomes: Vec::new(),
++            prefix: None,
+             messages: Vec::new(),
+         };
+ 
+diff --git a/src/state_root.rs b/src/state_root.rs
+index eeb4dca..d3b47db 100644
+--- a/src/state_root.rs
++++ b/src/state_root.rs
+@@ -211,6 +211,8 @@ pub(crate) enum SessionStoreKind {
+     Daemon,
+     Acp,
+     Chat,
++    /// Named one-shot `agent` sessions (ADR-036).
++    OneShot,
+ }
+ 
+ /// Immutable, run-scoped authority over internal state placement. Constructed
+@@ -477,6 +479,7 @@ impl StateAuthority {
+             SessionStoreKind::Daemon => "daemon",
+             SessionStoreKind::Acp => "acp",
+             SessionStoreKind::Chat => "chat",
++            SessionStoreKind::OneShot => "oneshot",
+         };
+         let directory = self.resolve_trusted(&["sessions", name])?;
+         self.verify_writable_directory("session store", &directory)?;
+diff --git a/tests/test_agent_oneshot_sessions.py b/tests/test_agent_oneshot_sessions.py
+new file mode 100644
+index 0000000..0df5df6
+--- /dev/null
++++ b/tests/test_agent_oneshot_sessions.py
+@@ -0,0 +1,478 @@
++"""One-shot `daimonos agent` options of ADR-036 (vikunja #1621).
++
++These tests run the real binary against a local OpenRouter-compatible endpoint.
++No request leaves 127.0.0.1.
++"""
++import json
++import shutil
++import sqlite3
++import subprocess
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++
++def text_reply(text, usage=None):
++    return {"kind": "message", "message": {"role": "assistant", "content": text},
++            "finish_reason": "stop", "usage": usage}
++
++
++def tool_reply(name, arguments):
++    call = {"id": "call-1", "type": "function",
++            "function": {"name": name, "arguments": json.dumps(arguments)}}
++    return {"kind": "message", "message": {"role": "assistant", "content": "", "tool_calls": [call]},
++            "finish_reason": "tool_calls", "usage": None}
++
++
++def http_error(status, message):
++    return {"kind": "error", "status": status, "message": message}
++
++
++class FakeProvider:
++    """Serve scripted chat completions and record each request body."""
++
++    def __init__(self, replies):
++        self.replies = list(replies)
++        self.requests = []
++        owner = self
++
++        class Handler(BaseHTTPRequestHandler):
++            protocol_version = "HTTP/1.1"
++
++            def log_message(self, *_):
++                pass
++
++            def _send(self, status, content_type, payload):
++                self.send_response(status)
++                self.send_header("Content-Type", content_type)
++                self.send_header("Content-Length", str(len(payload)))
++                self.send_header("Connection", "close")
++                self.end_headers()
++                self.close_connection = True
++                self.wfile.write(payload)
++                self.wfile.flush()
++
++            def do_GET(self):
++                models = {"data": [{"id": "test/model", "context_length": 100000,
++                                    "supported_parameters": ["tools"],
++                                    "pricing": {"prompt": "0", "completion": "0"}}]}
++                self._send(200, "application/json", json.dumps(models).encode())
++
++            def do_POST(self):
++                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
++                owner.requests.append(body)
++                reply = owner.replies.pop(0) if owner.replies else http_error(500, "fake provider has no reply")
++                gate = reply.get("hold")
++                if gate is not None:
++                    # Keep the run in flight until the test releases it.
++                    assert gate.wait(timeout=30), "the test did not release a held reply"
++                if reply["kind"] == "error":
++                    payload = json.dumps({"error": {"message": reply["message"]}}).encode()
++                    self._send(reply["status"], "application/json", payload)
++                    return
++                usage = reply["usage"] or {"prompt_tokens": 1, "completion_tokens": 1}
++                if body.get("stream"):
++                    chunk = {"choices": [{"index": 0, "delta": reply["message"],
++                                          "finish_reason": reply["finish_reason"]}], "usage": usage}
++                    payload = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
++                    self._send(200, "text/event-stream", payload)
++                else:
++                    document = {"choices": [{"index": 0, "message": reply["message"],
++                                             "finish_reason": reply["finish_reason"]}], "usage": usage}
++                    self._send(200, "application/json", json.dumps(document).encode())
++
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.server.daemon_threads = True
++        self.port = self.server.server_address[1]
++        threading.Thread(target=self.server.serve_forever, daemon=True).start()
++
++    def close(self):
++        self.server.shutdown()
++        self.server.server_close()
++
++
++@pytest.fixture
++def fake_provider():
++    providers = []
++
++    def start(replies):
++        provider = FakeProvider(replies)
++        providers.append(provider)
++        return provider
++
++    yield start
++    for provider in providers:
++        provider.close()
++
++
++class Harness:
++    """One isolated HOME, workspace, and agent env for `daimonos agent` runs."""
++
++    def __init__(self, binary, tmp_path, port):
++        self.binary = binary
++        self.workspace = tmp_path / "workspace"
++        self.workspace.mkdir()
++        self.home = tmp_path / "home"
++        self.home.mkdir()
++        self.config = tmp_path / "config.toml"
++        self.config.write_text(
++            "[analytics]\nenabled=false\n"
++            f'[logging]\nlevel="warn"\ndirectory="{tmp_path / "logs"}"\n'
++        )
++        self.agent_env = tmp_path / "agent.env"
++        self.agent_env.write_text("\n".join([
++            "DAIMONOS_AGENT_PROVIDER=openrouter", "DAIMONOS_AGENT_MODEL=test/model",
++            f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{port}", "DAIMONOS_AGENT_API_KEY=test",
++            "DAIMONOS_AGENT_APPROVAL_MODE=auto", "DAIMONOS_AGENT_COMPACTION=off", ""]))
++
++    def command(self, *args, global_args=()):
++        return [self.binary, "--workspace", str(self.workspace), "--config", str(self.config),
++                *global_args, "agent", "--agent-env", str(self.agent_env), *args]
++
++    def environment(self):
++        return {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
++
++    def agent(self, *args, global_args=()):
++        return subprocess.run(
++            self.command(*args, global_args=global_args), cwd=self.workspace, env=self.environment(),
++            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
++
++    def start(self, *args):
++        """Start a run and return at once. The caller reads it with `communicate`."""
++        return subprocess.Popen(
++            self.command(*args), cwd=self.workspace, env=self.environment(),
++            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++
++
++def only_json_document(stdout):
++    """Stdout must be exactly one JSON document and one newline."""
++    assert stdout.endswith("\n"), repr(stdout)
++    assert "\n" not in stdout[:-1], repr(stdout)
++    return json.loads(stdout)
++
++
++def test_text_output_is_the_assistant_text_without_the_new_options(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("plain answer")])
++    done = Harness(daimonos_binary, tmp_path, provider.port).agent("say something")
++    assert done.returncode == 0, done.stderr
++    assert done.stdout == "plain answer\n"
++
++
++def test_output_json_is_the_only_stdout_content_when_a_tool_child_prints(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([
++        tool_reply("exec", {"command": "echo", "args": ["CHILD_STDOUT_MARKER"]}),
++        text_reply("finished", usage={"prompt_tokens": 120, "completion_tokens": 9,
++                                      "prompt_tokens_details": {"cached_tokens": 100}}),
++    ])
++    done = Harness(daimonos_binary, tmp_path, provider.port).agent("--output", "json", "run echo")
++    assert done.returncode == 0, done.stderr
++
++    doc = only_json_document(done.stdout)
++    assert "CHILD_STDOUT_MARKER" not in done.stdout
++    # The tool ran: its output reached the model as a tool result.
++    assert "CHILD_STDOUT_MARKER" in json.dumps(provider.requests[1]["messages"])
++    assert doc["schema_version"] == 1
++    assert doc["provider"] == "openrouter"
++    assert doc["model"] == "test/model"
++    assert doc["stop_reason"] == "end_turn"
++    assert doc["final_text"] == "finished"
++    assert doc["session_id"] is None and doc["session_saved"] is None and doc["resumed"] is False
++    # Two calls: (1 + 1) and (20 non-cached + 100 cached, 9 output).
++    assert doc["usage"]["input_tokens"] == 21
++    assert doc["usage"]["output_tokens"] == 10
++    assert doc["usage"]["cache_read_tokens"] == 100
++
++
++def test_output_json_reports_a_provider_error_and_exits_non_zero(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([http_error(400, "bad request from the fake provider")])
++    done = Harness(daimonos_binary, tmp_path, provider.port).agent("--output", "json", "go")
++    assert done.returncode == 1, done.stderr
++
++    doc = only_json_document(done.stdout)
++    assert doc["stop_reason"] == "error"
++    assert "bad request from the fake provider" in doc["error_message"]
++    assert doc["context_overflow"] is False
++    assert doc["final_text"] == ""
++
++
++def test_output_json_reports_a_context_overflow(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([http_error(400, "This model's maximum context length is 10 tokens.")])
++    done = Harness(daimonos_binary, tmp_path, provider.port).agent("--output", "json", "go")
++    assert done.returncode == 1, done.stderr
++
++    doc = only_json_document(done.stdout)
++    assert doc["stop_reason"] == "error"
++    assert doc["context_overflow"] is True
++    # No compaction and no retry: one request reached the provider.
++    assert len(provider.requests) == 1
++
++
++# --- named sessions (--session-id) ---
++
++def refusal(done):
++    """A refused run: exit 2, nothing on stdout, one JSON error on stderr."""
++    assert done.returncode == 2, (done.returncode, done.stderr)
++    assert done.stdout == ""
++    errors = [json.loads(line) for line in done.stderr.splitlines() if line.startswith("{")]
++    assert len(errors) == 1, done.stderr
++    assert errors[0]["error"]["code"] == "run_configuration_invalid"
++    return errors[0]["error"]
++
++
++def session_rows(database):
++    with sqlite3.connect(database) as db:
++        return db.execute("SELECT session_id, generation, payload FROM sessions ORDER BY session_id").fetchall()
++
++
++def test_session_id_saves_a_session_and_refuses_the_same_id_again(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FIRST"), text_reply("NEVER SENT")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
++
++    first = harness.agent("--session-id", "run-1", "first task")
++    assert first.returncode == 0, first.stderr
++    assert first.stdout == "FIRST\n"
++    rows = session_rows(database)
++    assert [(row[0], row[1]) for row in rows] == [("run-1", 1)]
++    record = json.loads(rows[0][2])
++    assert record["model"] == "test/model"
++    assert record["prefix"]["provider"] == "openrouter"
++    assert [message["role"].lower() for message in record["messages"]] == ["user", "assistant"]
++    # chat does not list a one-shot session.
++    assert not (harness.home / ".daimonos" / "chat-sessions").exists()
++
++    second = harness.agent("--session-id", "run-1", "second task")
++    error = refusal(second)
++    assert error["reason"] == "session_exists"
++    assert len(provider.requests) == 1, "a refused run must not call the provider"
++    assert session_rows(database) == rows, "a refused run must not change the record"
++
++
++def test_an_invalid_session_id_is_refused_before_any_store_access(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("NEVER SENT")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    for bad in ["has space", "dot.dot", "a" * 129]:
++        error = refusal(harness.agent("--session-id", bad, "task"))
++        assert error["reason"] == "session_id_invalid"
++    assert provider.requests == []
++    assert not (harness.home / ".daimonos" / "oneshot-sessions").exists()
++
++
++def test_a_selected_state_root_holds_the_session_store(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FIRST")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    state = tmp_path / "state"
++    state.mkdir(mode=0o700)
++    # A selected state root refuses a log directory outside it, so this run
++    # uses the default log placement under the state root.
++    harness.config.write_text("[analytics]\nenabled=false\n")
++
++    done = harness.agent("--session-id", "run-1", "first task", global_args=("--state-dir", str(state)))
++    assert done.returncode == 0, done.stderr
++    assert [row[0] for row in session_rows(state / "sessions" / "oneshot" / "sessions.sqlite3")] == ["run-1"]
++    assert not (harness.home / ".daimonos" / "oneshot-sessions").exists()
++
++
++def test_output_json_names_the_saved_session(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FIRST")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    done = harness.agent("--session-id", "run-1", "--output", "json", "first task")
++    assert done.returncode == 0, done.stderr
++    doc = only_json_document(done.stdout)
++    assert (doc["session_id"], doc["resumed"], doc["session_saved"], doc["session_error"]) == ("run-1", False, True, None)
++
++
++# --- resumed sessions (--resume) ---
++
++def held(reply):
++    """A reply that the provider sends only after the returned event is set."""
++    gate = threading.Event()
++    return dict(reply, hold=gate), gate
++
++
++def wait_for_requests(provider, count):
++    deadline = time.monotonic() + 30
++    while len(provider.requests) < count:
++        assert time.monotonic() < deadline, f"the provider received {len(provider.requests)} request(s)"
++        time.sleep(0.02)
++
++
++def ordered(value):
++    """Serialize with the received key order, so equality also compares order."""
++    return json.dumps(value)
++
++
++def add_workspace_skill(harness):
++    """Change the workspace so that a rebuilt system prompt differs."""
++    skill = harness.workspace / ".agents" / "skills" / "probe"
++    skill.mkdir(parents=True)
++    (skill / "SKILL.md").write_text("---\nname: probe\ndescription: resume prefix probe\n---\nbody\n")
++
++
++def test_resume_sends_the_same_prefix_and_only_the_new_input(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FIRST"), text_reply("SECOND"), text_reply("CONTROL")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++
++    first = harness.agent("--session-id", "run-1", "first task")
++    assert first.returncode == 0, first.stderr
++    add_workspace_skill(harness)
++    second = harness.agent("--resume", "run-1", "the tests failed: E1")
++    assert second.returncode == 0, second.stderr
++    # Only the assistant text of this invocation.
++    assert second.stdout == "SECOND\n"
++    # Control: a new session in the changed workspace gets another system prompt.
++    control = harness.agent("--session-id", "run-2", "first task")
++    assert control.returncode == 0, control.stderr
++
++    one, two, three = provider.requests
++    assert ordered(three["messages"][0]) != ordered(one["messages"][0]), \
++        "control: the workspace change must alter a rebuilt system prompt"
++    assert one["messages"][0]["role"] == "system"
++    assert ordered(two["tools"]) == ordered(one["tools"])
++    earlier = len(one["messages"])
++    assert ordered(two["messages"][:earlier]) == ordered(one["messages"])
++    added = two["messages"][earlier:]
++    assert [message["role"] for message in added] == ["assistant", "user"]
++    assert "FIRST" in ordered(added[0])
++    assert "the tests failed: E1" in ordered(added[1])
++    assert two["model"] == one["model"]
++
++
++def test_resume_refuses_another_model_another_provider_and_an_unknown_id(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FIRST"), text_reply("NEVER SENT")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
++    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
++    before = session_rows(database)
++
++    model = refusal(harness.agent("--resume", "run-1", "--model", "other/model", "more"))
++    assert model["reason"] == "session_model_mismatch"
++    assert "test/model" in model["message"] and "other/model" in model["message"]
++    other_provider = refusal(harness.agent("--resume", "run-1", "--provider", "openai", "more"))
++    assert other_provider["reason"] == "session_provider_mismatch"
++    unknown = refusal(harness.agent("--resume", "run-9", "more"))
++    assert unknown["reason"] == "session_not_found"
++
++    assert len(provider.requests) == 1, "a refused run must not call the provider"
++    assert session_rows(database) == before
++    # The saved model, named explicitly, is accepted.
++    same = harness.agent("--resume", "run-1", "--model", "test/model", "more")
++    assert same.returncode == 0, same.stderr
++
++
++def test_a_second_resume_of_a_running_session_is_refused(daimonos_binary, tmp_path, fake_provider):
++    slow, gate = held(text_reply("SECOND"))
++    provider = fake_provider([text_reply("FIRST"), slow, text_reply("NEVER SENT")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
++
++    running = harness.start("--resume", "run-1", "second task")
++    try:
++        wait_for_requests(provider, 2)
++        error = refusal(harness.agent("--resume", "run-1", "third task"))
++        assert error["reason"] == "session_owned_elsewhere"
++        assert str(running.pid) in error["message"]
++    finally:
++        gate.set()
++        stdout, stderr = running.communicate(timeout=30)
++    assert running.returncode == 0, stderr
++    assert stdout == "SECOND\n"
++    assert len(provider.requests) == 2, "the refused run must not call the provider"
++    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
++    assert [(row[0], row[1]) for row in session_rows(database)] == [("run-1", 2)]
++
++
++def test_a_failed_save_exits_non_zero_after_the_json_document(daimonos_binary, tmp_path, fake_provider):
++    slow, gate = held(text_reply("FIRST"))
++    provider = fake_provider([slow])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++
++    running = harness.start("--session-id", "run-1", "--output", "json", "first task")
++    try:
++        wait_for_requests(provider, 1)
++        # Remove the store while the run is in flight, so the save cannot find its writer.
++        shutil.rmtree(harness.home / ".daimonos" / "oneshot-sessions")
++    finally:
++        gate.set()
++        stdout, stderr = running.communicate(timeout=30)
++    assert running.returncode == 1, (running.returncode, stderr)
++    doc = only_json_document(stdout)
++    assert doc["stop_reason"] == "end_turn"
++    assert (doc["session_id"], doc["session_saved"]) == ("run-1", False)
++    assert doc["session_error"]
++    assert "session run-1 was not saved" in stderr
++
++
++def test_resume_json_reports_this_invocation_only(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([
++        text_reply("FIRST", usage={"prompt_tokens": 900, "completion_tokens": 50}),
++        text_reply("SECOND", usage={"prompt_tokens": 1000, "completion_tokens": 7,
++                                    "prompt_tokens_details": {"cached_tokens": 940}}),
++    ])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
++    done = harness.agent("--resume", "run-1", "--output", "json", "second task")
++    assert done.returncode == 0, done.stderr
++    doc = only_json_document(done.stdout)
++    assert (doc["session_id"], doc["resumed"], doc["session_saved"]) == ("run-1", True, True)
++    assert doc["final_text"] == "SECOND"
++    assert doc["turns"] == 1
++    assert doc["usage"]["input_tokens"] == 60
++    assert doc["usage"]["cache_read_tokens"] == 940
++    assert doc["usage"]["output_tokens"] == 7
++
++
++# --- edge cases of the plan ("Error and edge behavior") ---
++
++def test_a_refused_run_prints_no_json_document(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("NEVER SENT")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    # `refusal` checks that stdout is empty: the run did not start, so it has no document.
++    error = refusal(harness.agent("--resume", "run-9", "--output", "json", "more"))
++    assert error["reason"] == "session_not_found"
++    assert provider.requests == []
++
++
++def test_a_session_can_be_resumed_after_a_failed_run(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([http_error(400, "bad request from the fake provider"), text_reply("RECOVERED")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++
++    failed = harness.agent("--session-id", "run-1", "--output", "json", "first task")
++    assert failed.returncode == 1, failed.stderr
++    doc = only_json_document(failed.stdout)
++    assert (doc["stop_reason"], doc["session_saved"]) == ("error", True)
++    # The failed first run consumed the id (ADR-036 Decision 8).
++    assert refusal(harness.agent("--session-id", "run-1", "first task"))["reason"] == "session_exists"
++
++    resumed = harness.agent("--resume", "run-1", "try again")
++    assert resumed.returncode == 0, resumed.stderr
++    assert resumed.stdout == "RECOVERED\n"
++    # The failed call left no assistant content. The saved history ends with
++    # the first user message, so the resumed request has two user messages in
++    # sequence and no empty assistant message.
++    resumed_messages = provider.requests[-1]["messages"]
++    assert [message["role"] for message in resumed_messages] == ["system", "user", "user"]
++    assert "first task" in ordered(resumed_messages[1])
++    assert "try again" in ordered(resumed_messages[2])
++
++
++def test_a_killed_run_saves_nothing_and_frees_the_id(daimonos_binary, tmp_path, fake_provider):
++    slow, gate = held(text_reply("NEVER RECEIVED"))
++    provider = fake_provider([slow, text_reply("AFTER KILL")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++
++    running = harness.start("--session-id", "run-1", "first task")
++    try:
++        wait_for_requests(provider, 1)
++        running.kill()
++        running.communicate(timeout=30)
++    finally:
++        gate.set()
++    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
++    assert session_rows(database) == [], "a killed run must not leave a record"
++
++    again = harness.agent("--session-id", "run-1", "first task")
++    assert again.returncode == 0, again.stderr
++    assert again.stdout == "AFTER KILL\n"

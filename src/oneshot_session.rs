@@ -758,7 +758,17 @@ mod tests {
         let record: PrefixRecord =
             serde_json::from_str(r#"{"provider":"mock","system":"s","tools":[]}"#).unwrap();
         assert_eq!(record.endpoint, "");
-        assert_ne!(record.endpoint, endpoint_digest("", []));
+        // The refusal rests on this: a digest is never the empty string, for
+        // any input, so an absent digest never equals the digest of a run.
+        for digest in [
+            endpoint_digest("", []),
+            endpoint_digest("  ", [("", "")]),
+            endpoint_digest("https://a.example", [("openai", "")]),
+        ] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert_ne!(record.endpoint, digest);
+        }
     }
 
     #[test]

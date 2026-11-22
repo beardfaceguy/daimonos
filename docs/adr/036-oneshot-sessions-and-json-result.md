@@ -138,6 +138,16 @@ The field `usage.thinking_bytes` is the count of thinking bytes that the provide
 - A CLI parse test: the top-level `--session-id` and `agent --session-id` parse as two separate values.
 - `cargo test` and `python3 -m pytest tests/ -v` pass.
 
+Tests added by the code review of 2026-11-22 (rules: "Changes after the code review"):
+
+- Endpoint: `oneshot_session::tests::a_resume_on_another_model_provider_or_endpoint_is_refused`, `the_endpoint_digest_covers_each_base_url_and_ignores_trailing_slashes`, `a_record_without_an_endpoint_digest_is_refused_on_resume`, and the process test `test_resume_refuses_another_endpoint_with_the_same_provider_name`.
+- Saved history: the three `resumable_history` tests in `oneshot_session::tests`, the six `agent_cmd::tests::a_session_is_resumable_after_*` tests, and `providers::anthropic::tests::build_request_drops_an_assistant_message_with_only_provider_state`.
+- Two user messages in sequence: `providers::anthropic::tests::build_request_keeps_two_user_messages_in_sequence` and `providers::openrouter::tests::messages_to_wire_keeps_two_user_messages_in_sequence`.
+- One document: `agent_cmd::tests::output_json_prints_the_document_before_a_thought_log_failure` and `output_json_writes_the_document_in_one_write_or_not_at_all`.
+- Pruning: `agent_cmd::tests::a_session_run_that_prunes_results_marks_and_saves_the_pruned_list`.
+- Tool digest and tool list: `oneshot_session::tests::a_tool_digest_does_not_depend_on_the_key_order_of_the_schema` and the process test `test_a_changed_tool_list_refuses_the_resume_with_exit_code_2`.
+- All process tests are in `tests/test_agent_oneshot_sessions.py`.
+
 ## Anchors
 
 _Anchors:_ src/agent_cmd.rs::run_agent, src/agent_runtime.rs::run_agent, src/agent_runtime.rs::check_agent_result, src/cli.rs::AgentArgs, src/session_store.rs::PersistedSession, src/session_store.rs::SessionStore::claim_writer, src/session_store.rs::SessionStore::load_result, src/session_store.rs::SessionStore::write_record, src/state_root.rs::SessionStoreKind, src/state_root.rs::StateAuthority::verify_session_store, src/agent.rs::run, src/agent.rs::AgentResult, src/tool_output.rs::microcompact_history, src/providers/mod.rs::Context, src/providers/mod.rs::StopReason::as_str, src/providers/anthropic.rs::build_request_with_cache, src/providers/openrouter.rs::apply_prompt_cache, src/prompts.rs::agent_system_for_workspace, src/analytics.rs::AnalyticsStore::record_agent_run, src/analytics.rs::migrate_schema, src/evidence.rs::EvidenceLedger::status, src/chat_cmd.rs::resolve_model, src/oneshot_session.rs::open, src/oneshot_session.rs::OpenSession::check_tools, src/oneshot_session.rs::PrefixRecord, src/agent_cmd.rs::run_agent_with, src/agent_cmd.rs::RunReport, src/agent_runtime.rs::open_oneshot_session
