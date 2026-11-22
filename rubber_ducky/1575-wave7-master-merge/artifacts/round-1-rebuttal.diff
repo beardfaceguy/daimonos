@@ -1,0 +1,344 @@
+diff --git a/docs/runtime-modes.md b/docs/runtime-modes.md
+index d0c9c70..efcb5ae 100644
+--- a/docs/runtime-modes.md
++++ b/docs/runtime-modes.md
+@@ -59,12 +59,26 @@ Combinations with the reviewer-runtime options:
+ - `--session-id` and `--resume` are refused with `--final-output`,
+   `--model-profile`, and `--worker-config`. These combinations are not built.
+   The session record does not hold the endpoint of a model profile.
+-- `--output json` is refused with `--final-output`. Both options own stdout.
+-  ADR-036 Decision 14 defines the combination. It is not built.
++- `--output json` is refused with `--final-output` and with
++  `--capability-probe-payload` (a probe requires `--final-output`). Both
++  `--output json` and `--final-output` own stdout. ADR-036 Decision 14 defines
++  the combination. It is not built.
+ - `--output json` works with `--model-profile`. The field `provider` is then
+   the `provider_label` of the profile.
+-- `--output json` with `--worker-config` or `--audit-path` is accepted. No test
+-  covers these two combinations. The top-level `--session-id` (before
++- `--output json` works with `--audit-path`. The run writes the `run_end`
++  audit event before the document reaches stdout. A failed session save still
++  prints the document, exits with code 1, and is recorded as `error`.
++- `--output json` works with `--worker-config`. A worker that is lost during
++  the run gives a document with `stop_reason: "error"` and exit code 22. A
++  worker run that does not start (a worker cannot start, or an allowlist entry
++  names no worker tool) prints no document and exits with code 22 or 2.
++- A session works with `--tool-allowlist`. The allowlist changes the offered
++  tools, so a resume needs the same allowlist.
++- `--workspace-read-only` does not change the offered tools. It belongs to the
++  run, not to the session: a resume can use another setting than the first run.
++- A run that fails before the agent loop (for example, the thought log cannot
++  be opened) saves nothing. The id of a new session stays free, and a resumed
++  session is unchanged. The top-level `--session-id` (before
+ `agent`) is a different option: it filters `--stats`.
+ 
+ **Sessions**
+diff --git a/src/agent_cmd.rs b/src/agent_cmd.rs
+index 7a1c5c1..21aa969 100644
+--- a/src/agent_cmd.rs
++++ b/src/agent_cmd.rs
+@@ -502,6 +502,15 @@ pub async fn run_agent_with(
+     // ADR-036 Decision 5: a resumed session keeps its request prefix. It runs
+     // on the saved model and thinking level with the saved system prompt, and
+     // a different tool list is refused before any provider call.
++    //
++    // Order: `tools` is complete here. It already holds a final-answer tool
++    // (WP05), so a session with `--final-output` would digest that tool too.
++    // The CLI refuses that combination today. If ADR-036 Decision 14 is built,
++    // decide if the final-answer tool is a part of the saved prefix.
++    debug_assert!(
++        options.session.is_none() || args.final_output.is_none(),
++        "a one-shot session with --final-output is refused by the CLI"
++    );
+     if let Some(session) = &options.session {
+         session.check_tools(&tools)?;
+     }
+diff --git a/src/agent_runtime.rs b/src/agent_runtime.rs
+index 3a637af..fc4e4c3 100644
+--- a/src/agent_runtime.rs
++++ b/src/agent_runtime.rs
+@@ -361,6 +361,9 @@ pub async fn run_agent(
+     let session_request = oneshot_session_id
+         .map(crate::oneshot_session::SessionRequest::Start)
+         .or(resume.map(crate::oneshot_session::SessionRequest::Resume));
++    // One-shot sessions exist only in the print path below. They are not sent
++    // to the session daemon and are not a part of its launch identity
++    // (`session_bootstrap`): the options conflict with `--interactive`.
+     if let Some(request) = &session_request {
+         // ADR-036: a bad id is refused before any store or provider access.
+         crate::oneshot_session::validate_id(request.id())?;
+diff --git a/src/cli.rs b/src/cli.rs
+index 3433ab0..8f9ef6e 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -121,7 +121,14 @@ pub struct AgentArgs {
+         // `final_output`: ADR-036 Decision 14 (the document carries the
+         // validated final output) is not built. Until then the combination
+         // is refused, because both options own stdout.
+-        conflicts_with_all = ["interactive", "dry_run", "final_output"]
++        // `capability_probe_payload`: a probe requires `--final-output`, so
++        // it is refused here by name and not only through that rule.
++        conflicts_with_all = [
++            "interactive",
++            "dry_run",
++            "final_output",
++            "capability_probe_payload"
++        ]
+     )]
+     pub output: AgentOutputFormat,
+     /// Start a named one-shot session and save it when the run ends. A later
+@@ -882,6 +889,12 @@ mod tests {
+             }
+         }
+         assert!(refused(&["--output", "json", "--final-output", "f.json"]));
++        assert!(refused(&[
++            "--output",
++            "json",
++            "--capability-probe-payload",
++            "p.json"
++        ]));
+         // Combinations that stay available.
+         assert!(!refused(&["--final-output", "f.json"]));
+         assert!(!refused(&["--output", "json", "--model-profile", "p.json"]));
+diff --git a/tests/test_oneshot_reviewer_combinations.py b/tests/test_oneshot_reviewer_combinations.py
+new file mode 100644
+index 0000000..4e09f8b
+--- /dev/null
++++ b/tests/test_oneshot_reviewer_combinations.py
+@@ -0,0 +1,213 @@
++"""ADR-036 one-shot options together with the reviewer-runtime options.
++
++The combined tree has both the one-shot sessions and `--output json` (ADR-036)
++and the reviewer-runtime options (run audit, workers, tool allowlist, read-only
++workspace). Neither side was built with the other. These tests fix the behavior
++of each combination that the CLI accepts. Refused combinations are in
++`test_agent_oneshot_sessions.py`.
++"""
++import json
++import shutil
++import subprocess
++
++from test_agent_oneshot_sessions import (
++    Harness, fake_provider, held, http_error, only_json_document, refusal, session_rows, text_reply,
++    wait_for_requests,
++)
++from test_worker_isolation import CRASH_CALL, DONE, NOTE_CALL, _run as run_with_worker, _write_worker
++
++__all__ = ["fake_provider"]  # the fixture of the imported module
++
++
++def state_harness(daimonos_binary, tmp_path, port):
++    """A harness with a selected state root. The audit path must be inside it."""
++    harness = Harness(daimonos_binary, tmp_path, port)
++    harness.config.write_text("[analytics]\nenabled=false\n")
++    state = tmp_path / "state"
++    state.mkdir(mode=0o700)
++    audit = state / "audit" / "run.jsonl"
++    return harness, state, audit, ("--state-dir", str(state), "--audit-path", str(audit))
++
++
++def run_end(audit):
++    events = [json.loads(line) for line in audit.read_text().splitlines() if line.strip()]
++    assert events[0]["kind"] == "run_start", events[0]
++    ends = [event for event in events if event["kind"] == "run_end"]
++    assert len(ends) == 1 and events[-1] is ends[0], events
++    return ends[0]["status"], ends[0]["exit_code"]
++
++
++# --- run audit (WP08): stdout is buffered until the run_end event is written ---
++
++def test_audit_with_output_json_prints_one_document_and_a_matching_run_end(daimonos_binary, tmp_path, fake_provider):
++    for index, (reply, stop_reason, exit_code, status) in enumerate([
++            (text_reply("FINE"), "end_turn", 0, "ok"),
++            (http_error(400, "bad request from the fake provider"), "error", 1, "error")]):
++        provider = fake_provider([reply])
++        harness, _, audit, global_args = state_harness(daimonos_binary, tmp_path / str(index), provider.port)
++        done = harness.agent("--output", "json", "task", global_args=global_args)
++        assert done.returncode == exit_code, done.stderr
++        assert only_json_document(done.stdout)["stop_reason"] == stop_reason
++        assert run_end(audit) == (status, exit_code)
++
++
++def test_audit_with_a_session_saves_and_resumes(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FIRST"), text_reply("SECOND")])
++    harness, state, audit, global_args = state_harness(daimonos_binary, tmp_path, provider.port)
++    first = harness.agent("--session-id", "run-1", "--output", "json", "first task", global_args=global_args)
++    assert first.returncode == 0, first.stderr
++    assert only_json_document(first.stdout)["session_saved"] is True
++    assert run_end(audit) == ("ok", 0)
++    audit.unlink()
++    second = harness.agent("--resume", "run-1", "more", global_args=global_args)
++    assert second.returncode == 0, second.stderr
++    assert second.stdout == "SECOND\n"
++    assert run_end(audit) == ("ok", 0)
++    rows = session_rows(state / "sessions" / "oneshot" / "sessions.sqlite3")
++    assert [(row[0], row[1]) for row in rows] == [("run-1", 2)]
++
++
++def test_audit_with_a_failed_session_save_still_prints_the_document(daimonos_binary, tmp_path, fake_provider):
++    # The run function returns an error after it wrote the document into the
++    # audit buffer. The buffer must reach stdout, the exit code is 1, and the
++    # run_end event records the same failure.
++    slow, gate = held(text_reply("FIRST"))
++    provider = fake_provider([slow])
++    harness, state, audit, global_args = state_harness(daimonos_binary, tmp_path, provider.port)
++    running = subprocess.Popen(
++        harness.command("--session-id", "run-1", "--output", "json", "task", global_args=global_args),
++        cwd=harness.workspace, env=harness.environment(), stdin=subprocess.DEVNULL,
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    try:
++        wait_for_requests(provider, 1)
++        shutil.rmtree(state / "sessions" / "oneshot")
++    finally:
++        gate.set()
++        stdout, stderr = running.communicate(timeout=30)
++    assert running.returncode == 1, stderr
++    doc = only_json_document(stdout)
++    assert (doc["stop_reason"], doc["session_id"], doc["session_saved"]) == ("end_turn", "run-1", False)
++    assert "session run-1 was not saved" in stderr
++    assert run_end(audit) == ("error", 1)
++
++
++# --- workers (WP10) ---
++
++def test_output_json_with_a_lost_worker_prints_the_document_and_exits_22(daimonos_binary, tmp_path):
++    for index, with_audit in enumerate([False, True]):
++        case = tmp_path / str(index)
++        case.mkdir()
++        config, _, calls = _write_worker(case)
++        audit = case / "state" / "audit.jsonl" if with_audit else None
++        done = run_with_worker(
++            daimonos_binary, case, [{"calls": [CRASH_CALL]}, {"calls": [NOTE_CALL]}, DONE],
++            worker_config=config, audit_path=audit, extra_agent_args=("--output", "json"))
++        # The loop returned a result (the worker died during the run), so the
++        # document is printed. The exit code is the worker code of WP10.
++        assert done.returncode == 22, done.stderr
++        doc = only_json_document(done.stdout)
++        assert (doc["stop_reason"], doc["final_text"]) == ("error", "")
++        assert "worker_unavailable" in doc["error_message"]
++        errors = [json.loads(line) for line in done.stderr.splitlines() if line.startswith('{"error"')]
++        assert [error["error"]["code"] for error in errors] == ["worker_unavailable"]
++        assert "read_note" not in (calls.read_text().split() if calls.exists() else [])
++        if with_audit:
++            assert run_end(audit) == ("worker_unavailable", 22)
++
++
++def test_output_json_with_a_worker_prints_the_document_of_a_successful_run(daimonos_binary, tmp_path):
++    config, _, calls = _write_worker(tmp_path)
++    done = run_with_worker(
++        daimonos_binary, tmp_path, [{"calls": [NOTE_CALL]}, DONE],
++        worker_config=config, extra_agent_args=("--output", "json"))
++    assert done.returncode == 0, done.stderr
++    doc = only_json_document(done.stdout)
++    assert (doc["stop_reason"], doc["final_text"]) == ("end_turn", "done")
++    assert "read_note" in calls.read_text().split()
++
++
++def test_output_json_prints_no_document_when_a_worker_run_does_not_start(daimonos_binary, tmp_path):
++    # A worker that cannot start, and an allowlist entry that no worker serves,
++    # end the run before the agent loop. The loop returned no result, so no
++    # document is printed. The exit codes are those of WP10.
++    config = tmp_path / "gone.json"
++    config.write_text(json.dumps({"workers": {"gone": {"command": str(tmp_path / "does-not-exist"), "env": {}}}}))
++    gone = tmp_path / "gone"
++    gone.mkdir()
++    done = run_with_worker(daimonos_binary, gone, [DONE], worker_config=config,
++                           extra_agent_args=("--output", "json"))
++    assert (done.returncode, done.stdout) == (22, ""), done.stderr
++
++    unknown = tmp_path / "unknown"
++    unknown.mkdir()
++    config, _, _ = _write_worker(unknown)
++    done = run_with_worker(daimonos_binary, unknown, [DONE], worker_config=config,
++                           allowlist=["mcp__toolside__read_note", "mcp__ghost__missing"],
++                           extra_agent_args=("--output", "json"))
++    assert (done.returncode, done.stdout) == (2, ""), done.stderr
++    assert "tool_allowlist_unknown_entry" in done.stderr
++
++
++# --- sessions with run policy options ---
++
++def test_a_session_keeps_its_tool_allowlist(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("A"), text_reply("B"), text_reply("NEVER SENT")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    allow = tmp_path / "allow.json"
++    allow.write_text(json.dumps(["read_file", "search"]))
++    with_list = ("--tool-allowlist", str(allow))
++
++    assert harness.agent("--session-id", "run-1", "task", global_args=with_list).returncode == 0
++    offered = [tool["function"]["name"] for tool in provider.requests[0]["tools"]]
++    assert offered == ["read_file", "search"]
++    assert harness.agent("--resume", "run-1", "more", global_args=with_list).returncode == 0
++    assert json.dumps(provider.requests[1]["tools"]) == json.dumps(provider.requests[0]["tools"])
++    # Without the allowlist the tool list differs, so the prefix cannot be reproduced.
++    assert refusal(harness.agent("--resume", "run-1", "more"))["reason"] == "session_tools_changed"
++    assert len(provider.requests) == 2
++
++
++def test_the_read_only_policy_belongs_to_the_run_not_to_the_session(daimonos_binary, tmp_path, fake_provider):
++    # `--workspace-read-only` does not change the offered tools: it refuses a
++    # write when the tool runs. So the request prefix is equal with and without
++    # it, and a resume can use another policy than the first run. The session
++    # record holds the request prefix, not the run policy.
++    provider = fake_provider([text_reply("A"), text_reply("B")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    assert harness.agent("--session-id", "run-1", "task", global_args=("--workspace-read-only",)).returncode == 0
++    done = harness.agent("--resume", "run-1", "more")
++    assert done.returncode == 0, done.stderr
++    assert json.dumps(provider.requests[1]["tools"]) == json.dumps(provider.requests[0]["tools"])
++    assert json.dumps(provider.requests[1]["messages"][0]) == json.dumps(provider.requests[0]["messages"][0])
++
++
++# --- a failure before the agent loop, after the session was claimed ---
++
++def test_a_failure_before_the_loop_saves_nothing_and_keeps_the_session_usable(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FIRST"), text_reply("SECOND")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
++    # The thought log cannot be opened: its parent is a regular file. The run
++    # ends after the session was claimed and before the first model request.
++    blocker = tmp_path / "a-file"
++    blocker.write_text("")
++    bad_log = ("--debug-thoughts", "--debug-thoughts-path", str(blocker / "thoughts.log"))
++
++    failed = harness.agent("--session-id", "run-1", "--output", "json", *bad_log, "task")
++    assert failed.returncode == 1, failed.stderr
++    assert failed.stdout == "", "the loop returned no result, so no document is printed"
++    assert "thought log" in failed.stderr
++    assert provider.requests == []
++    assert session_rows(database) == [], "a run that did not reach the loop consumes no id"
++
++    started = harness.agent("--session-id", "run-1", "task")
++    assert started.returncode == 0, started.stderr
++    before = session_rows(database)
++    assert [(row[0], row[1]) for row in before] == [("run-1", 1)]
++
++    failed = harness.agent("--resume", "run-1", *bad_log, "more")
++    assert failed.returncode == 1, failed.stderr
++    assert session_rows(database) == before, "a failed resume before the loop changes nothing"
++    resumed = harness.agent("--resume", "run-1", "more")
++    assert resumed.returncode == 0, resumed.stderr
++    assert resumed.stdout == "SECOND\n"
+diff --git a/tests/test_worker_isolation.py b/tests/test_worker_isolation.py
+index 7b2ad94..5cb3be6 100644
+--- a/tests/test_worker_isolation.py
++++ b/tests/test_worker_isolation.py
+@@ -296,7 +296,8 @@ def _offered_tool_names(body):
+ 
+ def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
+          audit_path=None, read_only=False, task="do the work",
+-         final_output=None, extra_config="", port_file=None, offers_out=None):
++         final_output=None, extra_config="", port_file=None, offers_out=None,
++         extra_agent_args=()):
+     mock = _MockChat(turns)
+     try:
+         if port_file is not None:
+@@ -338,7 +339,7 @@ def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
+             argv += ["--worker-config", str(worker_config)]
+         if final_output is not None:
+             argv += ["--final-output", str(final_output)]
+-        argv += ["--agent-env", str(agent_env), "--print", task]
++        argv += [*extra_agent_args, "--agent-env", str(agent_env), "--print", task]
+         # The credential is a real env var of the MODEL-SIDE process, so clearing
+         # it for the worker is a meaningful guarantee (AC-05.1), plus a second
+         # independent carrier that is not a known provider var.
