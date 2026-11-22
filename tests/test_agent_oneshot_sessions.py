@@ -113,7 +113,7 @@ class Harness:
     def __init__(self, binary, tmp_path, port):
         self.binary = binary
         self.workspace = tmp_path / "workspace"
-        self.workspace.mkdir()
+        self.workspace.mkdir(parents=True)
         self.home = tmp_path / "home"
         self.home.mkdir()
         self.config = tmp_path / "config.toml"
@@ -511,3 +511,28 @@ def test_a_changed_tool_list_refuses_the_resume_with_exit_code_2(daimonos_binary
     error = refusal(harness.agent("--resume", "run-1", "--output", "json", "more"))
     assert error["reason"] == "session_tools_changed"
     assert len(provider.requests) == 1
+
+
+# --- exit codes by stop reason (docs/runtime-modes.md, "Exit codes") ---
+
+def finish(reason):
+    reply = text_reply("partial")
+    reply["finish_reason"] = reason
+    return reply
+
+
+def test_only_an_error_stop_reason_exits_non_zero(daimonos_binary, tmp_path, fake_provider):
+    cases = [
+        (finish("stop"), "end_turn", 0),
+        (finish("max_tokens"), "max_tokens", 0),
+        (finish("content_filter"), "refusal", 0),
+        (http_error(400, "bad request from the fake provider"), "error", 1),
+    ]
+    for index, (reply, stop_reason, exit_code) in enumerate(cases):
+        for json_output in (False, True):
+            provider = fake_provider([reply])
+            harness = Harness(daimonos_binary, tmp_path / f"case-{index}-{json_output}", provider.port)
+            done = harness.agent(*(["--output", "json"] if json_output else []), "task")
+            assert done.returncode == exit_code, (stop_reason, json_output, done.stderr)
+            if json_output:
+                assert only_json_document(done.stdout)["stop_reason"] == stop_reason

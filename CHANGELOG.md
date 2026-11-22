@@ -7,15 +7,65 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-22
+
+This release has the 13 PRs that merged after v0.1.5 (#252 to #263, and #284).
+
 ### Added
 
-- `daimonos agent --session-id <ID>` and `daimonos agent --resume <ID>`: named
-  one-shot sessions that a later run continues on the same provider and model,
-  with the same system prompt, tool list, and earlier messages (ADR-036).
-- `daimonos agent --output json`: one JSON result document on stdout for each
-  run, with the outcome and the token usage of that invocation. It is also
-  printed after a provider error and a context overflow.
-- `agent_runs.oneshot_session_id`: the named session of a one-shot run.
+- **One-shot sessions and a JSON result** (ADR-036, #284).
+  - `daimonos agent --session-id <ID>` and `daimonos agent --resume <ID>`:
+    named one-shot sessions that a later run continues on the same provider,
+    endpoint, and model, with the same system prompt, tool list, and earlier
+    messages.
+  - `daimonos agent --output json`: one JSON result document on stdout for
+    each run, with the outcome and the token usage of that invocation. It is
+    also printed after a provider error and a context overflow.
+  - `agent_runs.oneshot_session_id`: the named session of a one-shot run.
+  - Reference: `docs/runtime-modes.md`, section "One-shot sessions and the
+    JSON result".
+- **`git_read` tool** (ADR-017, #253): a separate, read-only tool for pinned
+  git reads. The `[git_read]` configuration section sets its limits.
+- **Strict git pinning** (ADR-018, ADR-019, #254): `git_read.strict_pinning`
+  requires explicit full commit identifiers. Status filters are isolated.
+- **Caller-owned state root** (ADR-021, #257, #258): `--state-dir PATH` puts
+  the state of a run under one root. It covers the MCP tool server, native
+  tool mode, `agent`, `chat`, ACP, the session daemon, session import and
+  export, OAuth status, and analytics statistics.
+- **Path confinement for local reads** (ADR-022, #259): `--confine-paths`
+  (root = workspace) and `--confine-root PATH`. The `[reviewer.tool_limits]`
+  section sets the symlink limits.
+- **ACP approval time limit and permission-mode lists** (ADR-034, #261).
+  - `acp.approval_timeout_secs` (default 120) denies a permission request that
+    the client does not answer.
+  - `DAIMONOS_AGENT_PERMISSION_MODE` (`null`, `allow_list`, `deny_list`) and
+    `DAIMONOS_AGENT_PERMISSION_LIST` in the agent env file.
+
+### Changed
+
+- **`exec` of git and gh uses the plugin policy** (#252). The argv form,
+  unmapped subcommands, and ACP-streamed calls now run with the non-interactive
+  environment of the plugin. Stdout and the exit code do not change.
+- **Evidence fingerprint** (ADR-035, #262): the evidence ledger hashes file
+  metadata and writes nothing. Before, it copied the workspace into a shadow
+  git repository on each turn.
+
+### Fixed
+
+- **ACP thread history stopped saving** (ADR-033, #260). A second process that
+  loaded a live session took its writer. One live process now owns a session,
+  and a second process is refused.
+- **ACP crash recovery** (#255): accepted prompts, completed provider messages,
+  and completed tool results are saved at recovery boundaries.
+- **ACP approval wait without a limit** (#261): a client that never answered a
+  permission request held the session.
+- **Leaked evidence store** (#262): killed turns left shadow repositories in
+  the state directory. Each process now removes the legacy store once.
+
+### Documentation
+
+- Accepted ADRs 021 to 032 and the reviewer-runtime glossary (#256).
+- Vikunja project URLs in `AGENTS.md` (#263).
 
 ## [0.1.5] - 2026-10-18
 

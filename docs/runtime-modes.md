@@ -104,10 +104,14 @@ and `--resume` conflict with each other. The top-level `--session-id` (before
 
 | Case | Exit code | Output |
 |---|---|---|
-| The run ended with `end_turn` | 0 | The document, or the assistant text |
-| The run ended with another stop reason | 1 | The document, when `--output json` is set |
+| The run ended with `end_turn`, `max_tokens`, `refusal`, or `aborted` | 0 | The document, or the assistant text |
+| The run ended with `error` (a provider error or a context overflow) | 1 | The document, when `--output json` is set |
 | The session was not saved | 1 | The document with `session_saved: false`, and a message on stderr |
 | The run was refused before it started | 2 | Nothing on stdout. One JSON line on stderr. |
+
+The exit code does not show if the work is complete: a truncated run
+(`max_tokens`) and a model refusal exit with code 0. Read `stop_reason` in the
+document. These exit codes are the same with and without the new options.
 
 A refusal has this form on stderr:
 
