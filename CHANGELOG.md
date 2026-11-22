@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- **Releases start from CI.** A merge to `master` that changes the version in
+  `Cargo.toml` creates the tag and starts the Release workflow. A merge that
+  keeps the version releases nothing.
+
 ## [0.1.6] - 2026-11-22
 
 This release has the 13 PRs that merged after v0.1.5 (#252 to #263, and #284).

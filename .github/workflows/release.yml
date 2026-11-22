@@ -1,5 +1,10 @@
 name: Release
 
+# Starts on a `v*` tag. ci.yml creates that tag after a merge to master that
+# changes the version (.github/scripts/release-on-merge.sh) and then starts this
+# workflow on the tag ref, because a tag that the workflow token creates does
+# not trigger it. A maintainer can also push a tag, or start the workflow
+# manually on a tag ref to run a failed release again.
 on:
   push:
     tags: ["v*"]
