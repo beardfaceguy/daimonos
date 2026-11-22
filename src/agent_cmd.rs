@@ -502,6 +502,15 @@ pub async fn run_agent_with(
     // ADR-036 Decision 5: a resumed session keeps its request prefix. It runs
     // on the saved model and thinking level with the saved system prompt, and
     // a different tool list is refused before any provider call.
+    //
+    // Order: `tools` is complete here. It already holds a final-answer tool
+    // (WP05), so a session with `--final-output` would digest that tool too.
+    // The CLI refuses that combination today. If ADR-036 Decision 14 is built,
+    // decide if the final-answer tool is a part of the saved prefix.
+    debug_assert!(
+        options.session.is_none() || args.final_output.is_none(),
+        "a one-shot session with --final-output is refused by the CLI"
+    );
     if let Some(session) = &options.session {
         session.check_tools(&tools)?;
     }

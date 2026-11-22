@@ -121,7 +121,14 @@ pub struct AgentArgs {
         // `final_output`: ADR-036 Decision 14 (the document carries the
         // validated final output) is not built. Until then the combination
         // is refused, because both options own stdout.
-        conflicts_with_all = ["interactive", "dry_run", "final_output"]
+        // `capability_probe_payload`: a probe requires `--final-output`, so
+        // it is refused here by name and not only through that rule.
+        conflicts_with_all = [
+            "interactive",
+            "dry_run",
+            "final_output",
+            "capability_probe_payload"
+        ]
     )]
     pub output: AgentOutputFormat,
     /// Start a named one-shot session and save it when the run ends. A later
@@ -882,6 +889,12 @@ mod tests {
             }
         }
         assert!(refused(&["--output", "json", "--final-output", "f.json"]));
+        assert!(refused(&[
+            "--output",
+            "json",
+            "--capability-probe-payload",
+            "p.json"
+        ]));
         // Combinations that stay available.
         assert!(!refused(&["--final-output", "f.json"]));
         assert!(!refused(&["--output", "json", "--model-profile", "p.json"]));

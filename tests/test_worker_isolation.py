@@ -296,7 +296,8 @@ def _offered_tool_names(body):
 
 def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
          audit_path=None, read_only=False, task="do the work",
-         final_output=None, extra_config="", port_file=None, offers_out=None):
+         final_output=None, extra_config="", port_file=None, offers_out=None,
+         extra_agent_args=()):
     mock = _MockChat(turns)
     try:
         if port_file is not None:
@@ -338,7 +339,7 @@ def _run(binary, tmp_path, turns, *, worker_config=None, allowlist=None,
             argv += ["--worker-config", str(worker_config)]
         if final_output is not None:
             argv += ["--final-output", str(final_output)]
-        argv += ["--agent-env", str(agent_env), "--print", task]
+        argv += [*extra_agent_args, "--agent-env", str(agent_env), "--print", task]
         # The credential is a real env var of the MODEL-SIDE process, so clearing
         # it for the worker is a meaningful guarantee (AC-05.1), plus a second
         # independent carrier that is not a known provider var.

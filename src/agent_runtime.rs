@@ -361,6 +361,9 @@ pub async fn run_agent(
     let session_request = oneshot_session_id
         .map(crate::oneshot_session::SessionRequest::Start)
         .or(resume.map(crate::oneshot_session::SessionRequest::Resume));
+    // One-shot sessions exist only in the print path below. They are not sent
+    // to the session daemon and are not a part of its launch identity
+    // (`session_bootstrap`): the options conflict with `--interactive`.
     if let Some(request) = &session_request {
         // ADR-036: a bad id is refused before any store or provider access.
         crate::oneshot_session::validate_id(request.id())?;

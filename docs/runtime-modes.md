@@ -59,12 +59,26 @@ Combinations with the reviewer-runtime options:
 - `--session-id` and `--resume` are refused with `--final-output`,
   `--model-profile`, and `--worker-config`. These combinations are not built.
   The session record does not hold the endpoint of a model profile.
-- `--output json` is refused with `--final-output`. Both options own stdout.
-  ADR-036 Decision 14 defines the combination. It is not built.
+- `--output json` is refused with `--final-output` and with
+  `--capability-probe-payload` (a probe requires `--final-output`). Both
+  `--output json` and `--final-output` own stdout. ADR-036 Decision 14 defines
+  the combination. It is not built.
 - `--output json` works with `--model-profile`. The field `provider` is then
   the `provider_label` of the profile.
-- `--output json` with `--worker-config` or `--audit-path` is accepted. No test
-  covers these two combinations. The top-level `--session-id` (before
+- `--output json` works with `--audit-path`. The run writes the `run_end`
+  audit event before the document reaches stdout. A failed session save still
+  prints the document, exits with code 1, and is recorded as `error`.
+- `--output json` works with `--worker-config`. A worker that is lost during
+  the run gives a document with `stop_reason: "error"` and exit code 22. A
+  worker run that does not start (a worker cannot start, or an allowlist entry
+  names no worker tool) prints no document and exits with code 22 or 2.
+- A session works with `--tool-allowlist`. The allowlist changes the offered
+  tools, so a resume needs the same allowlist.
+- `--workspace-read-only` does not change the offered tools. It belongs to the
+  run, not to the session: a resume can use another setting than the first run.
+- A run that fails before the agent loop (for example, the thought log cannot
+  be opened) saves nothing. The id of a new session stays free, and a resumed
+  session is unchanged. The top-level `--session-id` (before
 `agent`) is a different option: it filters `--stats`.
 
 **Sessions**
