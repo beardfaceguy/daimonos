@@ -7,13 +7,20 @@
 //! store directory. A resume must reproduce the request prefix (system prompt,
 //! tool list, earlier messages) or refuse: a silently different prefix misses
 //! the provider prompt cache that the resume exists for.
+//!
+//! Owner lock and tool child processes: the store opens the lock file
+//! close-on-exec, so a tool child does not keep the lock after its `exec`.
+//! Between `fork` and `exec` a child holds a copy of the lock for a moment.
+//! A run that ends in that moment can leave the lock held until the child
+//! calls `exec` or exits. The next resume is then refused with
+//! `session_owned_elsewhere`, and it succeeds on a retry.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::providers::{Message, ThinkingLevel, ToolSchema};
+use crate::providers::{ContentBlock, Message, Role, ThinkingLevel, ToolSchema};
 use crate::session_store::{
     PersistedSession, SessionStore, SessionStoreError, SessionWriteOutcome, SessionWriter,
 };
@@ -54,11 +61,103 @@ pub struct ToolDigest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefixRecord {
     pub provider: String,
+    /// [`endpoint_digest`] of the provider endpoints of the run. A provider
+    /// name does not identify an endpoint: two base URLs can have one name.
+    /// A digest, not the URL, because a URL can hold credentials.
+    #[serde(default)]
+    pub endpoint: String,
     /// The system prompt text, sent again as saved. It is never rebuilt,
     /// because the builder reads a workspace that the agent just edited.
     pub system: String,
     /// The tool list in request order.
     pub tools: Vec<ToolDigest>,
+}
+
+/// Hex SHA-256 over the base URLs that a run can send the conversation to:
+/// the primary base URL, then each secondary provider as (name, base URL), in
+/// configuration order. An empty base URL is the default endpoint of its
+/// adapter. Surrounding whitespace and trailing slashes do not count.
+pub fn endpoint_digest<'a>(
+    primary_base_url: &str,
+    secondaries: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    fn normal(url: &str) -> &str {
+        url.trim().trim_end_matches('/')
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(normal(primary_base_url).as_bytes());
+    for (name, base_url) in secondaries {
+        hasher.update([0u8]);
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(normal(base_url).as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// The history that a session save stores (ADR-036 Decision 8).
+///
+/// The run saves for each stop reason, and a resume sends the saved messages
+/// again as they are. So the saved history must be one that a provider
+/// accepts with a new user message after it:
+///
+/// 1. Trailing assistant messages without content for the provider are not
+///    saved. Such a message has no text other than whitespace, no tool call,
+///    and no image: it is empty, or it holds only thinking and provider
+///    state. A failed, truncated, or aborted call leaves one. Providers
+///    reject it, or an adapter drops it and the request prefix changes.
+/// 2. Each tool call has a result. The loop closes open tool calls on its
+///    terminal paths. The save does it again, so that the rule does not
+///    depend on each return path of the loop.
+///
+/// Truncated text after `max_tokens` is content and is saved. A history can
+/// end with a user message. The next resume then sends two user messages in
+/// sequence, which the adapters send in order.
+pub fn resumable_history(messages: &[Message]) -> Vec<Message> {
+    fn has_provider_content(message: &Message) -> bool {
+        message.content.iter().any(|block| match block {
+            ContentBlock::Text(text) => !text.trim().is_empty(),
+            ContentBlock::ToolCall { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. } => true,
+            ContentBlock::Thinking(_) | ContentBlock::ProviderState { .. } => false,
+        })
+    }
+    let mut kept = messages;
+    while let [earlier @ .., last] = kept {
+        if last.role == Role::Assistant && !has_provider_content(last) {
+            kept = earlier;
+        } else {
+            break;
+        }
+    }
+    crate::agent::close_orphan_tool_calls(kept.to_vec())
+}
+
+/// JSON text with the keys of each object in sorted order.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::Value::String(key.clone()),
+                        canonical_json(&map[key])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        scalar => scalar.to_string(),
+    }
 }
 
 /// Digest each tool definition, in request order.
@@ -69,9 +168,11 @@ pub fn tool_digests(tools: &[ToolSchema]) -> Vec<ToolDigest> {
             let mut hasher = Sha256::new();
             hasher.update(tool.description.as_bytes());
             hasher.update([0u8]);
-            // `serde_json::Value` serializes object keys in a stable order,
-            // so equal schemas give equal bytes.
-            hasher.update(serde_json::to_vec(&tool.input_schema).unwrap_or_default());
+            // Equal schemas must give equal bytes, also when their keys were
+            // inserted in another order and when a build enables the
+            // `preserve_order` feature of serde_json. So the keys are sorted
+            // here, not left to the map type of `serde_json::Value`.
+            hasher.update(canonical_json(&tool.input_schema).as_bytes());
             ToolDigest {
                 name: tool.name.clone(),
                 sha256: hex::encode(hasher.finalize()),
@@ -119,6 +220,17 @@ impl Refusal {
             format!(
                 "session {id} was saved with model {saved}; --model {requested} differs. \
                  Start a new session to change the model."
+            ),
+        )
+    }
+
+    /// The message names no URL: a base URL can hold credentials.
+    pub fn endpoint_mismatch(id: &str) -> Self {
+        Self::new(
+            "session_endpoint_mismatch",
+            format!(
+                "session {id} was saved with another provider endpoint (base URL) than this \
+                 run selects. Start a new session to change the endpoint."
             ),
         )
     }
@@ -181,14 +293,22 @@ impl OpenSession {
         self.saved.as_ref()
     }
 
-    /// Refuse a resume on another model or provider (ADR-036 Decision 5).
+    /// Refuse a resume on another model, provider, or endpoint (ADR-036
+    /// Decision 5).
     ///
     /// `model` is an explicit `--model` value. A model default of the agent
     /// env file is not a request: the resume uses the saved model. `provider`
     /// is the provider that this run selects (`--provider` or the agent env
     /// file). Its credentials belong to that provider, so a saved session of
-    /// another provider is refused and never sent there.
-    pub fn check_overrides(&self, model: Option<&str>, provider: &str) -> Result<(), Refusal> {
+    /// another provider is refused and never sent there. `endpoint` is the
+    /// [`endpoint_digest`] of this run, for the same reason: one provider
+    /// name can have two base URLs.
+    pub fn check_overrides(
+        &self,
+        model: Option<&str>,
+        provider: &str,
+        endpoint: &str,
+    ) -> Result<(), Refusal> {
         let Some(saved) = &self.saved else {
             return Ok(());
         };
@@ -198,6 +318,9 @@ impl OpenSession {
                 &saved.prefix.provider,
                 provider,
             ));
+        }
+        if endpoint != saved.prefix.endpoint {
+            return Err(Refusal::endpoint_mismatch(self.id()));
         }
         match model {
             Some(model) if model != saved.model => {
@@ -234,7 +357,8 @@ impl OpenSession {
                 saved_tools.len()
             ),
             None if current.len() < saved_tools.len() => format!(
-                "tool {} at position {} of the session is not available",
+                "tool {} at position {} of the session is not available. If an MCP server \
+                 supplies this tool, make sure that the server is connected",
                 saved_tools[current.len()].name,
                 current.len()
             ),
@@ -417,6 +541,7 @@ mod tests {
     fn prefix(tools: &[ToolSchema]) -> PrefixRecord {
         PrefixRecord {
             provider: "mock".to_string(),
+            endpoint: "endpoint-a".to_string(),
             system: "system text".to_string(),
             tools: tool_digests(tools),
         }
@@ -580,31 +705,223 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_on_another_model_or_provider_is_refused() {
+    fn a_resume_on_another_model_provider_or_endpoint_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         saved(dir.path(), "s1");
         let resumed = open_when_free(dir.path(), SessionRequest::Resume("s1".into())).unwrap();
-        let saved_provider = resumed.saved().unwrap().prefix.provider.clone();
 
-        assert!(resumed.check_overrides(None, &saved_provider).is_ok());
+        assert!(resumed.check_overrides(None, "mock", "endpoint-a").is_ok());
         assert!(resumed
-            .check_overrides(Some("model-a"), &saved_provider)
+            .check_overrides(Some("model-a"), "mock", "endpoint-a")
             .is_ok());
         let model = resumed
-            .check_overrides(Some("model-b"), &saved_provider)
+            .check_overrides(Some("model-b"), "mock", "endpoint-a")
             .unwrap_err();
         assert_eq!(model.code(), "session_model_mismatch");
         assert!(model.to_string().contains("model-a") && model.to_string().contains("model-b"));
         let provider = resumed
-            .check_overrides(None, "another-provider")
+            .check_overrides(None, "another-provider", "endpoint-a")
             .unwrap_err();
         assert_eq!(provider.code(), "session_provider_mismatch");
+        let endpoint = resumed
+            .check_overrides(None, "mock", "endpoint-b")
+            .unwrap_err();
+        assert_eq!(endpoint.code(), "session_endpoint_mismatch");
+        assert!(!endpoint.to_string().contains("endpoint-b"));
+    }
+
+    #[test]
+    fn the_endpoint_digest_covers_each_base_url_and_ignores_trailing_slashes() {
+        let base = endpoint_digest("https://a.example/v1", [("openai", "")]);
+        assert_eq!(base.len(), 64);
+        assert_eq!(
+            base,
+            endpoint_digest(" https://a.example/v1/ ", [("openai", "")])
+        );
+        for other in [
+            endpoint_digest("https://b.example/v1", [("openai", "")]),
+            endpoint_digest(
+                "https://a.example/v1",
+                [("openai", "https://proxy.example")],
+            ),
+            endpoint_digest("https://a.example/v1", [("anthropic", "")]),
+            endpoint_digest("https://a.example/v1", []),
+            endpoint_digest("", [("openai", "")]),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    #[test]
+    fn a_record_without_an_endpoint_digest_is_refused_on_resume() {
+        // A record of a build before the endpoint digest has no `endpoint`.
+        let record: PrefixRecord =
+            serde_json::from_str(r#"{"provider":"mock","system":"s","tools":[]}"#).unwrap();
+        assert_eq!(record.endpoint, "");
+        assert_ne!(record.endpoint, endpoint_digest("", []));
     }
 
     #[test]
     fn a_new_session_accepts_any_model_and_provider() {
         let dir = tempfile::tempdir().unwrap();
         let session = open_when_free(dir.path(), SessionRequest::Start("s1".into())).unwrap();
-        assert!(session.check_overrides(Some("any"), "any").is_ok());
+        assert!(session.check_overrides(Some("any"), "any", "any").is_ok());
+    }
+
+    // --- the saved history (ADR-036 Decision 8) ---
+
+    fn assistant(content: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+        }
+    }
+
+    fn tool_call(id: &str) -> ContentBlock {
+        ContentBlock::ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "a"}),
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+            }],
+        }
+    }
+
+    fn provider_state() -> ContentBlock {
+        ContentBlock::ProviderState {
+            provider: "p".to_string(),
+            data: serde_json::json!({"signature": "x"}),
+        }
+    }
+
+    fn shape(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|message| serde_json::to_string(message).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_complete_history_is_saved_unchanged() {
+        let history = vec![
+            Message::user("task"),
+            assistant(vec![
+                ContentBlock::Thinking("plan".into()),
+                provider_state(),
+                tool_call("c1"),
+            ]),
+            tool_result("c1"),
+            Message::assistant("done"),
+        ];
+        assert_eq!(shape(&resumable_history(&history)), shape(&history));
+        // A history that ends with a user message (after a failed call).
+        let failed = vec![Message::user("task")];
+        assert_eq!(shape(&resumable_history(&failed)), shape(&failed));
+        // Truncated text after max_tokens is content for the provider.
+        let truncated = vec![Message::user("task"), Message::assistant("partial ans")];
+        assert_eq!(shape(&resumable_history(&truncated)), shape(&truncated));
+    }
+
+    #[test]
+    fn trailing_assistant_messages_without_provider_content_are_not_saved() {
+        let kept = vec![Message::user("task"), Message::assistant("answer")];
+        for tail in [
+            vec![assistant(vec![])],
+            vec![assistant(vec![ContentBlock::Thinking(
+                "only thoughts".into(),
+            )])],
+            vec![assistant(vec![provider_state()])],
+            vec![assistant(vec![
+                ContentBlock::Thinking("t".into()),
+                provider_state(),
+            ])],
+            vec![assistant(vec![ContentBlock::Text("  \n".into())])],
+            vec![assistant(vec![]), assistant(vec![provider_state()])],
+        ] {
+            let mut history = kept.clone();
+            history.extend(tail.clone());
+            assert_eq!(
+                shape(&resumable_history(&history)),
+                shape(&kept),
+                "tail {tail:?}"
+            );
+        }
+        // Only trailing messages are removed.
+        let middle = vec![
+            Message::user("task"),
+            assistant(vec![]),
+            Message::user("again"),
+        ];
+        assert_eq!(shape(&resumable_history(&middle)), shape(&middle));
+    }
+
+    #[test]
+    fn each_saved_tool_call_has_a_result() {
+        // The loop closes open tool calls before it returns. The save does it
+        // again, so the rule does not depend on each return path of the loop.
+        let history = vec![
+            Message::user("task"),
+            assistant(vec![tool_call("c1"), tool_call("c2")]),
+            tool_result("c1"),
+        ];
+        let saved = resumable_history(&history);
+        // The existing repair puts the new result message directly after the
+        // assistant message, before the result that was already there.
+        assert_eq!(shape(&saved[..2]), shape(&history[..2]));
+        let mut results: Vec<(String, bool)> = saved[2..]
+            .iter()
+            .inspect(|message| assert_eq!(message.role, Role::User))
+            .flat_map(|message| &message.content)
+            .map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => (tool_use_id.clone(), *is_error),
+                other => panic!("expected a tool result, got {other:?}"),
+            })
+            .collect();
+        results.sort();
+        assert_eq!(
+            results,
+            vec![("c1".to_string(), false), ("c2".to_string(), true)]
+        );
+
+        // A history that ends with an open tool call gets a result message.
+        let open_call = vec![Message::user("task"), assistant(vec![tool_call("c9")])];
+        let saved = resumable_history(&open_call);
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[2].role, Role::User);
+        assert!(matches!(
+            &saved[2].content[..],
+            [ContentBlock::ToolResult { tool_use_id, is_error: true, .. }] if tool_use_id == "c9"
+        ));
+    }
+
+    #[test]
+    fn a_tool_digest_does_not_depend_on_the_key_order_of_the_schema() {
+        let mut forward = serde_json::Map::new();
+        forward.insert("type".into(), serde_json::json!("object"));
+        forward.insert("properties".into(), serde_json::json!({"b": {}, "a": {}}));
+        let mut backward = serde_json::Map::new();
+        backward.insert("properties".into(), serde_json::json!({"a": {}, "b": {}}));
+        backward.insert("type".into(), serde_json::json!("object"));
+        let digest = |schema: serde_json::Map<String, serde_json::Value>| {
+            tool_digests(&[tool("t", "d", serde_json::Value::Object(schema))])
+        };
+        assert_eq!(digest(forward), digest(backward));
+        assert_eq!(
+            canonical_json(&serde_json::json!({"b": [1, {"z": null, "y": "q\""}], "a": true})),
+            r#"{"a":true,"b":[1,{"y":"q\"","z":null}]}"#
+        );
     }
 }

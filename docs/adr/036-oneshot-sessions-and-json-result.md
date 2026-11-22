@@ -84,6 +84,20 @@ The implementation refined four rules. Each refinement keeps the intent of its d
 - **Decision 7.** The loop sets the stable-prefix mark only when prompt caching is on. The Anthropic adapter sets a cache marker for each non-zero prefix length. It does not read the prompt-cache setting for messages. Without this condition, a session run with prompt caching off sends a cache marker.
 - **Decision 8.** The save removes empty assistant messages from the end of the history. The loop ends a failed provider call with an empty assistant message, and providers reject empty assistant content.
 
+### Changes after the code review (2026-11-22)
+
+A rubber-ducky review of the implementation (log `rubber_ducky/1621-oneshot-sessions-json-r2.md`) led to these rules.
+
+- **Decision 5, endpoint.** The prefix record holds `endpoint`: a SHA-256 digest of the primary base URL and of each secondary provider (name and base URL). A resume with another digest is refused with `session_endpoint_mismatch`. A provider name does not identify an endpoint, and the saved conversation holds workspace content. The record holds a digest, not the URL, because a URL can hold credentials. A record without the digest is refused.
+- **Decision 8, saved history.** The save stores a history that a provider accepts with a new user message after it (`oneshot_session::resumable_history`). This replaces the earlier note on empty assistant messages.
+  - Trailing assistant messages without text, tool call, or image are not saved. Such a message is empty or holds only thinking and provider state. A failed, truncated, or aborted call leaves one.
+  - Each saved tool call has a result. An open tool call gets an error result.
+  - Truncated text after `max_tokens` is saved.
+  - A history can end with a user message. The next resume sends two user messages in sequence. The Anthropic Messages API reference states: "Consecutive `user` or `assistant` turns in your request will be combined into a single turn." Request-builder tests show that the Anthropic and OpenRouter adapters send both messages in order.
+- **Decisions 6 and 7, pruning.** The loop prunes old tool results before it builds a request. So `stable_prefix_len` is the length of the message list that the request carries, also after a prune. "Stable" means: the adapter can set its cache breakpoint at the end of this list. It does not mean that the list is equal to the list of the request before. A prune changes earlier messages, so the requests after it miss the cache from the changed message on. The saved history is the pruned history, and a resume sends it unchanged.
+- **Decision 12, order.** The run serializes the document and writes it in one write. No step between the loop result and the write can return early. A failure of the thought log or of the save is reported after the document.
+- **Tool digests.** The digest sorts the keys of the schema, so it does not depend on the key order or on the `preserve_order` feature of serde_json.
+
 The field `usage.thinking_bytes` is the count of thinking bytes that the provider streamed. It is 0 when the provider does not stream.
 
 ## Alternatives
@@ -147,4 +161,4 @@ The maintainer resolved these on 2026-11-20. Each answer keeps the rule of the D
 These are open. They did not block acceptance:
 
 6. The reason codes, the field names, the column name, the 128-character limit, and exit code 1 for a failed save are proposed.
-7. After a failed run, the saved history can end with a user message. The next resume then sends two user messages in sequence. It is not verified that each provider accepts this. A process test shows that the OpenRouter-compatible adapter sends the two user messages. No real provider was tested with this sequence.
+7. Resolved (2026-11-22). After a failed run, the saved history can end with a user message, and the resume sends two user messages in sequence. See "Changes after the code review". No real provider run tested this sequence.

@@ -2895,7 +2895,7 @@ fn has_orphan_tool_calls(messages: &[Message]) -> bool {
 /// call, so ordering stays valid for providers that require the pairing to be
 /// adjacent. `ToolResult`-only messages are not user turns
 /// ([`is_user_turn_message`]), so turn indexing is unaffected.
-fn close_orphan_tool_calls(messages: Vec<Message>) -> Vec<Message> {
+pub(crate) fn close_orphan_tool_calls(messages: Vec<Message>) -> Vec<Message> {
     let answered: HashSet<&str> = messages
         .iter()
         .flat_map(|message| &message.content)

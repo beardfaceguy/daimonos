@@ -476,3 +476,38 @@ def test_a_killed_run_saves_nothing_and_frees_the_id(daimonos_binary, tmp_path, 
     again = harness.agent("--session-id", "run-1", "first task")
     assert again.returncode == 0, again.stderr
     assert again.stdout == "AFTER KILL\n"
+
+
+# --- review round 1 (rubber ducky, thread oneshot-sessions-1621-2652965-r2) ---
+
+def test_resume_refuses_another_endpoint_with_the_same_provider_name(daimonos_binary, tmp_path, fake_provider):
+    first_endpoint = fake_provider([text_reply("FIRST")])
+    other_endpoint = fake_provider([text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, first_endpoint.port)
+    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
+
+    # Same provider name, another base URL: the saved conversation must not go there.
+    env = harness.agent_env.read_text()
+    assert f":{first_endpoint.port}" in env
+    harness.agent_env.write_text(env.replace(f":{first_endpoint.port}", f":{other_endpoint.port}"))
+    error = refusal(harness.agent("--resume", "run-1", "more"))
+    assert error["reason"] == "session_endpoint_mismatch"
+    assert other_endpoint.requests == []
+    # The record does not hold the base URL in clear text: a URL can hold credentials.
+    database = harness.home / ".daimonos" / "oneshot-sessions" / "sessions.sqlite3"
+    payload = session_rows(database)[0][2]
+    payload = payload.decode() if isinstance(payload, bytes) else payload
+    assert "127.0.0.1" not in payload
+    assert len(json.loads(payload)["prefix"]["endpoint"]) == 64
+
+
+def test_a_changed_tool_list_refuses_the_resume_with_exit_code_2(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("FIRST"), text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    assert harness.agent("--session-id", "run-1", "first task").returncode == 0
+
+    # The tool list depends on the workspace: a `.git` directory enables the git tools.
+    (harness.workspace / ".git").mkdir()
+    error = refusal(harness.agent("--resume", "run-1", "--output", "json", "more"))
+    assert error["reason"] == "session_tools_changed"
+    assert len(provider.requests) == 1

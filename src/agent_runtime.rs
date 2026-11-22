@@ -504,10 +504,20 @@ pub async fn run_agent(
         thought_log,
         thinking: agent.thinking.clone(),
     };
+    // The endpoints that `build_provider` uses: the primary base URL and each
+    // secondary provider that is not the selected provider.
+    let endpoint = crate::oneshot_session::endpoint_digest(
+        &agent.base_url,
+        agent
+            .secondary_providers
+            .iter()
+            .filter(|secondary| secondary.name != effective_provider)
+            .map(|secondary| (secondary.name.as_str(), secondary.base_url.as_str())),
+    );
     let session = match session_request {
         Some(request) => {
             let session = open_oneshot_session(&cfg, request)?;
-            session.check_overrides(explicit_model.as_deref(), &effective_provider)?;
+            session.check_overrides(explicit_model.as_deref(), &effective_provider, &endpoint)?;
             Some(session)
         }
         None => None,
@@ -517,6 +527,7 @@ pub async fn run_agent(
         output,
         session,
         prompt_cache: agent.prompt_cache,
+        endpoint,
     };
     let result = agent_cmd::run_agent_with(
         llm.as_ref(),

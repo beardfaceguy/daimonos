@@ -95,6 +95,8 @@ Types and signatures only.
 - `oneshot_session::open` takes the request by value. `OpenSession::check_overrides` and `OpenSession::check_tools` replace `check_prefix`.
 - `AgentConfig.stable_prefix` replaces `mark_history_stable`.
 
+**Review round 1 (2026-11-22).** The request-builder tests for two user messages in sequence, which the Risks table names for slice 3, were missing in the first implementation. They exist now for the Anthropic and OpenRouter adapters. New names: `oneshot_session::endpoint_digest`, `oneshot_session::resumable_history`, `PrefixRecord.endpoint`, `RunOptions.endpoint`, and the reason `session_endpoint_mismatch`.
+
 ## Error and edge behavior
 
 | Case | Result |

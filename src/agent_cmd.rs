@@ -49,6 +49,9 @@ pub struct RunOptions {
     /// The provider was built with prompt caching on
     /// (`DAIMONOS_AGENT_PROMPT_CACHE`).
     pub prompt_cache: bool,
+    /// [`crate::oneshot_session::endpoint_digest`] of the run. Saved in the
+    /// prefix record of a new session.
+    pub endpoint: String,
 }
 
 /// The `--output json` result document of one invocation (ADR-036,
@@ -414,25 +417,18 @@ pub async fn run_agent_with(
                 Some(saved) => saved.prefix.clone(),
                 None => crate::oneshot_session::PrefixRecord {
                     provider: options.provider.clone(),
+                    endpoint: options.endpoint.clone(),
                     system: config.system.clone().unwrap_or_default(),
                     tools: crate::oneshot_session::tool_digests(&config.tools),
                 },
             };
-            // A failed provider call ends the history with an empty assistant
-            // message. Providers reject empty assistant content, so it is not
-            // saved: the next resume continues after the last real message.
-            let mut history = result.messages.as_slice();
-            while let [earlier @ .., last] = history {
-                if last.role == Role::Assistant && last.content.is_empty() {
-                    history = earlier;
-                } else {
-                    break;
-                }
-            }
+            // Not each loop result is a history that a provider accepts with
+            // a new user message after it. See `resumable_history`.
+            let history = crate::oneshot_session::resumable_history(&result.messages);
             session.save(
                 &config.opts.model,
                 config.opts.thinking.as_str(),
-                history,
+                &history,
                 workspace,
                 &prefix,
             )
@@ -467,7 +463,11 @@ pub async fn run_agent_with(
 
     if options.output == crate::cli::AgentOutputFormat::Json {
         // The document is the only stdout write of the run (ADR-036). It is
-        // written for each stop reason, before a debug-artifact failure.
+        // written for each stop reason. Order: the steps between the loop
+        // result and this write cannot return early. The MCP shutdown, the
+        // span, the session save, and the analytics insert return no error to
+        // this function, and the results of the thought log and of the save
+        // are held until after the write.
         let report = RunReport::new(
             &options,
             &config.opts.model,
@@ -477,8 +477,12 @@ pub async fn run_agent_with(
             turns,
             started.elapsed(),
         );
-        serde_json::to_writer(&mut *out, &report)?;
-        writeln!(out)?;
+        // Serialize first, then one write: a failure of the serializer or of
+        // stdout must not leave a part of a document on stdout.
+        let mut document = serde_json::to_vec(&report)?;
+        document.push(b'\n');
+        out.write_all(&document)?;
+        out.flush()?;
         thought_capture_result?;
         if let Some(failure) = session_failure {
             anyhow::bail!(failure);
@@ -1197,8 +1201,7 @@ mod tests {
         RunOptions {
             provider: "mock".to_string(),
             output: crate::cli::AgentOutputFormat::Json,
-            session: None,
-            prompt_cache: false,
+            ..RunOptions::default()
         }
     }
 
@@ -1458,7 +1461,7 @@ mod tests {
             provider: "mock".to_string(),
             output,
             session: Some(oneshot_session::open_when_free(state, request).unwrap()),
-            prompt_cache: false,
+            ..RunOptions::default()
         }
     }
 
@@ -1931,6 +1934,7 @@ mod tests {
                     workspace.path(),
                     &oneshot_session::PrefixRecord {
                         provider: "mock".to_string(),
+                        endpoint: String::new(),
                         system: "saved system".to_string(),
                         tools: oneshot_session::tool_digests(&other_tools),
                     },
@@ -2029,5 +2033,415 @@ mod tests {
         // A run without a session option keeps the value 0.
         assert_eq!(prefix_marks(false, true).await, vec![(0, 1), (0, 3)]);
         assert_eq!(prefix_marks(false, false).await, vec![(0, 1), (0, 3)]);
+    }
+
+    // --- review round 1: terminal history shapes (ADR-036 Decision 8) ---
+
+    fn response(content: Vec<ContentBlock>, stop: crate::providers::StopReason) -> LlmResponse {
+        LlmResponse {
+            retryable: false,
+            content,
+            stop_reason: stop,
+            error_message: None,
+            context_overflow: false,
+            usage: Usage::default(),
+        }
+    }
+
+    fn read_note_call(id: &str) -> ContentBlock {
+        ContentBlock::ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "note.txt"}),
+        }
+    }
+
+    /// Each tool call of a request has a result, and no assistant message is
+    /// without content for the provider.
+    fn assert_request_is_well_formed(messages: &[String]) {
+        let parsed: Vec<Message> = messages
+            .iter()
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect();
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for message in &parsed {
+            let mut provider_content = false;
+            for block in &message.content {
+                match block {
+                    ContentBlock::ToolCall { id, .. } => {
+                        calls.push(id.clone());
+                        provider_content = true;
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        results.push(tool_use_id.clone());
+                        provider_content = true;
+                    }
+                    ContentBlock::Text(text) => provider_content |= !text.trim().is_empty(),
+                    ContentBlock::Image { .. } => provider_content = true,
+                    ContentBlock::Thinking(_) | ContentBlock::ProviderState { .. } => {}
+                }
+            }
+            assert!(
+                provider_content,
+                "a message without provider content: {message:?}"
+            );
+        }
+        calls.sort();
+        results.sort();
+        assert_eq!(calls, results, "each tool call needs one result");
+    }
+
+    /// Run a first session run with `first` responses, then resume it. Return
+    /// the first result, the saved messages, and the resumed request.
+    async fn first_run_then_resume(
+        first: Vec<LlmResponse>,
+    ) -> (AgentResult, Vec<Message>, SeenRequest) {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("note.txt"), "hello\n").unwrap();
+        let first_calls = first.len();
+        let mut responses = first;
+        responses.push(end_turn_with_text("recovered"));
+        let provider = RecordingProvider::new(responses);
+        let result = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("first task"),
+            session_options(state.path(), start("s1"), Default::default()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.seen().len(), first_calls, "calls of the first run");
+        let saved = oneshot_store(state.path())
+            .load_result("s1")
+            .unwrap()
+            .messages;
+
+        let mut out = Vec::new();
+        let resumed = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("try again"),
+            session_options(state.path(), resume("s1"), Default::default()),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.stop_reason, crate::providers::StopReason::EndTurn);
+        assert_eq!(out, b"recovered\n");
+        let request = provider.seen().last().unwrap().clone();
+        // The resume sends the saved messages unchanged, then the new input.
+        let saved_json: Vec<String> = saved.iter().map(message_json).collect();
+        assert_eq!(request.messages[..saved_json.len()], saved_json[..]);
+        assert_eq!(
+            request.messages[saved_json.len()..],
+            [message_json(&Message::user("try again"))]
+        );
+        assert_request_is_well_formed(&request.messages);
+        (result, saved, request)
+    }
+
+    #[tokio::test]
+    async fn a_session_is_resumable_after_max_tokens_with_partial_text() {
+        use crate::providers::StopReason;
+        let (result, saved, _) = first_run_then_resume(vec![response(
+            vec![ContentBlock::Text("partial ans".into())],
+            StopReason::MaxTokens,
+        )])
+        .await;
+        assert_eq!(result.stop_reason, StopReason::MaxTokens);
+        // Truncated text is content: it is saved.
+        assert_eq!(saved.len(), 2);
+        assert_eq!(
+            message_json(&saved[1]),
+            message_json(&Message::assistant("partial ans"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_is_resumable_after_max_tokens_with_only_thinking() {
+        use crate::providers::StopReason;
+        let (result, saved, _) = first_run_then_resume(vec![response(
+            vec![
+                ContentBlock::Thinking("thoughts, then the token limit".into()),
+                ContentBlock::ProviderState {
+                    provider: "p".into(),
+                    data: serde_json::json!({"signature": "x"}),
+                },
+            ],
+            StopReason::MaxTokens,
+        )])
+        .await;
+        assert_eq!(result.stop_reason, StopReason::MaxTokens);
+        // The loop result ends with the thinking-only assistant message.
+        assert_eq!(result.messages.len(), 2);
+        // It has no content for a provider, so it is not saved.
+        assert_eq!(saved.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_is_resumable_after_max_tokens_inside_a_tool_call() {
+        use crate::providers::StopReason;
+        let (result, saved, _) = first_run_then_resume(vec![response(
+            vec![read_note_call("call-1")],
+            StopReason::MaxTokens,
+        )])
+        .await;
+        assert_eq!(result.stop_reason, StopReason::MaxTokens);
+        // The open tool call is saved with a result.
+        assert_eq!(saved.len(), 3);
+        assert!(matches!(
+            &saved[2].content[..],
+            [ContentBlock::ToolResult { tool_use_id, is_error: true, .. }] if tool_use_id == "call-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_session_is_resumable_after_an_aborted_call() {
+        use crate::providers::StopReason;
+        let (result, saved, _) =
+            first_run_then_resume(vec![response(vec![], StopReason::Aborted)]).await;
+        assert_eq!(result.stop_reason, StopReason::Aborted);
+        assert_eq!(saved.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_is_resumable_after_an_error_that_follows_a_tool_round() {
+        use crate::providers::StopReason;
+        let (result, saved, _) = first_run_then_resume(vec![
+            response(vec![read_note_call("call-1")], StopReason::ToolUse),
+            LlmResponse::error("api down"),
+        ])
+        .await;
+        assert_eq!(result.stop_reason, StopReason::Error);
+        // user, assistant (tool call), tool result. The empty assistant
+        // message of the failed call is not saved.
+        assert_eq!(saved.len(), 3);
+        assert!(matches!(
+            &saved[2].content[..],
+            [ContentBlock::ToolResult { tool_use_id, is_error: false, .. }] if tool_use_id == "call-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_session_is_resumable_after_a_refusal() {
+        use crate::providers::StopReason;
+        let (result, saved, _) = first_run_then_resume(vec![response(
+            vec![ContentBlock::Text("I cannot do that.".into())],
+            StopReason::Refusal,
+        )])
+        .await;
+        assert_eq!(result.stop_reason, StopReason::Refusal);
+        assert_eq!(saved.len(), 2);
+    }
+
+    // --- review round 1: the JSON document and post-loop failures ---
+
+    /// A provider that makes the thought log fail during the model call. The
+    /// log is a FIFO. The provider closes its only reader, so the write of
+    /// the streamed thinking fails with EPIPE after the open succeeded.
+    struct ThoughtLogBreaker {
+        reader: Mutex<Option<std::fs::File>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ThoughtLogBreaker {
+        async fn complete(&self, _: &Context, _: &CompleteOpts) -> LlmResponse {
+            drop(self.reader.lock().unwrap().take());
+            let mut response = end_turn_with_text("answer");
+            response
+                .content
+                .insert(0, ContentBlock::Thinking("some thoughts".into()));
+            response
+        }
+    }
+
+    #[tokio::test]
+    async fn output_json_prints_the_document_before_a_thought_log_failure() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("thoughts.fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // A reader must exist, or the open for writing blocks.
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let provider = ThoughtLogBreaker {
+            reader: Mutex::new(Some(reader)),
+        };
+        let mut a = args("go");
+        a.thought_log = Some(fifo);
+        let mut out = Vec::new();
+        let run = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            a,
+            json_options(),
+            &mut out,
+        )
+        .await;
+        // The run has a result, so the document is printed. The failure of
+        // the debug artifact is reported after it.
+        let doc = single_json_document(&out);
+        assert_eq!(doc["stop_reason"], "end_turn");
+        assert_eq!(doc["final_text"], "answer");
+        let Err(error) = run else {
+            panic!("a failed thought log must fail the run");
+        };
+        assert!(error.to_string().contains("thought"), "{error}");
+    }
+
+    /// A writer that accepts `limit` bytes and then fails.
+    struct FailingWriter {
+        written: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.written.len() + buf.len() > self.limit {
+                return Err(std::io::Error::other("stdout is closed"));
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn output_json_writes_the_document_in_one_write_or_not_at_all() {
+        let workspace = tempfile::tempdir().unwrap();
+        // The document does not fit: nothing may reach stdout, so a caller
+        // never reads a truncated document.
+        let provider = MockProvider::new(vec![end_turn_with_text("all good")]);
+        let mut out = FailingWriter {
+            written: Vec::new(),
+            limit: 64,
+        };
+        let run = run_agent_with(
+            &provider,
+            workspace.path(),
+            hermetic_cfg(),
+            args("go"),
+            json_options(),
+            &mut out,
+        )
+        .await;
+        assert!(run.is_err(), "a failed stdout write must fail the run");
+        assert!(
+            out.written.is_empty(),
+            "partial document: {:?}",
+            out.written
+        );
+    }
+
+    // --- review round 1: result pruning in a session run (Decision 6, 7) ---
+
+    #[tokio::test]
+    async fn a_session_run_that_prunes_results_marks_and_saves_the_pruned_list() {
+        use crate::providers::StopReason;
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(workspace.path().join(name), format!("{name} ").repeat(400)).unwrap();
+        }
+        // A small budget, so the third request prunes the first result.
+        let mut cfg = Config::default();
+        cfg.agent.mcp.enabled = false;
+        cfg.tool_output.directory = Some(logs.path().to_string_lossy().into_owned());
+        cfg.tool_output.intra_turn_result_budget_tokens = 1;
+        cfg.tool_output.intra_turn_keep_recent_results = 1;
+        let cfg = Arc::new(cfg);
+        let read = |id: &str, path: &str| {
+            response(
+                vec![ContentBlock::ToolCall {
+                    id: id.to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": path}),
+                }],
+                StopReason::ToolUse,
+            )
+        };
+        let provider = RecordingProvider::new(vec![
+            read("call-1", "a.txt"),
+            read("call-2", "b.txt"),
+            read("call-3", "c.txt"),
+            end_turn_with_text("done"),
+            end_turn_with_text("resumed"),
+        ]);
+        let options = RunOptions {
+            prompt_cache: true,
+            ..session_options(state.path(), start("s1"), Default::default())
+        };
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            Arc::clone(&cfg),
+            args("read three files"),
+            options,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let seen = provider.seen();
+        assert_eq!(seen.len(), 4);
+        // The mark is the length of the list that the request carries: the
+        // loop prunes before it builds the request, never after.
+        for request in &seen {
+            assert_eq!(request.stable_prefix_len, request.messages.len());
+        }
+        // Control: pruning happened. The first result is intact in the second
+        // request and replaced by the pruned marker in a later request.
+        let first_result = |request: &SeenRequest| request.messages[2].clone();
+        assert!(first_result(&seen[1]).contains("a.txt a.txt"));
+        let pruned = first_result(&seen[3]);
+        assert!(pruned.contains("old tool result pruned"), "{pruned}");
+        assert!(!pruned.contains("a.txt a.txt"));
+
+        // The saved history is the pruned history of the last request plus
+        // the final answer, and a resume sends exactly that.
+        let saved: Vec<String> = oneshot_store(state.path())
+            .load_result("s1")
+            .unwrap()
+            .messages
+            .iter()
+            .map(message_json)
+            .collect();
+        assert_eq!(saved[..seen[3].messages.len()], seen[3].messages[..]);
+        assert_eq!(saved.len(), seen[3].messages.len() + 1);
+
+        let options = RunOptions {
+            prompt_cache: true,
+            ..session_options(state.path(), resume("s1"), Default::default())
+        };
+        run_agent_with(
+            &provider,
+            workspace.path(),
+            cfg,
+            args("more"),
+            options,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let resumed = provider.seen().last().unwrap().clone();
+        assert_eq!(resumed.messages[..saved.len()], saved[..]);
+        assert_eq!(resumed.stable_prefix_len, resumed.messages.len());
+        assert_request_is_well_formed(&resumed.messages);
     }
 }
