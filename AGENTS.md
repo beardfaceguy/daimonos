@@ -532,8 +532,10 @@ CI releases on a merge to `master` that changes the version (Vikunja #1622).
 - **`release.yml`** builds five targets, tests the binary, creates the GitHub
   Release, and publishes to the MCP Registry.
 - **If the release run fails,** the tag exists without a release, and later
-  merges do not try again. Run the failed jobs again, or start it with
-  `gh workflow run release.yml --ref v<version>`.
+  merges do not try again. The job `Release on merge` fails when the release
+  run does not start. Run the failed jobs of the release run again, or start a
+  new run with `gh workflow run release.yml --ref v<version> -f tag=v<version>`.
+- A version with build metadata (`+...`) is not supported.
 - A version with a `-` (for example `0.2.0-rc.1`) becomes a prerelease.
 
 ## Vikunja project management

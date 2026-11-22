@@ -35,6 +35,20 @@ def test_prints_the_version_when_the_files_agree(tmp_path):
     assert (done.returncode, done.stdout) == (0, "1.2.3\n"), done.stderr
 
 
+def test_reads_the_version_of_the_package_table_only(tmp_path):
+    root = make_repo(tmp_path)
+    cargo = (root / "Cargo.toml").read_text()
+    (root / "Cargo.toml").write_text('[workspace.package]\nversion = "9.9.9"\n\n' + cargo)
+    done = run(root)
+    assert (done.returncode, done.stdout) == (0, "1.2.3\n"), done.stderr
+
+
+def test_rejects_a_version_with_build_metadata(tmp_path):
+    done = run(make_repo(tmp_path, cargo="1.2.3+b1", lock="1.2.3+b1", server="1.2.3+b1", changelog="1.2.3+b1"))
+    assert done.returncode != 0
+    assert "Cargo.toml" in done.stderr
+
+
 def test_accepts_a_prerelease_version(tmp_path):
     done = run(make_repo(tmp_path, cargo="1.2.3-rc.1", lock="1.2.3-rc.1", server="1.2.3-rc.1", changelog="1.2.3-rc.1"))
     assert (done.returncode, done.stdout) == (0, "1.2.3-rc.1\n"), done.stderr
@@ -90,6 +104,11 @@ case "$1 $2" in
 "workflow run")
     [ "${GH_DISPATCH:-ok}" = "ok" ] || { echo "HTTP 403" >&2; exit 1; }
     ;;
+"api repos/o/r/actions/workflows/release.yml/runs?"*)
+    # The run appears at lookup number $GH_RUN_AT (0 = never).
+    lookups=$(grep -c "actions/workflows/release.yml/runs" "$GH_LOG")
+    if [ "${GH_RUN_AT:-1}" != "0" ] && [ "$lookups" -ge "${GH_RUN_AT:-1}" ]; then echo 1; else echo 0; fi
+    ;;
 *) echo "unexpected gh call: $*" >&2; exit 97 ;;
 esac
 '''
@@ -104,6 +123,7 @@ def claim(tmp_path, **gh):
     log = tmp_path / "gh.log"
     log.write_text("")
     env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "GITHUB_REPOSITORY": "o/r", "GITHUB_SHA": "abc123",
+           "RELEASE_CONFIRM_ATTEMPTS": "3", "RELEASE_CONFIRM_INTERVAL": "0",
            "GH_LOG": str(log), "GH_EXISTING_TAGS": gh.pop("existing", ""), **gh}
     done = subprocess.run(["bash", str(CLAIM), str(root)], capture_output=True, text=True, timeout=30, env=env)
     return done, log.read_text().splitlines()
@@ -113,8 +133,24 @@ def test_a_new_version_creates_the_tag_and_starts_the_release(tmp_path):
     done, calls = claim(tmp_path, existing="v1.2.2 v1.2.30")
     assert done.returncode == 0, done.stderr
     assert calls[1] == "api repos/o/r/git/refs -f ref=refs/tags/v1.2.3 -f sha=abc123"
-    assert calls[2] == "workflow run release.yml --repo o/r --ref v1.2.3"
-    assert len(calls) == 3
+    assert calls[2] == "workflow run release.yml --repo o/r --ref v1.2.3 -f tag=v1.2.3"
+    # The job confirms that the release run exists.
+    assert calls[3].startswith("api repos/o/r/actions/workflows/release.yml/runs?event=workflow_dispatch&head_sha=abc123")
+    assert len(calls) == 4
+
+
+def test_the_release_run_is_confirmed_after_the_start(tmp_path):
+    # The run appears at the third lookup: the job waits for it.
+    done, calls = claim(tmp_path / "late", GH_RUN_AT="3")
+    assert done.returncode == 0, done.stderr
+    assert sum("actions/workflows/release.yml/runs" in call for call in calls) == 3
+
+    # `gh workflow run` reported success, but no run exists: the job fails.
+    done, calls = claim(tmp_path / "never", GH_RUN_AT="0")
+    assert done.returncode != 0
+    assert sum("actions/workflows/release.yml/runs" in call for call in calls) == 3
+    assert "no release run" in done.stderr
+    assert "gh workflow run release.yml --ref v1.2.3 -f tag=v1.2.3" in done.stderr
 
 
 def test_an_existing_tag_releases_nothing(tmp_path):
@@ -138,7 +174,7 @@ def test_api_failures_fail_the_job_and_start_no_release(tmp_path):
     # A failed start of the release fails the job, and the message names the recovery command.
     done, _ = claim(tmp_path / "dispatch", GH_DISPATCH="fail")
     assert done.returncode != 0
-    assert "gh workflow run release.yml --ref v1.2.3" in done.stderr
+    assert "gh workflow run release.yml --ref v1.2.3 -f tag=v1.2.3" in done.stderr
 
 
 def test_inconsistent_version_files_start_no_release(tmp_path):

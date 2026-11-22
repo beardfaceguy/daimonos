@@ -4,7 +4,9 @@ name: Release
 # changes the version (.github/scripts/release-on-merge.sh) and then starts this
 # workflow on the tag ref, because a tag that the workflow token creates does
 # not trigger it. A maintainer can also push a tag, or start the workflow
-# manually on a tag ref to run a failed release again.
+# manually on a tag ref to run a failed release again. A manual start on a
+# branch with the `tag` input creates that tag at the head of the default
+# branch. Without the input it is a dev build with no release.
 on:
   push:
     tags: ["v*"]
@@ -236,9 +238,17 @@ jobs:
       - name: Download MCPB bundles and update server.json
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REF_NAME: ${{ github.ref_name }}
+          GH_REF: ${{ github.ref }}
+          GH_INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          TAG="$GH_REF_NAME"
+          # The same tag as the release job: the tag ref of the run, else the
+          # `tag` input. `github.ref_name` is a branch name when the workflow
+          # is started on a branch with the `tag` input.
+          if [[ "$GH_REF" == refs/tags/* ]]; then
+            TAG="${GH_REF#refs/tags/}"
+          else
+            TAG="$GH_INPUT_TAG"
+          fi
           VERSION="${TAG#v}"
 
           mkdir -p mcpb-release
