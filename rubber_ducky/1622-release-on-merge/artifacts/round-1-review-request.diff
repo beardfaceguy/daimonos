@@ -1,0 +1,353 @@
+diff --git a/.github/scripts/release-on-merge.sh b/.github/scripts/release-on-merge.sh
+new file mode 100755
+index 0000000..1356474
+--- /dev/null
++++ b/.github/scripts/release-on-merge.sh
+@@ -0,0 +1,51 @@
++#!/usr/bin/env bash
++# Release on merge (Vikunja #1622). Run by ci.yml after a push to master, when
++# all CI jobs passed.
++#
++# Rule: release `v<version>` when no tag exists for the version in Cargo.toml.
++# So a merge that changes the version releases, and a merge that keeps the
++# version releases nothing.
++#
++# Steps: create the tag at the tested commit, then start release.yml on the
++# tag ref. That is the same run as a manual release from a pushed tag. A tag
++# that the workflow token creates does not start release.yml by itself, so
++# this script starts it.
++#
++# Usage: release-on-merge.sh [REPOSITORY_ROOT]
++# Environment: GITHUB_REPOSITORY, GITHUB_SHA, and a token for `gh` with
++# `contents: write` and `actions: write`.
++set -euo pipefail
++
++root="${1:-.}"
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++version=$("$here/release-version.sh" "$root")
++tag="v$version"
++
++# The endpoint matches by prefix (v0.1.7 also returns v0.1.70), so count the
++# exact matches. An API failure stops the script: it is not "no tag".
++existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
++    --jq "[.[] | select(.ref == \"refs/tags/$tag\")] | length")
++if [[ "$existing" != "0" ]]; then
++    echo "Tag $tag exists. This merge releases nothing."
++    exit 0
++fi
++
++# Creating the ref is the claim: of two runs, only one succeeds.
++if ! created=$(gh api "repos/$GITHUB_REPOSITORY/git/refs" \
++    -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA" 2>&1); then
++    if grep -q "Reference already exists" <<< "$created"; then
++        echo "Another run created $tag. This merge releases nothing."
++        exit 0
++    fi
++    echo "release-on-merge: could not create $tag: $created" >&2
++    exit 1
++fi
++echo "Created $tag at $GITHUB_SHA."
++
++if ! gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$tag"; then
++    echo "release-on-merge: $tag exists, but the release did not start." >&2
++    echo "Later merges do not try again. Start it with: gh workflow run release.yml --ref $tag" >&2
++    exit 1
++fi
++echo "Started release.yml for $tag."
+diff --git a/.github/scripts/release-version.sh b/.github/scripts/release-version.sh
+new file mode 100755
+index 0000000..63986b3
+--- /dev/null
++++ b/.github/scripts/release-version.sh
+@@ -0,0 +1,36 @@
++#!/usr/bin/env bash
++# Print the version that a merge to master releases: the package version in
++# Cargo.toml. Fail when Cargo.lock, server.json, or CHANGELOG.md names another
++# version, so a release never ships a binary that reports a different version.
++#
++# Usage: release-version.sh [REPOSITORY_ROOT]
++set -euo pipefail
++
++root="${1:-.}"
++
++fail() {
++    echo "release-version: $1" >&2
++    exit 1
++}
++
++# The first `version = "..."` line is the one of [package].
++version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n 1)
++if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
++    fail "Cargo.toml: the package version '$version' is not MAJOR.MINOR.PATCH"
++fi
++
++lock=$(grep -A 1 '^name = "daimonos"$' "$root/Cargo.lock" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)
++if [[ "$lock" != "$version" ]]; then
++    fail "Cargo.lock: the daimonos package has version '$lock', Cargo.toml has '$version'"
++fi
++
++server=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$root/server.json")
++if [[ "$server" != "$version" ]]; then
++    fail "server.json: version is '$server', Cargo.toml has '$version'"
++fi
++
++if ! grep -q -F "## [$version]" "$root/CHANGELOG.md"; then
++    fail "CHANGELOG.md: no '## [$version]' section"
++fi
++
++echo "$version"
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 47b77ca..342a289 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -116,3 +116,21 @@ jobs:
+           name: daimonos-musl
+           path: target/x86_64-unknown-linux-musl/release/daimonos
+           retention-days: 7
++
++  # Release on merge (Vikunja #1622). After a push to master, when all jobs
++  # above passed: if no tag exists for the version in Cargo.toml, create the tag
++  # at this commit and start release.yml on it. A merge that keeps the version
++  # releases nothing. The rule and its failure cases are in the script.
++  release-on-merge:
++    name: Release on merge
++    runs-on: ubuntu-26.04
++    needs: [fmt, check, test, mcp-integration, android, smoke-test, musl-build]
++    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
++    permissions:
++      contents: write # create the tag
++      actions: write # start release.yml
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++      - run: .github/scripts/release-on-merge.sh
++        env:
++          GH_TOKEN: ${{ github.token }}
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 56b866c..51a6ca9 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -1,5 +1,10 @@
+ name: Release
+ 
++# Starts on a `v*` tag. ci.yml creates that tag after a merge to master that
++# changes the version (.github/scripts/release-on-merge.sh) and then starts this
++# workflow on the tag ref, because a tag that the workflow token creates does
++# not trigger it. A maintainer can also push a tag, or start the workflow
++# manually on a tag ref to run a failed release again.
+ on:
+   push:
+     tags: ["v*"]
+diff --git a/AGENTS.md b/AGENTS.md
+index c904952..4a5628a 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -157,6 +157,7 @@ daimonos/
+ │                                  #   repowise + the graphify KGL substrate)
+ ├── .github/
+ │   ├── RELEASE_TEMPLATE.md
++│   ├── scripts/                   # release-version.sh, release-on-merge.sh (see Releases)
+ │   └── workflows/                 # ci.yml, deploy.yml, distro.yml, release.yml
+ ├── graphify-out/                  # Local KGL substrate, gitignored (ADR 012)
+ ├── .repowise/                     # Local repowise index, gitignored
+@@ -513,6 +514,28 @@ After changing the ACP engine, a live check means installing the binary and
+ restarting the ACP client (Zed) — the client spawns `daimonos acp` itself, so a
+ stale binary silently keeps serving the old behavior.
+ 
++## Releases
++
++CI releases on a merge to `master` that changes the version (Vikunja #1622).
++
++- **Rule.** After a push to `master`, when all CI jobs passed, the job
++  `Release on merge` reads the version in `Cargo.toml`. If no tag `v<version>`
++  exists, it creates the tag at that commit and starts `release.yml` on it. If
++  the tag exists, it does nothing.
++- **To release,** set the same new version in `Cargo.toml`, `Cargo.lock`
++  (package `daimonos`), and `server.json`, and add a `## [<version>]` section to
++  `CHANGELOG.md`. Do this in the PR that must ship, or in a separate release
++  PR. `.github/scripts/release-version.sh` checks that the four files agree,
++  and `tests/test_release_version.py` runs that check on each PR.
++- **A PR that keeps the version releases nothing.** Its changes ship with the
++  next version change. Put their changelog entries under `## [Unreleased]`.
++- **`release.yml`** builds five targets, tests the binary, creates the GitHub
++  Release, and publishes to the MCP Registry.
++- **If the release run fails,** the tag exists without a release, and later
++  merges do not try again. Run the failed jobs again, or start it with
++  `gh workflow run release.yml --ref v<version>`.
++- A version with a `-` (for example `0.2.0-rc.1`) becomes a prerelease.
++
+ ## Vikunja project management
+ 
+ Keep Vikunja accurate **as you work**, not after being asked. Work goes in
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 77ef3a1..fbfc69c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- **Releases start from CI.** A merge to `master` that changes the version in
++  `Cargo.toml` creates the tag and starts the Release workflow. A merge that
++  keeps the version releases nothing.
++
+ ## [0.1.6] - 2026-11-22
+ 
+ This release has the 13 PRs that merged after v0.1.5 (#252 to #263, and #284).
+diff --git a/tests/test_release_version.py b/tests/test_release_version.py
+new file mode 100644
+index 0000000..259d422
+--- /dev/null
++++ b/tests/test_release_version.py
+@@ -0,0 +1,149 @@
++"""`.github/scripts/release-version.sh`: the version that a merge to master releases.
++
++CI releases `v<version>` when no tag exists for the version in Cargo.toml. The
++script prints that version. It fails when the four files that name the version
++do not agree, so a release never ships a binary that reports another version.
++"""
++import json
++import pathlib
++import subprocess
++
++REPO = pathlib.Path(__file__).resolve().parent.parent
++SCRIPT = REPO / ".github" / "scripts" / "release-version.sh"
++
++
++def make_repo(root, cargo="1.2.3", lock="1.2.3", server="1.2.3", changelog="1.2.3"):
++    root.mkdir(parents=True, exist_ok=True)
++    (root / "Cargo.toml").write_text(
++        f'[package]\nname = "daimonos"\nversion = "{cargo}"\n\n[dependencies]\nserde = {{ version = "1" }}\n')
++    (root / "Cargo.lock").write_text(
++        '[[package]]\nname = "cc"\nversion = "9.9.9"\n\n'
++        f'[[package]]\nname = "daimonos"\nversion = "{lock}"\n\n'
++        '[[package]]\nname = "daimonos-extra"\nversion = "8.8.8"\n')
++    (root / "server.json").write_text(json.dumps({"name": "x", "version": server, "packages": []}))
++    (root / "CHANGELOG.md").write_text(
++        f"# Changelog\n\n## [Unreleased]\n\n## [{changelog}] - 2026-01-01\n\n- entry\n\n## [0.0.1] - 2025-01-01\n")
++    return root
++
++
++def run(root):
++    return subprocess.run(["bash", str(SCRIPT), str(root)], capture_output=True, text=True, timeout=30)
++
++
++def test_prints_the_version_when_the_files_agree(tmp_path):
++    done = run(make_repo(tmp_path))
++    assert (done.returncode, done.stdout) == (0, "1.2.3\n"), done.stderr
++
++
++def test_accepts_a_prerelease_version(tmp_path):
++    done = run(make_repo(tmp_path, cargo="1.2.3-rc.1", lock="1.2.3-rc.1", server="1.2.3-rc.1", changelog="1.2.3-rc.1"))
++    assert (done.returncode, done.stdout) == (0, "1.2.3-rc.1\n"), done.stderr
++
++
++def test_fails_and_names_the_file_that_differs(tmp_path):
++    cases = {
++        "Cargo.lock": dict(lock="1.2.2"),
++        "server.json": dict(server="1.2.2"),
++        "CHANGELOG.md": dict(changelog="1.2.2"),
++        "Cargo.toml": dict(cargo="not a version", lock="not a version", server="not a version", changelog="not a version"),
++    }
++    for name, change in cases.items():
++        done = run(make_repo(tmp_path / name.replace(".", "-"), **change))
++        assert done.returncode != 0, name
++        assert done.stdout == "", name
++        assert name in done.stderr, (name, done.stderr)
++
++
++def test_the_repository_itself_is_consistent():
++    done = run(REPO)
++    assert done.returncode == 0, done.stderr
++    cargo_version = [line for line in (REPO / "Cargo.toml").read_text().splitlines() if line.startswith("version = ")][0]
++    assert cargo_version == f'version = "{done.stdout.strip()}"'
++
++
++# --- `.github/scripts/release-on-merge.sh`: claim the tag and start the release ---
++
++CLAIM = REPO / ".github" / "scripts" / "release-on-merge.sh"
++
++FAKE_GH = r'''#!/usr/bin/env bash
++# A fake `gh` for the tests. It appends each call to $GH_LOG and answers from
++# $GH_EXISTING_TAGS (space-separated) and $GH_CREATE / $GH_LOOKUP / $GH_DISPATCH.
++echo "$*" >> "$GH_LOG"
++case "$1 $2" in
++"api repos/o/r/git/matching-refs/tags/"*)
++    [ "${GH_LOOKUP:-ok}" = "fail" ] && { echo "HTTP 503" >&2; exit 1; }
++    wanted="${2#repos/o/r/git/matching-refs/tags/}"
++    count=0
++    for tag in $GH_EXISTING_TAGS; do
++        # The real endpoint matches by prefix. The script must count exact matches.
++        case "$tag" in "$wanted"*) [ "$tag" = "$wanted" ] && count=$((count + 1)) ;; esac
++    done
++    echo "$count"
++    ;;
++"api repos/o/r/git/refs")
++    case "${GH_CREATE:-ok}" in
++    ok) echo '{"ref":"created"}' ;;
++    exists) echo '{"message":"Reference already exists"}'; echo "gh: Reference already exists (HTTP 422)" >&2; exit 1 ;;
++    *) echo "gh: Resource not accessible by integration (HTTP 403)" >&2; exit 1 ;;
++    esac
++    ;;
++"workflow run")
++    [ "${GH_DISPATCH:-ok}" = "ok" ] || { echo "HTTP 403" >&2; exit 1; }
++    ;;
++*) echo "unexpected gh call: $*" >&2; exit 97 ;;
++esac
++'''
++
++
++def claim(tmp_path, **gh):
++    root = make_repo(tmp_path / "repo")
++    fake_bin = tmp_path / "bin"
++    fake_bin.mkdir(parents=True)
++    (fake_bin / "gh").write_text(FAKE_GH)
++    (fake_bin / "gh").chmod(0o755)
++    log = tmp_path / "gh.log"
++    log.write_text("")
++    env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "GITHUB_REPOSITORY": "o/r", "GITHUB_SHA": "abc123",
++           "GH_LOG": str(log), "GH_EXISTING_TAGS": gh.pop("existing", ""), **gh}
++    done = subprocess.run(["bash", str(CLAIM), str(root)], capture_output=True, text=True, timeout=30, env=env)
++    return done, log.read_text().splitlines()
++
++
++def test_a_new_version_creates_the_tag_and_starts_the_release(tmp_path):
++    done, calls = claim(tmp_path, existing="v1.2.2 v1.2.30")
++    assert done.returncode == 0, done.stderr
++    assert calls[1] == "api repos/o/r/git/refs -f ref=refs/tags/v1.2.3 -f sha=abc123"
++    assert calls[2] == "workflow run release.yml --repo o/r --ref v1.2.3"
++    assert len(calls) == 3
++
++
++def test_an_existing_tag_releases_nothing(tmp_path):
++    done, calls = claim(tmp_path, existing="v1.2.3")
++    assert done.returncode == 0, done.stderr
++    assert len(calls) == 1 and "matching-refs" in calls[0], calls
++    assert "releases nothing" in done.stdout
++
++
++def test_a_lost_race_for_the_tag_releases_nothing(tmp_path):
++    done, calls = claim(tmp_path, GH_CREATE="exists")
++    assert done.returncode == 0, done.stderr
++    assert not any(call.startswith("workflow run") for call in calls), calls
++
++
++def test_api_failures_fail_the_job_and_start_no_release(tmp_path):
++    for index, failure in enumerate([{"GH_LOOKUP": "fail"}, {"GH_CREATE": "denied"}]):
++        done, calls = claim(tmp_path / str(index), **failure)
++        assert done.returncode != 0, failure
++        assert not any(call.startswith("workflow run") for call in calls), calls
++    # A failed start of the release fails the job, and the message names the recovery command.
++    done, _ = claim(tmp_path / "dispatch", GH_DISPATCH="fail")
++    assert done.returncode != 0
++    assert "gh workflow run release.yml --ref v1.2.3" in done.stderr
++
++
++def test_inconsistent_version_files_start_no_release(tmp_path):
++    root = make_repo(tmp_path / "repo", server="1.2.2")
++    done = subprocess.run(["bash", str(CLAIM), str(root)], capture_output=True, text=True, timeout=30,
++                          env={"PATH": "/usr/bin:/bin", "GITHUB_REPOSITORY": "o/r", "GITHUB_SHA": "abc123"})
++    assert done.returncode != 0
++    assert "server.json" in done.stderr
