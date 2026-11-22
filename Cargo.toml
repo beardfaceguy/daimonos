@@ -1,6 +1,6 @@
 [package]
 name = "daimonos"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Daimonos — an agent-optimized OS layer for remote LLM agents"
 
