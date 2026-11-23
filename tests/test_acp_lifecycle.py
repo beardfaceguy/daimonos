@@ -8,7 +8,6 @@ import json
 import signal
 import subprocess
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -133,11 +132,10 @@ def test_acp_exits_cleanly_when_signaled_during_startup(daimonos_binary, tmp_pat
     process = _spawn_acp(daimonos_binary, tmp_path, base_url=catalog.url)
     try:
         assert catalog.arrived.wait(timeout=10), "startup did not request the model catalog"
-        started = time.monotonic()
         process.send_signal(sig)
-        # The catalog reply is still held: the exit does not wait for it.
+        # The catalog reply is still held: the exit does not wait for it. The
+        # limit is below the 5 s that startup waits for the catalog.
         assert process.wait(timeout=4) == 0
-        assert time.monotonic() - started < 4
         assert not catalog.release.is_set()
     finally:
         _stop(process)

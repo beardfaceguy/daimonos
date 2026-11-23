@@ -154,7 +154,9 @@ impl AgentEnv {
             let (Ok(key), Ok(value)) = (key.into_string(), value.into_string()) else {
                 continue;
             };
-            if !key.starts_with("DAIMONOS_AGENT_") && key != crate::skills::SKILL_DIR_ENV {
+            // The selector `DAIMONOS_AGENT_ENV` is not a setting. It is read
+            // below, for the selection.
+            if !is_agent_setting(&key) {
                 continue;
             }
             if implicit_keys.contains(&key) {
@@ -185,8 +187,9 @@ impl AgentEnv {
     /// `real` holds the process values that the launcher supplied. `implicit`
     /// holds the process values that an implicit `agent.env` file supplied.
     /// ADR-037: with an explicitly selected file (`explicit`), an implicit
-    /// value only fills a setting that the selected file does not set.
-    /// Without one, both kinds override the selected file as before.
+    /// value only fills a setting that the selected file does not set, and
+    /// never a connection setting. Without one, both kinds override the
+    /// selected file as before.
     fn load_layered(
         flag: Option<PathBuf>,
         explicit: bool,
@@ -206,8 +209,18 @@ impl AgentEnv {
                 REQUIRED.join(", ")
             )
         })?;
-        let vars = layered_vars(&content, explicit, real, implicit);
-        Self::from_vars(&vars, &path)
+        let (vars, withheld) = layered_vars(&content, explicit, real, implicit);
+        Self::from_vars(&vars, &path).map_err(|error| {
+            if withheld.is_empty() {
+                return error;
+            }
+            format!(
+                "{error}\nNot used from an implicit agent.env file: {}. With an explicitly \
+                 selected agent env file, the connection settings (provider, base URL, API \
+                 key) come from that file or from the real environment.",
+                withheld.join(", ")
+            )
+        })
     }
 
     fn from_vars(vars: &HashMap<String, String>, path: &Path) -> Result<AgentEnv, String> {
@@ -582,10 +595,7 @@ fn merge_process_overrides(
     process_vars: &HashMap<String, String>,
 ) {
     for (key, value) in process_vars {
-        if (key.starts_with("DAIMONOS_AGENT_") || key == crate::skills::SKILL_DIR_ENV)
-            && key != "DAIMONOS_AGENT_ENV"
-            && !value.trim().is_empty()
-        {
+        if is_agent_setting(key) && !value.trim().is_empty() {
             file_vars.insert(key.clone(), value.clone());
         }
     }
@@ -599,42 +609,73 @@ fn explicit_selection(flag_given: bool, selector_set: bool, selector_is_implicit
     flag_given || (selector_set && !selector_is_implicit)
 }
 
+/// A setting of the agent env file: `DAIMONOS_AGENT_*` or the skill root. The
+/// selector `DAIMONOS_AGENT_ENV` chooses the file and is not a setting.
+fn is_agent_setting(key: &str) -> bool {
+    (key.starts_with("DAIMONOS_AGENT_") || key == crate::skills::SKILL_DIR_ENV)
+        && key != "DAIMONOS_AGENT_ENV"
+}
+
+/// A setting that names where requests go or which credential they carry: the
+/// provider, each base URL, and each API key, also of a secondary provider
+/// (`DAIMONOS_AGENT_<PROVIDER>_API_KEY`, `..._BASE_URL`).
+///
+/// ADR-037: with an explicitly selected file, these never come from an
+/// implicit file. Otherwise the API key of a host file could go to the
+/// endpoint that the selected file names, or the reverse.
+fn is_connection_setting(key: &str) -> bool {
+    key == "DAIMONOS_AGENT_PROVIDER" || key.ends_with("_API_KEY") || key.ends_with("_BASE_URL")
+}
+
 /// The effective settings: the selected file, then the two kinds of process
-/// values in the order of ADR-037. Pure, so tests need no process environment.
+/// values in the order of ADR-037. Also returns the names of the connection
+/// settings of implicit files that were not used. Pure, so tests need no
+/// process environment.
 fn layered_vars(
     content: &str,
     explicit: bool,
     real: &HashMap<String, String>,
     implicit: &HashMap<String, String>,
-) -> HashMap<String, String> {
+) -> (HashMap<String, String>, Vec<String>) {
     let mut vars = parse_dotenv(content);
+    let mut withheld = Vec::new();
     if explicit {
-        fill_unset_from_implicit(&mut vars, implicit);
+        withheld = fill_unset_from_implicit(&mut vars, implicit);
     } else {
         merge_process_overrides(&mut vars, implicit);
     }
     merge_process_overrides(&mut vars, real);
-    vars
+    // A setting that the real environment supplied was not needed from the
+    // implicit file, so it is not reported.
+    withheld.retain(|key| vars.get(key).is_none_or(|value| value.trim().is_empty()));
+    (vars, withheld)
 }
 
 /// Use a value from an implicit `agent.env` file only for a setting that the
 /// explicitly selected file does not set (ADR-037). A blank value in the
 /// selected file does not set the setting, as in [`merge_process_overrides`].
+/// A connection setting is never used ([`is_connection_setting`]). Returns the
+/// sorted names of the connection settings that were not used for that reason.
 fn fill_unset_from_implicit(
     file_vars: &mut HashMap<String, String>,
     implicit: &HashMap<String, String>,
-) {
+) -> Vec<String> {
+    let mut withheld = Vec::new();
     for (key, value) in implicit {
-        let is_agent_setting = (key.starts_with("DAIMONOS_AGENT_")
-            || key == crate::skills::SKILL_DIR_ENV)
-            && key != "DAIMONOS_AGENT_ENV";
         let unset_in_file = file_vars
             .get(key)
             .is_none_or(|existing| existing.trim().is_empty());
-        if is_agent_setting && unset_in_file && !value.trim().is_empty() {
+        if !is_agent_setting(key) || !unset_in_file || value.trim().is_empty() {
+            continue;
+        }
+        if is_connection_setting(key) {
+            withheld.push(key.clone());
+        } else {
             file_vars.insert(key.clone(), value.clone());
         }
     }
+    withheld.sort();
+    withheld
 }
 
 /// Build the picker's candidate model list: `current` is always present
@@ -880,21 +921,14 @@ mod tests {
     fn an_explicit_file_ranks_between_the_real_environment_and_implicit_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.env");
-        // The file sets the model, leaves the base URL blank, and omits the
-        // thinking level.
-        std::fs::write(
-            &path,
-            base().replace(
-                "DAIMONOS_AGENT_BASE_URL=https://openrouter.ai/api/v1\n",
-                "DAIMONOS_AGENT_BASE_URL=\n",
-            ),
-        )
-        .unwrap();
+        // The file sets the model, leaves the summary model blank, and omits
+        // the thinking level.
+        std::fs::write(&path, format!("{}DAIMONOS_AGENT_SUMMARY_MODEL=\n", base())).unwrap();
         let implicit = vars(&[
             ("DAIMONOS_AGENT_MODEL", "implicit/model"),
-            ("DAIMONOS_AGENT_BASE_URL", "https://implicit.example/v1"),
+            ("DAIMONOS_AGENT_SUMMARY_MODEL", "implicit/summary"),
             ("DAIMONOS_AGENT_THINKING", "high"),
-            ("DAIMONOS_AGENT_PROVIDER", "  "),
+            ("DAIMONOS_AGENT_APPROVAL_MODE", "  "),
             ("DAIMONOS_AGENT_ENV", "/implicit/selector"),
         ]);
 
@@ -902,16 +936,84 @@ mod tests {
         let env =
             AgentEnv::load_layered(Some(path.clone()), true, &HashMap::new(), &implicit).unwrap();
         assert_eq!(env.model, "anthropic/claude-sonnet-4.6");
-        assert_eq!(env.provider, "openrouter");
         // An implicit value fills a setting that the file omits or leaves blank.
-        assert_eq!(env.base_url, "https://implicit.example/v1");
         assert_eq!(env.thinking, ThinkingLevel::High);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let (layered, withheld) = layered_vars(&content, true, &HashMap::new(), &implicit);
+        assert_eq!(layered["DAIMONOS_AGENT_SUMMARY_MODEL"], "implicit/summary");
+        assert_eq!(layered["DAIMONOS_AGENT_APPROVAL_MODE"], "interactive");
+        assert!(!layered.contains_key("DAIMONOS_AGENT_ENV"));
+        assert!(withheld.is_empty());
 
         // The real environment wins over the explicit file.
         let real = vars(&[("DAIMONOS_AGENT_MODEL", "real/model")]);
         let env = AgentEnv::load_layered(Some(path), true, &real, &implicit).unwrap();
         assert_eq!(env.model, "real/model");
-        assert_eq!(env.base_url, "https://implicit.example/v1");
+        assert_eq!(env.thinking, ThinkingLevel::High);
+    }
+
+    /// ADR-037: with an explicitly selected file, no connection setting comes
+    /// from an implicit file. So the API key of a host file cannot go to the
+    /// endpoint that the selected file names, or the reverse.
+    #[test]
+    fn an_explicit_file_takes_no_connection_setting_from_an_implicit_file() {
+        for key in [
+            "DAIMONOS_AGENT_PROVIDER",
+            "DAIMONOS_AGENT_BASE_URL",
+            "DAIMONOS_AGENT_API_KEY",
+            "DAIMONOS_AGENT_OPENAI_API_KEY",
+            "DAIMONOS_AGENT_ANTHROPIC_BASE_URL",
+        ] {
+            assert!(is_connection_setting(key), "{key}");
+        }
+        for key in [
+            "DAIMONOS_AGENT_MODEL",
+            "DAIMONOS_AGENT_APPROVAL_MODE",
+            "DAIMONOS_SKILL_DIR",
+        ] {
+            assert!(!is_connection_setting(key), "{key}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.env");
+        // The selected file names an endpoint and has no API key.
+        std::fs::write(
+            &path,
+            base().replace("DAIMONOS_AGENT_API_KEY=sk-test\n", ""),
+        )
+        .unwrap();
+        let implicit = vars(&[
+            ("DAIMONOS_AGENT_API_KEY", "sk-host-secret"),
+            ("DAIMONOS_AGENT_OPENAI_API_KEY", "sk-host-openai"),
+            ("DAIMONOS_AGENT_MODEL", "implicit/model"),
+        ]);
+
+        let error = AgentEnv::load_layered(Some(path.clone()), true, &HashMap::new(), &implicit)
+            .unwrap_err();
+        assert!(error.contains("missing required value"), "{error}");
+        assert!(
+            error.contains(
+                "Not used from an implicit agent.env file: \
+                 DAIMONOS_AGENT_API_KEY, DAIMONOS_AGENT_OPENAI_API_KEY"
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.contains("sk-host"),
+            "the message must not hold a key"
+        );
+
+        // The real environment can supply the key. The host key is not used,
+        // and no secondary provider comes from the implicit file.
+        let real = vars(&[("DAIMONOS_AGENT_API_KEY", "sk-real")]);
+        let env = AgentEnv::load_layered(Some(path.clone()), true, &real, &implicit).unwrap();
+        assert_eq!(env.api_key, "sk-real");
+        assert!(env.secondary_providers.is_empty());
+
+        // Without an explicit selection the behavior does not change.
+        let env = AgentEnv::load_layered(Some(path), false, &HashMap::new(), &implicit).unwrap();
+        assert_eq!(env.api_key, "sk-host-secret");
+        assert_eq!(env.secondary_providers.len(), 1);
     }
 
     /// Without an explicit selection, the selected file is the home file, and
@@ -921,7 +1023,7 @@ mod tests {
         let implicit = vars(&[("DAIMONOS_AGENT_MODEL", "implicit/model")]);
         let real = vars(&[("DAIMONOS_AGENT_API_KEY", "sk-real")]);
         let model = |explicit: bool| {
-            let layered = layered_vars(&base(), explicit, &real, &implicit);
+            let (layered, _) = layered_vars(&base(), explicit, &real, &implicit);
             assert_eq!(layered["DAIMONOS_AGENT_API_KEY"], "sk-real");
             layered["DAIMONOS_AGENT_MODEL"].clone()
         };

@@ -35,6 +35,12 @@ def write_home_agent_env(harness, port, model="home/model"):
     (directory / "agent.env").write_text(settings(port, model))
 
 
+def without(harness, name):
+    """Remove one setting from the explicit file of the harness."""
+    lines = [line for line in harness.agent_env.read_text().splitlines() if not line.startswith(name + "=")]
+    harness.agent_env.write_text("\n".join(lines) + "\n")
+
+
 def run(harness, argv, extra_env=None):
     return subprocess.run(
         argv, cwd=harness.workspace, env={**harness.environment(), **(extra_env or {})},
@@ -90,24 +96,21 @@ def test_a_file_from_the_real_selector_variable_wins_over_the_home_agent_env(
     assert len(explicit.requests) == 1
 
 
-def test_a_file_that_the_workspace_agent_env_selects_is_not_an_explicit_file(
+def test_a_file_that_an_implicit_file_selects_is_not_an_explicit_file(
         daimonos_binary, tmp_path, fake_provider):
-    # Unchanged behavior: an implicit file can name the agent env file. It then
-    # keeps its rank above that file, so its own values win.
-    implicit = fake_provider([text_reply("FROM THE WORKSPACE FILE")])
-    selected = fake_provider([text_reply("FROM THE SELECTED FILE")])
-    harness = Harness(daimonos_binary, tmp_path, selected.port)
+    # Unchanged behavior: an implicit file can name the agent env file. That is
+    # not an explicit selection, so a setting of the implicit file still
+    # overrides the file that it names.
+    provider = fake_provider([text_reply("REPLY")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
     (harness.workspace / "agent.env").write_text(
-        f"DAIMONOS_AGENT_ENV={harness.agent_env}\n"
-        f"DAIMONOS_AGENT_BASE_URL=http://127.0.0.1:{implicit.port}\n")
+        f"DAIMONOS_AGENT_ENV={harness.agent_env}\nDAIMONOS_AGENT_MODEL=workspace/model\n")
 
     argv = [harness.binary, "--workspace", str(harness.workspace), "--config", str(harness.config),
             "agent", "--output", "json", "task"]
     done = run(harness, argv)
     assert done.returncode == 0, done.stderr
-    doc = only_json_document(done.stdout)
-    assert (doc["model"], doc["final_text"]) == ("test/model", "FROM THE WORKSPACE FILE")
-    assert selected.requests == []
+    assert only_json_document(done.stdout)["model"] == "workspace/model"
 
 
 def test_the_real_environment_wins_over_the_explicit_agent_env(daimonos_binary, tmp_path, fake_provider):
@@ -131,15 +134,88 @@ def test_the_home_agent_env_supplies_a_value_that_the_explicit_file_omits(
     explicit = fake_provider([text_reply("FROM THE EXPLICIT FILE")])
     harness = Harness(daimonos_binary, tmp_path, explicit.port)
     write_home_agent_env(harness, implicit.port)
-    lines = [line for line in harness.agent_env.read_text().splitlines()
-             if not line.startswith("DAIMONOS_AGENT_MODEL=")]
-    harness.agent_env.write_text("\n".join(lines) + "\n")
+    without(harness, "DAIMONOS_AGENT_MODEL")
 
     done = harness.agent("--output", "json", "task")
     assert done.returncode == 0, done.stderr
     assert only_json_document(done.stdout)["model"] == "home/model"
     assert implicit.requests == []
     assert len(explicit.requests) == 1
+
+
+def test_the_api_key_of_the_home_agent_env_is_not_sent_to_the_endpoint_of_the_explicit_file(
+        daimonos_binary, tmp_path, fake_provider):
+    # The explicit file names an endpoint and has no API key. The key of the
+    # home file must not go to that endpoint: the run stops before a request.
+    implicit = fake_provider([text_reply("FROM THE HOME FILE")])
+    explicit = fake_provider([text_reply("FROM THE EXPLICIT FILE")])
+    harness = Harness(daimonos_binary, tmp_path, explicit.port)
+    write_home_agent_env(harness, implicit.port)
+    home_file = harness.home / ".config" / "daimonos" / "agent.env"
+    home_file.write_text(home_file.read_text().replace("API_KEY=test", "API_KEY=sk-home-secret"))
+    without(harness, "DAIMONOS_AGENT_API_KEY")
+
+    done = harness.agent("--output", "json", "task")
+    assert done.returncode != 0
+    assert done.stdout == ""
+    assert "DAIMONOS_AGENT_API_KEY" in done.stderr
+    assert "Not used from an implicit agent.env file" in done.stderr
+    assert "sk-home-secret" not in done.stderr
+    assert implicit.requests == [] and explicit.requests == []
+
+
+def test_the_endpoint_of_the_home_agent_env_does_not_get_the_api_key_of_the_explicit_file(
+        daimonos_binary, tmp_path, fake_provider):
+    # The reverse: the explicit file has a key and no base URL.
+    implicit = fake_provider([text_reply("FROM THE HOME FILE")])
+    explicit = fake_provider([text_reply("FROM THE EXPLICIT FILE")])
+    harness = Harness(daimonos_binary, tmp_path, explicit.port)
+    write_home_agent_env(harness, implicit.port)
+    without(harness, "DAIMONOS_AGENT_BASE_URL")
+
+    done = harness.agent("--output", "json", "task")
+    assert done.returncode != 0
+    assert "DAIMONOS_AGENT_BASE_URL" in done.stderr
+    assert implicit.requests == [] and explicit.requests == []
+
+
+def test_the_real_environment_can_supply_a_connection_setting_for_the_explicit_file(
+        daimonos_binary, tmp_path, fake_provider):
+    implicit = fake_provider([text_reply("FROM THE HOME FILE")])
+    explicit = fake_provider([text_reply("FROM THE EXPLICIT FILE")])
+    harness = Harness(daimonos_binary, tmp_path, explicit.port)
+    write_home_agent_env(harness, implicit.port)
+    without(harness, "DAIMONOS_AGENT_API_KEY")
+
+    done = run(harness, harness.command("--output", "json", "task"), {"DAIMONOS_AGENT_API_KEY": "from-the-launcher"})
+    assert done.returncode == 0, done.stderr
+    assert only_json_document(done.stdout)["final_text"] == "FROM THE EXPLICIT FILE"
+    assert implicit.requests == []
+
+
+def test_explicit_agent_env_wins_over_the_workspace_agent_env_under_confinement(
+        daimonos_binary, tmp_path, fake_provider):
+    # With --confine-paths, only <workspace>/agent.env is an implicit file, and
+    # an agent env file must be named. Both ways to name it are explicit.
+    for index, by_option in enumerate([True, False]):
+        implicit = fake_provider([text_reply("FROM THE WORKSPACE FILE")])
+        explicit = fake_provider([text_reply("FROM THE EXPLICIT FILE")])
+        harness = Harness(daimonos_binary, tmp_path / str(index), explicit.port)
+        (harness.workspace / "agent.env").write_text(settings(implicit.port, "workspace/model"))
+        state = tmp_path / str(index) / "state"
+        state.mkdir(mode=0o700)
+        argv = [harness.binary, "--workspace", str(harness.workspace), "--state-dir", str(state),
+                "--confine-paths", "agent", "--output", "json"]
+        extra_env = {}
+        if by_option:
+            argv += ["--agent-env", str(harness.agent_env)]
+        else:
+            extra_env["DAIMONOS_AGENT_ENV"] = str(harness.agent_env)
+        done = run(harness, argv + ["task"], extra_env)
+        assert done.returncode == 0, (by_option, done.stderr)
+        doc = only_json_document(done.stdout)
+        assert (doc["model"], doc["final_text"]) == ("test/model", "FROM THE EXPLICIT FILE"), by_option
+        assert implicit.requests == [], by_option
 
 
 def test_the_home_agent_env_is_the_selected_file_without_an_explicit_file(
@@ -188,6 +264,47 @@ class CatalogEndpoint:
         self.server.server_close()
 
 
+def session_daemon_pids(socket_path):
+    """The session daemon processes that serve `socket_path`, found by command line."""
+    wanted = str(socket_path).encode()
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                argv = handle.read().split(b"\0")
+        except OSError:
+            continue  # the process ended
+        if b"session-daemon" in argv and wanted in argv:
+            pids.append(int(entry))
+    return pids
+
+
+def stop_session_daemons(socket_path, grace=20.0):
+    """Stop each session daemon of `socket_path`, and wait until it is gone.
+
+    The daemon is not a child of the test, and it does not depend on its pid
+    file here: a daemon that is still in its startup has not written one.
+    """
+    for pid in session_daemon_pids(socket_path):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + grace
+    while session_daemon_pids(socket_path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    for pid in session_daemon_pids(socket_path):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while session_daemon_pids(socket_path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
 def test_the_session_daemon_of_an_interactive_run_uses_the_explicit_agent_env(daimonos_binary, tmp_path):
     """`agent --interactive` starts the session daemon as a child process. The
     daemon asks its provider for the model catalog at startup. That request
@@ -195,6 +312,14 @@ def test_the_session_daemon_of_an_interactive_run_uses_the_explicit_agent_env(da
     the home `agent.env` that the parent process loaded.
     """
     implicit, explicit = CatalogEndpoint(), CatalogEndpoint()
+    try:
+        _daemon_uses_the_explicit_file(daimonos_binary, tmp_path, implicit, explicit)
+    finally:
+        implicit.close()
+        explicit.close()
+
+
+def _daemon_uses_the_explicit_file(daimonos_binary, tmp_path, implicit, explicit):
     harness = Harness(daimonos_binary, tmp_path, explicit.port)
     write_home_agent_env(harness, implicit.port, model="test/model")
     socket_path = tmp_path / "daemon.sock"
@@ -202,7 +327,6 @@ def test_the_session_daemon_of_an_interactive_run_uses_the_explicit_agent_env(da
         "[analytics]\nenabled=false\n"
         f'[session]\nsocket_path = "{socket_path}"\nbootstrap_timeout_secs = 10\n'
         "bootstrap_retry_interval_ms = 10\n")
-    instance_path = tmp_path / "daemon.sock.pid"
     master_fd, slave_fd = pty.openpty()
     process = subprocess.Popen(
         harness.command("--interactive"), cwd=harness.workspace,
@@ -224,18 +348,6 @@ def test_the_session_daemon_of_an_interactive_run_uses_the_explicit_agent_env(da
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        deadline = time.monotonic() + 10
-        while not instance_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if instance_path.exists():
-            try:
-                os.kill(json.loads(instance_path.read_text())["pid"], signal.SIGTERM)
-            except (ProcessLookupError, ValueError):
-                pass
-            deadline = time.monotonic() + 5
-            while socket_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
         os.close(master_fd)
-        implicit.close()
-        explicit.close()
-    assert not socket_path.exists(), "the test left a session daemon"
+        stop_session_daemons(socket_path)
+    assert session_daemon_pids(socket_path) == [], "the test left a session daemon"

@@ -16,12 +16,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `$DAIMONOS_AGENT_ENV` names. A run with `--agent-env` on a host with a home
   `agent.env` used the provider endpoint, the model, and the API key of the
   home file. The order is now: real environment, then the explicitly selected
-  file, then the implicit files. A run without an explicit selection does not
-  change.
+  file, then the implicit files. With an explicitly selected file, the
+  connection settings (provider, base URL, API key) never come from an implicit
+  file. A run without an explicit selection does not change.
 - **A signal during `daimonos acp` startup killed the process** (vikunja
   #1623). The handlers for SIGTERM, SIGINT, and SIGHUP were installed after the
-  startup requests to the provider. They are now installed first, and a signal
-  during startup ends the process with exit code 0.
+  startup requests to the provider. They are now installed before those
+  requests, and a signal during them ends the process with exit code 0.
 
 ### Changed
 

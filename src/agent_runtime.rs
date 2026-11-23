@@ -644,6 +644,15 @@ pub async fn run_acp(
     // provider. A signal during startup then ends the process with code 0.
     // No session and no tool process exists at that time, so no teardown is
     // necessary (vikunja #1623).
+    //
+    // Residual window: `main` loads the configuration and starts logging
+    // before it calls this function. A signal in that time uses the default
+    // action. That work makes no network request.
+    //
+    // A signal drops `prepare_acp` at an await point. Its steps are file reads,
+    // provider requests, and at the end the open of the analytics store. That
+    // open runs as a blocking task, which runs to its end when the future is
+    // dropped. SQLite keeps the database consistent in each case.
     let mut signals = acp_cmd::TerminationSignals::install()?;
     let startup = tokio::select! {
         startup = prepare_acp(args, cfg) => startup?,

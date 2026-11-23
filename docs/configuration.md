@@ -137,6 +137,10 @@ CLI behavior flags > real environment DAIMONOS_AGENT_* values
 
 - A value from an implicit file fills only a setting that the selected file
   omits or leaves blank.
+- A value from an implicit file never fills a connection setting:
+  `DAIMONOS_AGENT_PROVIDER`, each `..._BASE_URL`, and each `..._API_KEY`. Put
+  these into the selected file or into the real environment. A run that lacks
+  one stops at startup and names it.
 - Without an explicit selection, nothing changes: the selected file is the home
   file, and each process value overrides it.
 - A selector that an implicit file sets (`DAIMONOS_AGENT_ENV=...` in
@@ -147,6 +151,10 @@ CLI behavior flags > real environment DAIMONOS_AGENT_* values
   `DAIMONOS_AGENT_MODELS_DISCOVER`, `DAIMONOS_AGENT_MAX_TOKENS`,
   `DAIMONOS_AGENT_ERROR_RESUME`, `DAIMONOS_AGENT_AUTO_CONTINUE`, and
   `DAIMONOS_AGENT_SESSION_ID`.
+- Tool child processes inherit the process environment, with the values of the
+  implicit files. A Daimonos process that a tool starts sees those values as
+  values of the real environment. The session daemon of `agent --interactive`
+  does not: it loads the implicit files itself.
 
 Required effective values remain
 `DAIMONOS_AGENT_PROVIDER`, `DAIMONOS_AGENT_MODEL`,
