@@ -200,6 +200,52 @@ impl ToolFailure {
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::refusal(CODE_FILESYSTEM_POLICY_UNSUPPORTED, message, None)
     }
+
+    /// Cooperative tool-budget deadline hit (WP18, FR-19, ADR-031). The
+    /// `configured_ms` value is reported as both the limit and the consumed
+    /// amount: the call ran until at least the deadline. No partial success.
+    pub fn tool_timeout(argument: Option<&str>, configured_ms: u64) -> Self {
+        let mut failure = Self::refusal(
+            "tool_timeout",
+            format!("tool deadline exceeded: configured_ms={configured_ms}"),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure.budget = Some(Box::new(FailureBudget {
+            limit: configured_ms,
+            configured: configured_ms,
+            consumed: configured_ms,
+        }));
+        failure
+    }
+
+    /// Cooperative tool-budget logical-input hit (WP18, FR-19, ADR-031). Used
+    /// for both the byte ceiling and the directory-entry ceiling; `which`
+    /// names the ceiling that was hit (integrator D56 keeps the single
+    /// reviewed `tool_input_limit` code). No partial success.
+    pub fn tool_input_limit(
+        argument: Option<&str>,
+        which: &str,
+        limit: u64,
+        consumed: u64,
+    ) -> Self {
+        let mut failure = Self::refusal(
+            "tool_input_limit",
+            format!("tool input limit exceeded ({which}): configured={limit}, consumed={consumed}"),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure.budget = Some(Box::new(FailureBudget {
+            limit,
+            configured: limit,
+            consumed,
+        }));
+        failure
+    }
 }
 
 /// Configurable bounds for the authority. Caller/config supplied — no hidden

@@ -469,6 +469,29 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub tool_allowlist: Option<PathBuf>,
 
+    /// Stop an opted-in tool call at an absolute per-call deadline of N
+    /// milliseconds (WP18, FR-19, ADR-031). External work (exec, git_read)
+    /// inherits the remaining deadline and its process group is reaped. A
+    /// deadline hit returns `tool_timeout` with no partial result. Positive
+    /// integer; omitted means no new limit; default off.
+    #[arg(long = "tool-timeout-ms", global = true, value_name = "N")]
+    pub tool_timeout_ms: Option<u64>,
+
+    /// Refuse an opted-in tool call once its logical input exceeds N bytes
+    /// (WP18, FR-19, ADR-031). Counts file/git content read or scanned,
+    /// including cached-index content — not displayed output, which is a
+    /// separate truncation mechanism. A hit returns `tool_input_limit`.
+    /// Positive integer; omitted means no new limit; default off.
+    #[arg(long = "tool-input-bytes", global = true, value_name = "N")]
+    pub tool_input_bytes: Option<u64>,
+
+    /// Refuse an opted-in tool call once it walks more than N directory
+    /// entries (WP18, FR-19, ADR-031; integrator D56 `(proposed)`). A hit
+    /// returns `tool_input_limit` naming the entry ceiling. Positive integer;
+    /// omitted means no new limit; default off.
+    #[arg(long = "tool-max-entries", global = true, value_name = "N")]
+    pub tool_max_entries: Option<u64>,
+
     /// Serve and export full, self-contained JSON Schema draft 2020-12 tool
     /// schemas instead of the default stripped placeholders (WP17, FR-15).
     /// Equivalent to `[mcp] full_tool_schemas = true`; the config/env seam still

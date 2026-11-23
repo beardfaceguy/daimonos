@@ -459,6 +459,10 @@ pub async fn run_agent(
             .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
         let bootstrap = crate::session_bootstrap::connect_or_spawn(
             &crate::session_bootstrap::BootstrapOptions {
+                // FR-19 (WP18, ADR-031): carry the caller's budget into the
+                // daemon launch identity so an interactive session enforces it
+                // and an attach cannot silently downgrade it.
+                tool_budget: cfg.tool_budget,
                 workspace,
                 config_path: explicit_config_path.as_deref(),
                 state_dir: cfg
@@ -702,6 +706,24 @@ pub async fn run_agent(
         }
         None => None,
     };
+    // FR-19 (WP18, ADR-031): a cooperative tool budget is installed at THIS
+    // process's dispatch seams, but worker-routed tool calls execute inside a
+    // separate worker process the parent budget never observes — the deadline
+    // cannot stop that owned work and its input cannot be accounted. Rather
+    // than silently ignore a budget option in worker mode (the frontend rule
+    // forbids a silent drop), refuse the budgeted worker route at startup, the
+    // same fail-closed class as `reject_credential_disclosure`
+    // (ADR-031 "refuse enabled-but-unenforceable"; the INTERFACES worker rule).
+    // A default-off budget leaves worker mode exactly unchanged.
+    if worker_config_runtime.is_some() && cfg.tool_budget.any_enabled() {
+        emit_run_configuration_invalid(
+            "tool_budget_worker_unenforceable",
+            "a tool budget (--tool-timeout-ms/--tool-input-bytes/--tool-max-entries) \
+             cannot be enforced across the worker boundary: worker-routed tool calls \
+             run in a separate process, so the deadline cannot stop that work and the \
+             input cannot be accounted. Remove the budget option or --worker-config.",
+        );
+    }
     let agent = load_agent_env(agent_env, &cfg)?;
     let cfg = with_skill_dir(cfg, &agent)?;
     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());

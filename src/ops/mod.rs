@@ -31,7 +31,14 @@ pub async fn dispatch_with_progress(
     req: Request,
     on_exec_progress: Option<&ExecProgressCallback<'_>>,
 ) -> Response {
-    match req {
+    // FR-19 (WP18, ADR-031): install a fresh operation budget for this
+    // top-level call. A composite's children re-enter here and inherit the
+    // parent's budget (`owned == false`), so delegation cannot multiply the
+    // allowance or extend the deadline; the installing call clears it on
+    // return so each sequential top-level call starts fresh. When no budget
+    // option is set nothing is installed and behavior is unchanged.
+    let owned = session.begin_tool_operation();
+    let result = match req {
         Request::Single(op) => dispatch_op(session, op, on_exec_progress).await,
         Request::Batch { batch } => {
             let mut results = Vec::with_capacity(batch.len());
@@ -40,7 +47,9 @@ pub async fn dispatch_with_progress(
             }
             Response::ok(serde_json::to_value(results).unwrap())
         }
-    }
+    };
+    session.end_tool_operation(owned);
+    result
 }
 
 async fn dispatch_op(
@@ -147,6 +156,15 @@ async fn find(session: &Session, op: &Op) -> Response {
     let results = idx
         .search_scoped(&query, max, op.q.as_deref(), file_glob.as_ref())
         .await;
+    // FR-19 (WP18, ADR-031): charge the bytes returned from the cached index,
+    // so an index-answered search is accounted and not only filesystem reads.
+    // A byte-ceiling hit returns tool_input_limit with no partial results.
+    let payload = serde_json::to_string(&results)
+        .map(|text| text.len() as u64)
+        .unwrap_or(0);
+    if let Err(failure) = session.budget_charge_bytes(payload, "search") {
+        return failure.into_response("search");
+    }
     let stats = idx.stats().await;
 
     Response::ok(serde_json::json!({
@@ -258,6 +276,14 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
     .await;
     match result {
         Ok(Ok((results, stats, skipped))) => {
+            // FR-19 (WP18, ADR-031): charge bytes returned from the cached
+            // index on the confined find path too.
+            let payload = serde_json::to_string(&results)
+                .map(|text| text.len() as u64)
+                .unwrap_or(0);
+            if let Err(failure) = session.budget_charge_bytes(payload, "search") {
+                return failure.into_response("search");
+            }
             let mut value = serde_json::json!({"results": results, "index": stats});
             if skipped > 0 {
                 value["skipped"] = serde_json::json!(skipped)

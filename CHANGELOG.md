@@ -9,6 +9,24 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **Cooperative tool budgets (FR-19, ADR-031).** Three default-off, global
+  options bound a single top-level tool call: `--tool-timeout-ms N` (an absolute
+  per-call deadline), `--tool-input-bytes N` (a logical input-byte ceiling,
+  charged for file *and* git content and for bytes returned from the cached
+  index, not only filesystem reads), and `--tool-max-entries N` (a
+  directory-entry ceiling; `(proposed)` spelling). A deadline hit returns the
+  reviewed `tool_timeout`; a byte or entry hit returns `tool_input_limit`
+  naming which ceiling was hit, the configured value, and the consumed value —
+  with no partial result. A composite (`batch`, `execute_script`) shares one
+  budget with its children: they inherit the remaining allowance and the
+  absolute deadline and cannot start a fresh one. For `exec` and `git_read` the
+  deadline stops the work, not merely the wait: the managed process group is
+  `SIGTERM`/`SIGKILL` reaped so no child or grandchild outlives the result.
+  Output truncation (`--no-output-spill`) stays a separate mechanism and is
+  never a budget failure. With none of the options set, every tool is exactly
+  unchanged. A budget option with `--worker-config` is refused at startup
+  (exit `2`, `run_configuration_invalid`, `tool_budget_worker_unenforceable`):
+  the budget cannot be enforced across the worker process boundary.
 - **`--capability-probe-payload` (FR-04).** A default-off `agent --print`
   option (ADR-027) that sends exactly one unretried capability probe before any
   evidence tool runs, proving the endpoint can drive the same final-answer tool

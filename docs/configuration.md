@@ -1812,3 +1812,57 @@ The control file is JSON:
   platforms reaping relies on the SDK's `kill_on_drop` at process exit.
 
 See ADR-028 and `tests/test_worker_isolation.py`.
+
+## Cooperative tool budgets (FR-19, ADR-031)
+
+Three default-off, global command-line options bound the resources a single
+top-level tool call may consume. They are caller-owned (never read from
+`daimonos.toml`) and, when none is set, every tool behaves exactly as before.
+
+- **`--tool-timeout-ms N`** — an absolute deadline, in milliseconds, for the
+  call. A hit returns the reviewed `tool_timeout` code with no partial result.
+- **`--tool-input-bytes N`** — a logical input-byte ceiling for the call. Bytes
+  are counted for file content read, git content read, and the bytes returned
+  from the cached (trigram) index — not only filesystem reads, and never the
+  displayed/truncated output bytes. A hit returns `tool_input_limit`.
+- **`--tool-max-entries N`** *(proposed)* — a directory-entry ceiling for the
+  call (e.g. `ls` walking). A hit returns `tool_input_limit` naming
+  `directory entries`. (The reviewed interface row has no separate code for the
+  entry limit; integrator decision D56 reuses `tool_input_limit`.)
+
+Each value must be a positive integer; `0` is rejected at startup (exit `2`).
+
+**No partial success.** A limit hit is a typed tool failure naming which limit
+was hit, the configured value, and the consumed value — never a truncated
+"successful" result.
+
+**One budget per call, shared by composites.** A `batch` and an
+`execute_script` share one budget with their children: a child inherits the
+remaining allowance and the same absolute deadline and cannot open a fresh
+top-level budget, so delegation cannot multiply the allowance.
+
+**Stopped work, not a stopped wait.** For `exec` and `git_read` the deadline is
+handed to the managed subprocess, which reaps the whole process group
+(`SIGTERM`, bounded grace, then `SIGKILL`) — so no child or grandchild outlives
+the `tool_timeout` result. On non-Unix platforms the subprocess stop relies on
+the managed lifecycle's `kill_on_drop`.
+
+**Output truncation is separate.** `--no-output-spill` bounds the *displayed*
+output of a result; it is not an input budget and a truncated result is never a
+budget failure.
+
+**Workers.** Worker-routed tool calls (`--worker-config`, WP10) run in a
+separate process that this process's budget cannot observe, so the deadline
+cannot stop that work and its input cannot be accounted. Rather than silently
+ignore a budget option in worker mode, a budgeted worker route is refused at
+startup with exit `2` (`run_configuration_invalid`, reason
+`tool_budget_worker_unenforceable`). Worker mode with no budget option is
+unchanged.
+
+Every frontend that builds a session from configuration honours the budget
+(the MCP server, `agent --print`, the interactive agent / session daemon,
+`chat`, `acp`, `batch`, and `execute_script`). For the interactive agent the
+budget is part of the session-daemon launch identity, so an attach to a daemon
+started under a different (or absent) budget is refused.
+
+See ADR-031 and `tests/test_tool_budgets.py`.

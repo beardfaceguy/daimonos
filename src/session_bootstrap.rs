@@ -61,6 +61,14 @@ pub struct BootstrapOptions<'a> {
     /// Part of the launch identity so a frontend requesting it cannot silently
     /// attach to a daemon launched without it.
     pub full_tool_schemas: bool,
+    /// FR-19 (WP18, ADR-031): the caller's cooperative tool-budget options.
+    /// Part of the daemon's immutable launch identity exactly like
+    /// `workspace_read_only`: forwarded in `daemon_args`, hashed into
+    /// `bootstrap_fingerprint`, and treated as an explicit selection in
+    /// `launch_identity`, so a client requesting a budget cannot be served by a
+    /// daemon started without the same one (the daemon pins its budget from its
+    /// OWN parsed flags). All-absent keeps legacy behavior.
+    pub tool_budget: crate::tool_budget::ToolBudgetConfig,
 }
 
 pub struct BootstrapConnection {
@@ -229,6 +237,21 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
     if options.no_follow {
         args.push(OsString::from("--no-follow-symlinks"));
     }
+    // FR-19 (WP18, ADR-031): forward the caller's budget to the daemon so an
+    // interactive session actually enforces it (global flags, before the
+    // subcommand). Omitted options add nothing, preserving legacy launch args.
+    if let Some(ms) = options.tool_budget.timeout_ms {
+        args.push(OsString::from("--tool-timeout-ms"));
+        args.push(OsString::from(ms.to_string()));
+    }
+    if let Some(bytes) = options.tool_budget.input_bytes {
+        args.push(OsString::from("--tool-input-bytes"));
+        args.push(OsString::from(bytes.to_string()));
+    }
+    if let Some(entries) = options.tool_budget.max_entries {
+        args.push(OsString::from("--tool-max-entries"));
+        args.push(OsString::from(entries.to_string()));
+    }
     args.push(OsString::from("session-daemon"));
     args.push(OsString::from("--socket"));
     args.push(options.socket_path.as_os_str().to_owned());
@@ -298,6 +321,20 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
     if options.no_follow {
         digest.update(b"no-follow\0");
     }
+    // FR-19 (WP18, ADR-031): pin the budget into the launch identity so an
+    // attach cannot silently run under a different (or absent) budget.
+    if let Some(ms) = options.tool_budget.timeout_ms {
+        digest.update(b"tool-timeout-ms\0");
+        digest.update(ms.to_le_bytes());
+    }
+    if let Some(bytes) = options.tool_budget.input_bytes {
+        digest.update(b"tool-input-bytes\0");
+        digest.update(bytes.to_le_bytes());
+    }
+    if let Some(entries) = options.tool_budget.max_entries {
+        digest.update(b"tool-max-entries\0");
+        digest.update(entries.to_le_bytes());
+    }
     if let Some(provider) = options.provider {
         digest.update(provider.as_bytes());
     }
@@ -320,6 +357,7 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.confine_identity.is_none()
         && !options.ignore_config_files
         && !options.no_follow
+        && !options.tool_budget.any_enabled()
     {
         return Ok(LaunchIdentity::NotRequested);
     }
@@ -395,6 +433,7 @@ mod tests {
         agent_env: &'a Path,
     ) -> BootstrapOptions<'a> {
         BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig::default(),
             workspace,
             tool_allowlist: None,
             config_path: Some(config),
@@ -474,6 +513,71 @@ mod tests {
         );
     }
 
+    // WP18 (FR-19, ADR-031, req 1): the interactive agent runs through the
+    // session daemon, so each budget option must be a daemon launch argument
+    // AND part of the launch identity. If it were not in the identity, an
+    // attach could silently reuse a daemon with a different (or absent) budget;
+    // the client compares fingerprints and refuses on mismatch.
+    #[test]
+    fn tool_budget_is_a_daemon_argument_and_pins_the_launch_identity() {
+        let base = options(
+            Path::new("/workspace"),
+            Path::new("/config.toml"),
+            Path::new("/runtime/session.sock"),
+            Path::new("/agent.env"),
+        );
+        let budgeted = BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig {
+                timeout_ms: Some(1500),
+                input_bytes: Some(4096),
+                max_entries: Some(32),
+            },
+            ..options(
+                Path::new("/workspace"),
+                Path::new("/config.toml"),
+                Path::new("/runtime/session.sock"),
+                Path::new("/agent.env"),
+            )
+        };
+        let args = daemon_args(&budgeted);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tool-timeout-ms", "1500"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tool-input-bytes", "4096"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tool-max-entries", "32"]));
+        // The unbudgeted daemon carries none of these arguments.
+        assert!(!daemon_args(&base)
+            .iter()
+            .any(|arg| arg == "--tool-timeout-ms"));
+        // A budget changes the launch identity, so an attach to a daemon that
+        // lacks it (or has a different one) is refused.
+        assert_ne!(
+            bootstrap_fingerprint(&base),
+            bootstrap_fingerprint(&budgeted)
+        );
+        let other = BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig {
+                timeout_ms: Some(500),
+                input_bytes: None,
+                max_entries: None,
+            },
+            ..options(
+                Path::new("/workspace"),
+                Path::new("/config.toml"),
+                Path::new("/runtime/session.sock"),
+                Path::new("/agent.env"),
+            )
+        };
+        assert_ne!(
+            bootstrap_fingerprint(&budgeted),
+            bootstrap_fingerprint(&other)
+        );
+    }
+
     // WP11 (FR-09, ADR-021): explicit-only mode is pinned into the daemon's
     // launch identity, the same way --confine-paths is.
     #[test]
@@ -485,6 +589,7 @@ mod tests {
             Path::new("/agent.env"),
         );
         let explicit = BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig::default(),
             ignore_config_files: true,
             ..options(
                 Path::new("/workspace"),
@@ -512,6 +617,7 @@ mod tests {
         let config = directory.path().join("config.toml");
         let agent_env = directory.path().join("agent.env");
         let pinned = BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig::default(),
             config_path: None,
             provider: None,
             agent_env: None,
@@ -652,6 +758,7 @@ mod tests {
             LaunchIdentity::Unavailable
         );
         let bare = BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig::default(),
             config_path: None,
             provider: None,
             agent_env: None,
@@ -776,6 +883,7 @@ mod tests {
         // explicit selection (not NotRequested), so it is compared against the
         // daemon's published identity.
         let read_only = BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig::default(),
             config_path: None,
             provider: None,
             agent_env: None,
@@ -786,6 +894,7 @@ mod tests {
         // The running daemon published a NON-read-only fingerprint (its own
         // bare identity). The client must NOT silently attach.
         let non_read_only = BootstrapOptions {
+            tool_budget: crate::tool_budget::ToolBudgetConfig::default(),
             config_path: None,
             provider: None,
             agent_env: None,

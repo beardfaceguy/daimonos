@@ -24,6 +24,14 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
     if let Some(index) = &session.index {
         index.observe_path(&path).await;
     }
+    // FR-19 (WP18, ADR-031): charge the logical file content read before
+    // producing any result. A byte-ceiling hit returns tool_input_limit with no
+    // partial content (output truncation is a separate mechanism).
+    if let Err(failure) =
+        session.budget_charge_bytes(content.len() as u64, op.p.as_deref().unwrap_or("read_file"))
+    {
+        return failure.into_response("read_file");
+    }
 
     let total_lines = content.lines().count();
     let offset = op.n.unwrap_or(0).max(0) as usize;
@@ -114,6 +122,12 @@ async fn read_confined(session: &mut Session, op: &Op) -> Response {
         Ok(Err(error)) => return Response::err(4, &format!("io: {error}")),
         Err(error) => return Response::err(4, &format!("io: {error}")),
     };
+    // FR-19 (WP18, ADR-031): charge logical file content for confined reads too.
+    if let Err(failure) =
+        session.budget_charge_bytes(content.len() as u64, op.p.as_deref().unwrap_or("read_file"))
+    {
+        return failure.into_response("read_file");
+    }
     let total_lines = content.lines().count();
     let offset = op.n.unwrap_or(0).max(0) as usize;
     let limit = op.n2.unwrap_or(0);
@@ -432,8 +446,15 @@ pub async fn ls(session: &Session, op: &Op) -> Response {
     };
 
     let mut entries = Vec::new();
-    if let Err(e) = ls_recurse(&path, &path, depth, &opts, &mut entries).await {
+    let mut walked = 0u64;
+    if let Err(e) = ls_recurse(&path, &path, depth, &opts, &mut entries, &mut walked).await {
         return Response::err(4, &format!("ls: {e}"));
+    }
+    // FR-19 (WP18, ADR-031): charge directory entries walked. An entry-ceiling
+    // hit returns tool_input_limit (integrator D56) naming the entry limit,
+    // with no partial listing. No-op when no entry budget is set.
+    if let Err(failure) = session.budget_charge_entries(walked, "ls") {
+        return failure.into_response("ls");
     }
 
     entries.sort_by(|a, b| {
@@ -503,6 +524,13 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
         Err(error) => return Response::err(4, &format!("ls: {error}")),
     };
     let (skipped, skipped_links) = walk.skipped_summary();
+    // FR-19 (WP18, ADR-031): charge directory entries walked on the confined
+    // path too (entries visited plus those skipped by the walk). No-op when no
+    // entry budget is set.
+    let walked = walk.entries.len() as u64 + skipped as u64 + skipped_links as u64;
+    if let Err(failure) = session.budget_charge_entries(walked, "ls") {
+        return failure.into_response("ls");
+    }
     let mut entries = Vec::new();
     for entry in walk.entries {
         let Ok(relative) = entry.relative_path.strip_prefix(&base) else {
@@ -554,6 +582,7 @@ async fn ls_recurse(
     depth: usize,
     opts: &LsOpts<'_>,
     entries: &mut Vec<serde_json::Value>,
+    walked: &mut u64,
 ) -> Result<(), String> {
     let mut dir = tokio::fs::read_dir(path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -564,6 +593,9 @@ async fn ls_recurse(
     })?;
 
     while let Ok(Some(entry)) = dir.next_entry().await {
+        // FR-19 (WP18, ADR-031): every directory entry visited counts, before
+        // any hidden/skip/type/glob filter, so the charged input is honest.
+        *walked += 1;
         let name = entry.file_name().to_string_lossy().to_string();
         if !opts.show_all && name.starts_with('.') {
             continue;
@@ -630,7 +662,15 @@ async fn ls_recurse(
         }
 
         if is_dir && depth > 1 {
-            let _ = Box::pin(ls_recurse(root, &entry.path(), depth - 1, opts, entries)).await;
+            let _ = Box::pin(ls_recurse(
+                root,
+                &entry.path(),
+                depth - 1,
+                opts,
+                entries,
+                walked,
+            ))
+            .await;
         }
     }
 
@@ -945,6 +985,14 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
                     .collect::<Vec<_>>();
                 index.observe_paths(observed).await;
             }
+            // FR-19 (WP18, ADR-031): charge the logical input the search
+            // returns on the filesystem path. A byte-ceiling hit returns
+            // tool_input_limit with no partial matches. No-op when unset.
+            if let Err(failure) =
+                session.budget_charge_bytes(search_payload_bytes(&matches), "search")
+            {
+                return failure.into_response("search");
+            }
             Response::ok(json!({"matches": matches}))
         }
         Ok(Err(e)) => Response::err(4, &format!("grep: {e}")),
@@ -1074,6 +1122,13 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
     .await;
     match result {
         Ok(Ok((matches, skipped))) => {
+            // FR-19 (WP18, ADR-031): charge returned matches on the confined
+            // filesystem path too.
+            if let Err(failure) =
+                session.budget_charge_bytes(search_payload_bytes(&matches), "search")
+            {
+                return failure.into_response("search");
+            }
             let mut value = json!({"matches": matches});
             if skipped > 0 {
                 value["skipped"] = json!(skipped)
@@ -1160,6 +1215,17 @@ fn grep_blocking(
     }
 
     Ok(matches)
+}
+
+/// FR-19 (WP18, ADR-031): logical input charged for a search result set — the
+/// serialized byte length of the matches/results the tool returns. This is the
+/// metered input for both the filesystem (grep) and cached-index (find) search
+/// paths, so bytes returned from the index are charged, not only filesystem
+/// reads. Context: src/tool_budget.rs.
+pub(crate) fn search_payload_bytes(results: &[serde_json::Value]) -> u64 {
+    serde_json::to_string(results)
+        .map(|text| text.len() as u64)
+        .unwrap_or(0)
 }
 
 fn glob_match_simple(pattern: &str, path: &str) -> bool {

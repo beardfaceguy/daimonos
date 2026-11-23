@@ -65,6 +65,7 @@ mod skills;
 mod snapshot;
 mod state_root;
 mod structured_output;
+mod tool_budget;
 mod tool_contract;
 mod tool_descriptions;
 mod tool_facade;
@@ -545,6 +546,32 @@ async fn main() -> anyhow::Result<()> {
     if cli.no_output_spill {
         cfg.tool_output.save_full_output = false;
     }
+    // FR-19 (WP18, ADR-031): pin the caller's cooperative tool-budget options.
+    // Positive integers only; a zero is a non-positive limit and is refused at
+    // startup with a named error rather than silently disabling the budget.
+    // Caller-owned: set only here, never from workspace/user config.
+    for (name, value) in [
+        ("--tool-timeout-ms", cli.tool_timeout_ms),
+        ("--tool-input-bytes", cli.tool_input_bytes),
+        ("--tool-max-entries", cli.tool_max_entries),
+    ] {
+        if value == Some(0) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "code": "run_configuration_invalid",
+                    "reason": "tool_budget_invalid",
+                    "message": format!("{name} must be a positive integer")
+                }})
+            );
+            std::process::exit(2);
+        }
+    }
+    cfg.tool_budget = crate::tool_budget::ToolBudgetConfig {
+        timeout_ms: cli.tool_timeout_ms,
+        input_bytes: cli.tool_input_bytes,
+        max_entries: cli.tool_max_entries,
+    };
     // FR-07 (ADR-022): pin the read-only workspace decision before any writer.
     cfg.workspace_read_only = cli.workspace_read_only;
     if cfg.workspace_read_only

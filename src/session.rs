@@ -89,6 +89,15 @@ pub struct Session {
     /// and model-visible listing. Unrestricted keeps legacy behavior.
     /// Context: src/run_policy.rs::ToolPolicy.
     pub policy: crate::run_policy::ToolPolicy,
+    /// Caller's cooperative tool-budget options (FR-19, WP18, ADR-031), copied
+    /// from `cfg.tool_budget`. Used to install a fresh operation budget at each
+    /// top-level tool call. Context: src/tool_budget.rs.
+    pub tool_budget_config: crate::tool_budget::ToolBudgetConfig,
+    /// The operation budget in force for the current top-level tool call, or
+    /// `None` between calls / when no budget option is set. Installed once per
+    /// top-level call and shared (inherited, never reset) by composite children
+    /// so delegation cannot multiply the allowance (ADR-031).
+    pub tool_budget: Option<Arc<crate::tool_budget::ToolBudget>>,
 }
 
 pub type BgProcess = crate::managed_process::ManagedBackground;
@@ -121,6 +130,7 @@ impl Session {
             relocated(cfg.snapshot_directory.as_ref()),
         );
         let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+        let tool_budget_config = cfg.tool_budget;
         Self {
             workspace,
             cwd,
@@ -146,7 +156,92 @@ impl Session {
             authority,
             admission,
             policy,
+            tool_budget_config,
+            tool_budget: None,
         }
+    }
+
+    /// Install a fresh operation budget for a top-level tool call unless one is
+    /// already active (a composite's children inherit the parent's). Returns
+    /// `true` when this call installed the budget and must clear it afterwards
+    /// (FR-19, WP18, ADR-031). Context: src/tool_budget.rs.
+    pub fn begin_tool_operation(&mut self) -> bool {
+        if self.tool_budget.is_some() {
+            return false;
+        }
+        self.tool_budget = self.tool_budget_config.start();
+        self.tool_budget.is_some()
+    }
+
+    /// Clear the operation budget if this call owned it. A composite child
+    /// (`owned == false`) leaves the parent's budget in place.
+    pub fn end_tool_operation(&mut self, owned: bool) {
+        if owned {
+            self.tool_budget = None;
+        }
+    }
+
+    /// Charge `bytes` logical input against the active budget. Returns the
+    /// typed [`crate::path_policy::ToolFailure`] when the ceiling is exceeded;
+    /// a no-op when no byte budget is active.
+    pub fn budget_charge_bytes(
+        &self,
+        bytes: u64,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            budget
+                .charge_bytes(bytes)
+                .map_err(|hit| hit.into_failure(Some(argument)))?;
+        }
+        Ok(())
+    }
+
+    /// Charge `entries` directory entries against the active budget.
+    pub fn budget_charge_entries(
+        &self,
+        entries: u64,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            budget
+                .charge_entries(entries)
+                .map_err(|hit| hit.into_failure(Some(argument)))?;
+        }
+        Ok(())
+    }
+
+    /// Remaining time until the active budget's absolute deadline, to hand to
+    /// the managed-subprocess path so external work (exec, git_read) inherits
+    /// but never extends it (FR-19, WP18, ADR-031). `None` when no budget or no
+    /// deadline is active.
+    pub fn budget_remaining(&self) -> Option<std::time::Duration> {
+        self.tool_budget.as_ref().and_then(|b| b.remaining())
+    }
+
+    /// The typed `tool_timeout` failure for the active budget, used after the
+    /// managed-subprocess path reports it stopped external work at the
+    /// deadline. `None` when no budget is active.
+    pub fn budget_timeout_failure(
+        &self,
+        argument: &str,
+    ) -> Option<crate::path_policy::ToolFailure> {
+        self.tool_budget
+            .as_ref()
+            .map(|b| b.timeout_failure(Some(argument)))
+    }
+
+    /// Error if the active budget's absolute deadline has passed.
+    pub fn budget_check_deadline(
+        &self,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            budget
+                .check_deadline()
+                .map_err(|hit| hit.into_failure(Some(argument)))?;
+        }
+        Ok(())
     }
 
     /// Build the initial session environment with an enhanced PATH.
