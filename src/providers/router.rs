@@ -178,6 +178,89 @@ impl LlmProvider for MultiProvider {
     }
 }
 
+/// WP07 controlled provider (ADR-025, FR-04 requirements 1-13).
+///
+/// Context: docs/contexts/reviewer-runtime/CONTEXT.md; ADR-025. Wraps one
+/// validated controlled profile and routes every completion through the opt-in
+/// controlled transport ([`super::controlled_send`]). It performs no model
+/// discovery (the trait defaults return `None`, so no hidden catalog supplies a
+/// default) and exposes no legacy fallback: if the profile cannot build, the
+/// run fails rather than silently reverting to a default client.
+pub struct ControlledProvider {
+    spec: super::ControlledModelSpec,
+    request: super::ControlledRequest,
+    /// Resolved from the profile's named variable only; never logged or exported.
+    credential: String,
+    /// WP09 (G3): the transport observation of the most recent completion,
+    /// drained once per response by the agent loop for the audit's
+    /// `model_request` event. Interior-mutable because `complete` takes `&self`.
+    last_observation: std::sync::Mutex<Option<super::ControlledObservation>>,
+}
+
+impl ControlledProvider {
+    /// Build from a validated profile, resolving the credential from the named
+    /// environment variable (FR-04 req 1-2: the value comes only from there,
+    /// never combined with another source).
+    pub fn from_profile(profile: super::ControlledProfile) -> Result<Self, String> {
+        let credential = std::env::var(&profile.spec.credential_env).map_err(|_| {
+            format!(
+                "controlled credential variable {} is not set",
+                profile.spec.credential_env
+            )
+        })?;
+        if credential.trim().is_empty() {
+            return Err(format!(
+                "controlled credential variable {} is empty",
+                profile.spec.credential_env
+            ));
+        }
+        Ok(ControlledProvider {
+            spec: profile.spec,
+            request: profile.request,
+            credential,
+            last_observation: std::sync::Mutex::new(None),
+        })
+    }
+}
+
+impl std::fmt::Debug for ControlledProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlledProvider")
+            .field("provider_label", &self.spec.provider_label)
+            .field("model", &self.spec.model)
+            .field("wire", &self.spec.wire.as_str())
+            .field("credential", &"[redacted]")
+            .finish()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ControlledProvider {
+    /// Route the completion through the controlled transport. The profile owns
+    /// the model and max_tokens, so `opts` is intentionally ignored here.
+    async fn complete(&self, ctx: &Context, _opts: &CompleteOpts) -> LlmResponse {
+        let mut obs = super::ControlledObservation::default();
+        let response =
+            super::controlled_send(&self.spec, &self.request, &self.credential, ctx, &mut obs)
+                .await;
+        *self
+            .last_observation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(obs);
+        response
+    }
+
+    fn take_controlled_observation(&self) -> Option<super::ControlledObservation> {
+        self.last_observation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+    // `stream` falls back to `complete` (controlled mode is non-streaming: the
+    // fixed body has no `stream` field). `list_models`/`context_window`/
+    // `thinking_levels` keep the trait default `None`: no hidden discovery.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

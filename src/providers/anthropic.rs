@@ -483,6 +483,104 @@ fn build_request(ctx: &Context, opts: &CompleteOpts) -> AnthropicRequest {
     build_request_with_cache(ctx, opts, false)
 }
 
+// --- WP07 controlled Messages wire (ADR-025, FR-04 requirements 1-13) ---
+//
+// Context: ADR-025. This is the Messages wire's provider-local serialization
+// for the controlled transport. It is deliberately separate from
+// `build_request_with_cache`: it emits ONLY the fixed body/header sets, sends
+// automatic tool choice explicitly, never a forced choice, never a sampling or
+// cache or thinking field, and uses the stable `/v1/messages` path only.
+
+/// Build the fixed controlled Messages request (body + exact header set + URL).
+/// The caller resolves `credential` from the profile's named variable; it is
+/// injected into the `x-api-key` header and never logged.
+pub(crate) fn controlled_request(
+    spec: &super::ControlledModelSpec,
+    req: &super::ControlledRequest,
+    credential: &str,
+    ctx: &Context,
+) -> Result<super::ControlledHttp, String> {
+    // Messages, with no cache_control (is_prefix_boundary = false everywhere).
+    let messages: Vec<AnthropicMessage> = ctx
+        .messages
+        .iter()
+        .filter_map(|msg| message_to_anthropic(msg, false))
+        .collect();
+    // Tool definitions carry no cache_control and no provider "strict" flag.
+    let tools: Vec<Value> = ctx
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), json!(spec.model));
+    // max_tokens is caller-owned (FR-04 req 6, 11); the Messages wire requires
+    // it, enforced at startup in `ControlledProfile::from_json`. Emit the
+    // caller value; never inject a built-in default on the request path.
+    if let Some(max_tokens) = req.max_tokens {
+        body.insert("max_tokens".to_string(), json!(max_tokens));
+    }
+    if let Some(system) = &ctx.system {
+        body.insert("system".to_string(), json!(system));
+    }
+    body.insert(
+        "messages".to_string(),
+        serde_json::to_value(&messages)
+            .map_err(|e| format!("controlled messages serialize failed: {e}"))?,
+    );
+    body.insert("tools".to_string(), json!(tools));
+    // Explicit automatic tool choice whenever tools are offered; never forced,
+    // never `any`/`required` (FR-04 req 5).
+    if !tools.is_empty() {
+        body.insert("tool_choice".to_string(), json!({ "type": "auto" }));
+    }
+    super::apply_extra_body_fields(&mut body, &req.extra_body_fields)?;
+
+    // Stable path only; never a beta path or beta query string (FR-04 req 7).
+    let url = format!("{}/v1/messages", spec.base_url.trim_end_matches('/'));
+    let headers = vec![
+        ("x-api-key".to_string(), credential.to_string()),
+        (
+            "anthropic-version".to_string(),
+            ANTHROPIC_VERSION.to_string(),
+        ),
+        ("content-type".to_string(), "application/json".to_string()),
+    ];
+    Ok(super::ControlledHttp {
+        url,
+        headers,
+        body: Value::Object(body),
+    })
+}
+
+/// Decode a successful controlled Messages response body.
+pub(crate) fn controlled_decode(body: &str, model: &str) -> LlmResponse {
+    let raw: AnthropicResponse = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return LlmResponse::error(format!("controlled parse error: {e}")),
+    };
+    let content = raw
+        .content
+        .into_iter()
+        .flat_map(AnthropicResponseBlock::into_contents)
+        .collect();
+    LlmResponse {
+        retryable: false,
+        content,
+        stop_reason: map_stop_reason(raw.stop_reason.as_deref()),
+        error_message: None,
+        context_overflow: false,
+        usage: map_usage(raw.usage, model),
+    }
+}
+
 // --- Streaming (vikunja #957) ---
 
 /// One in-progress content block, tracked by SSE `index` from

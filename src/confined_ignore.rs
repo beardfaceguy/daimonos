@@ -32,6 +32,19 @@ pub(crate) struct ConfinedIgnore {
 }
 
 impl ConfinedIgnore {
+    /// An ignore set that matches nothing. WP11 (FR-09, ADR-021): under
+    /// explicit-only mode the confined walkers build this instead of reading
+    /// `.gitignore`/`.ignore`/`.git/info/exclude`, so a hostile ignore file
+    /// cannot steer confined `grep`/`find`. `is_ignored` always returns false.
+    pub(crate) fn disabled(authority: &FilesystemAuthority) -> Self {
+        Self {
+            root: authority.root().to_path_buf(),
+            layers: Vec::new(),
+            ignored_dirs: Vec::new(),
+            git_roots: Vec::new(),
+        }
+    }
+
     pub(crate) fn from_walk(authority: &FilesystemAuthority, start: &Path, walk: &Walk) -> Self {
         let mut directories = BTreeSet::new();
         directories.insert(PathBuf::new());

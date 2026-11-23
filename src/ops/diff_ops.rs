@@ -84,8 +84,10 @@ async fn read_for_diff(
     argument: &str,
 ) -> Result<String, Response> {
     if let Some(authority) = &session.authority {
+        // WP14: honor no-follow so a symlink input is refused with its target
+        // text, never diffed through to the target's content.
         let entry = authority
-            .open_read(path)
+            .open_read_policy(path)
             .map_err(|error| error.with_argument(argument).into_response("diff_files"))?;
         return tokio::task::spawn_blocking(move || {
             use std::io::Read;

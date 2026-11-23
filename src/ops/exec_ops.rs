@@ -533,6 +533,12 @@ async fn capture_exec(
     env: &HashMap<String, String>,
     on_progress: Option<&ExecProgressCallback<'_>>,
 ) -> Response {
+    // FR-19 (WP18, ADR-031): if the cooperative budget's deadline already
+    // passed, refuse before spawning anything rather than start work we would
+    // immediately have to stop. No budget / no deadline is a no-op.
+    if let Err(failure) = session.budget_check_deadline("exec") {
+        return failure.into_response("exec");
+    }
     let mut command = build_command(cmd, args);
     command.current_dir(cwd);
     crate::managed_process::apply_environment(&mut command, &session.cfg.process, env);
@@ -541,17 +547,24 @@ async fn capture_exec(
             callback(ExecProgress::Output(text));
         }
     });
-    let output = match crate::managed_process::capture(
+    // FR-19 (WP18, ADR-031): hand the budget's remaining deadline to the
+    // managed-process path so the exec is stopped (TERM/grace/KILL, whole
+    // process group reaped) at the sooner of it and the process default. A
+    // budget-deadline stop becomes a typed `tool_timeout` below; `None` keeps
+    // legacy behavior exactly.
+    let budget_deadline = session.budget_remaining();
+    let (output, budget_fired) = match crate::managed_process::capture_budgeted(
         &mut command,
         &session.cfg.process,
         progress
             .as_ref()
             .map(|callback| callback as &crate::managed_process::ProgressCallback<'_>),
         None,
+        budget_deadline,
     )
     .await
     {
-        Ok(output) => output,
+        Ok(result) => result,
         Err(error) => {
             if let Some(callback) = on_progress {
                 callback(ExecProgress::Exit {
@@ -567,6 +580,14 @@ async fn capture_exec(
             code: output.status.code(),
             signal: exit_signal(&output.status),
         });
+    }
+    // FR-19 (WP18, ADR-031): a cooperative-budget deadline stop returns the
+    // typed `tool_timeout` with no partial exec result, distinct from the
+    // legacy process-timeout (exit 6) path below.
+    if budget_fired {
+        if let Some(failure) = session.budget_timeout_failure("exec") {
+            return failure.into_response("exec");
+        }
     }
     if output.timed_out {
         return Response::err(
@@ -655,6 +676,7 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
         &mut command,
         &session.cfg.process,
         &format!("bg-{pid}"),
+        session.cfg.tool_output.save_full_output,
     ) {
         Ok(process) => process,
         Err(e) => return Response::err(5, &format!("spawn: {e}")),
@@ -662,10 +684,14 @@ pub async fn bg(session: &mut Session, op: &Op) -> Response {
     let output_path = process.output_path.clone();
     session.bg_processes.insert(pid, process);
 
-    Response::ok(json!({
-        "pid": pid,
-        "log": output_path.to_string_lossy(),
-    }))
+    // No-spill (ADR-021, FR-11): advertise the artifact path only when one was
+    // written. Under `--no-output-spill` the bounded output is read back via
+    // `poll` alone, so no saved-file pointer is emitted.
+    let mut data = json!({ "pid": pid });
+    if let Some(path) = &output_path {
+        data["log"] = json!(path.to_string_lossy());
+    }
+    Response::ok(data)
 }
 
 pub async fn poll(session: &mut Session, op: &Op) -> Response {
@@ -681,21 +707,18 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
     };
 
     let status = process.try_wait();
-    let output_path = process.output_path.clone();
     let tail_n = session.cfg.process.poll_tail_lines;
+    let max_read = session.cfg.process.output_memory_bytes;
 
     match status {
         Ok(Some(exit)) => {
             let code = exit.code().unwrap_or(-1);
             if let Some(mut process) = session.bg_processes.remove(&pid) {
                 let _ = process.settle_output().await;
-                let tail = crate::managed_process::tail_lines(
-                    &output_path,
-                    tail_n,
-                    session.cfg.process.output_memory_bytes,
-                )
-                .await
-                .ok();
+                // No-spill (ADR-021, FR-11): `read_tail` serves the in-memory
+                // buffer when no artifact file was written, so the caller sees
+                // the same bounded tail either way.
+                let tail = process.read_tail(tail_n, max_read).await.ok();
                 process.cleanup_artifact();
                 return Response::ok(json!({
                     "running": false,
@@ -710,13 +733,7 @@ pub async fn poll(session: &mut Session, op: &Op) -> Response {
             }))
         }
         Ok(None) => {
-            let tail = crate::managed_process::tail_lines(
-                &output_path,
-                tail_n,
-                session.cfg.process.output_memory_bytes,
-            )
-            .await
-            .ok();
+            let tail = process.read_tail(tail_n, max_read).await.ok();
             Response::ok(json!({
                 "running": true,
                 "tail": tail,
@@ -742,7 +759,9 @@ pub async fn kill(session: &mut Session, op: &Op) -> Response {
     let grace = std::time::Duration::from_millis(session.cfg.process.termination_grace_ms);
     match process.terminate(grace).await {
         Ok(_) => {
-            crate::managed_process::remove_artifact(&output_path);
+            if let Some(path) = &output_path {
+                crate::managed_process::remove_artifact(path);
+            }
             Response::ok(json!({"ok": true}))
         }
         Err(e) => Response::err(4, &format!("kill: {e}")),

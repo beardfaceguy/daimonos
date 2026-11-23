@@ -246,6 +246,17 @@ fn cap_tool_result(content: &str) -> String {
                 path.display()
             ));
         }
+    } else if content.contains(crate::tool_output::NO_SPILL_MARKER)
+        && !out.contains("output not saved")
+    {
+        // No-spill results (ADR-021, FR-11) carry `NO_SPILL_MARKER` *between*
+        // head and tail and have no saved-file pointer to re-attach. Eliding
+        // the middle would drop the only truncation signal, so the summariser
+        // could mistake head+tail for a complete result. Re-attach an explicit,
+        // saved-file-free truncation note so the elision stays honest.
+        out.push_str(
+            " [truncated; output not saved — re-read with offset/limit or narrow the query]",
+        );
     }
     out
 }
@@ -350,6 +361,46 @@ mod tests {
         assert!(
             capped.contains(crate::tool_output::TRUNCATED_MARKER),
             "recovery pointer must survive"
+        );
+    }
+
+    /// R3 (ADR-021, FR-11): a no-spill result longer than
+    /// `SUMMARY_TOOL_RESULT_CAP` carries `NO_SPILL_MARKER` *between* its head
+    /// and tail, so eliding the middle for the summariser transcript drops the
+    /// only truncation signal. Unlike the default path there is no saved-file
+    /// pointer to re-attach, so without a fix the summariser would treat a
+    /// partial result as whole. The cap must keep an explicit truncation note.
+    #[test]
+    fn cap_tool_result_keeps_a_no_spill_truncation_note_when_eliding() {
+        let head: String = "a".repeat(300);
+        let tail: String = "b".repeat(300);
+        let content = format!(
+            "{head}\n... {} ...\n{tail}",
+            crate::tool_output::NO_SPILL_MARKER
+        );
+        assert!(
+            content.chars().count() > SUMMARY_TOOL_RESULT_CAP,
+            "precondition: the no-spill result must exceed the cap so the middle is elided"
+        );
+        let capped = cap_tool_result(&content);
+        // The elision budget plus a short re-attached truncation note may run a
+        // little past the soft cap, exactly as the default saved-file pointer
+        // re-attach does; the cap sizes the *elision*, not the final string.
+        // The middle (and with it NO_SPILL_MARKER) is gone...
+        assert!(!capped.contains(crate::tool_output::NO_SPILL_MARKER));
+        // ...so an explicit, saved-file-free truncation note must remain, or the
+        // summariser would read the head+tail as a complete result.
+        assert!(
+            capped.contains("truncated"),
+            "no-spill truncation must stay explicit after elision: {capped}"
+        );
+        assert!(
+            capped.contains("output not saved"),
+            "the note must not imply a recoverable saved file: {capped}"
+        );
+        assert!(
+            !capped.contains(crate::tool_output::TRUNCATED_MARKER),
+            "must never advertise a saved-file pointer for no-spill content"
         );
     }
 
