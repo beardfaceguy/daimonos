@@ -225,6 +225,24 @@ impl ToolFailure {
     /// for both the byte ceiling and the directory-entry ceiling; `which`
     /// names the ceiling that was hit (integrator D56 keeps the single
     /// reviewed `tool_input_limit` code). No partial success.
+    /// Cooperative tool-budget refusal (WP18, FR-19, ADR-031): a tool whose
+    /// relevant input/entry budget cannot be enforced is REFUSED when that
+    /// budget is enabled, rather than silently exempted (INTERFACES.md row
+    /// WP18). Used for process-starting plugins (no meterable logical input)
+    /// and the index-answered search (cached index content is not exposed as a
+    /// byte count). Deadline enforcement is unaffected.
+    pub fn tool_budget_unenforceable(argument: Option<&str>, detail: &str) -> Self {
+        let mut failure = Self::refusal(
+            "tool_budget_unenforceable",
+            format!("input/entry budget cannot be enforced for this tool: {detail}"),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure
+    }
+
     pub fn tool_input_limit(
         argument: Option<&str>,
         which: &str,

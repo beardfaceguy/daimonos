@@ -191,10 +191,60 @@ impl Session {
     ) -> Result<(), crate::path_policy::ToolFailure> {
         if let Some(budget) = &self.tool_budget {
             budget
-                .charge_bytes(bytes)
+                .charge_input(bytes)
                 .map_err(|hit| hit.into_failure(Some(argument)))?;
         }
         Ok(())
+    }
+
+    /// A clone of the active operation budget, for handing the shared `Arc`
+    /// into a blocking search worker so the worker itself meters scanned bytes
+    /// and checks the deadline (FR-19 F1/F2). `None` when no budget is active.
+    pub fn tool_budget(&self) -> Option<std::sync::Arc<crate::tool_budget::ToolBudget>> {
+        self.tool_budget.clone()
+    }
+
+    /// Install (or clear with `None`) the operation budget directly. Used by
+    /// `execute_script` (FR-19 F4): the script owns ONE shared budget and
+    /// installs it on the session only inside each inner per-op lock, clearing
+    /// it when the lock is released, so the budget never lingers on the shared
+    /// session between ops where a concurrent top-level call could inherit it.
+    /// `begin_tool_operation` then sees it already installed and inherits.
+    pub fn set_operation_budget(
+        &mut self,
+        budget: Option<std::sync::Arc<crate::tool_budget::ToolBudget>>,
+    ) {
+        self.tool_budget = budget;
+    }
+
+    /// True when ANY operation budget is active (deadline, byte, or entry).
+    /// Used to refuse composite routes whose external work cannot be governed
+    /// cooperatively (e.g. `tool_pipeline`).
+    pub fn budget_active(&self) -> bool {
+        self.tool_budget.is_some()
+    }
+
+    /// True when the active budget carries an input-byte or directory-entry
+    /// ceiling (a logical-input budget a tool must be able to meter).
+    pub fn budget_has_input_limits(&self) -> bool {
+        self.tool_budget
+            .as_ref()
+            .is_some_and(|b| b.has_input_limits())
+    }
+
+    /// Refuse `tool` when an input/entry budget is enabled but the tool reads
+    /// no meterable logical input (a process-starting plugin, the index
+    /// search): return the typed `tool_budget_unenforceable` failure rather
+    /// than exempt it silently (ADR-031). `None` when nothing need be refused.
+    pub fn budget_input_refusal(&self, tool: &str) -> Option<crate::path_policy::ToolFailure> {
+        if self.budget_has_input_limits() {
+            Some(crate::path_policy::ToolFailure::tool_budget_unenforceable(
+                Some(tool),
+                "it starts external work whose logical input is not metered",
+            ))
+        } else {
+            None
+        }
     }
 
     /// Charge `entries` directory entries against the active budget.

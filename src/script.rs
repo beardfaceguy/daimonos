@@ -512,6 +512,14 @@ fn build_globals(
     op_count: Arc<AtomicUsize>,
     subcall: Option<SubcallEnv>,
 ) -> Globals {
+    // FR-19 F4 (WP18, ADR-031): create ONE shared operation budget for the
+    // whole script here, so every inner op charges the same cumulative
+    // allowance against the same absolute deadline. It is installed on the
+    // session only inside each per-op lock (see dispatch_request /
+    // dispatch_tool_by_name) and cleared when the lock is released, so it never
+    // lingers on the shared session where a concurrent top-level MCP call could
+    // inherit it. `None` when no budget option is set (legacy behavior).
+    let budget = handle.block_on(async { session.lock().await.cfg.tool_budget.start() });
     // We store session + handle + cancel flag in a thread-local so the
     // starlark_module functions can access them without capturing closures.
     TOOL_CTX.with(|ctx| {
@@ -521,6 +529,7 @@ fn build_globals(
             subcall,
             cancel,
             op_count,
+            budget,
         });
     });
 
@@ -572,6 +581,10 @@ struct ToolContext {
     /// Owned by the caller so the count survives even when the script errors
     /// after dispatching some ops.
     op_count: Arc<AtomicUsize>,
+    /// FR-19 F4: the one shared operation budget for this script, installed on
+    /// the session inside each per-op lock and cleared on release. `None` when
+    /// no budget option is set.
+    budget: Option<Arc<crate::tool_budget::ToolBudget>>,
 }
 
 thread_local! {
@@ -643,10 +656,16 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
         let child_span =
             crate::observability::ToolSpan::new(label, crate::observability::tool_kind(label));
         let session = ctx.session.clone();
+        let budget = ctx.budget.clone();
         let resp = child_span.span().in_scope(|| {
             ctx.handle.block_on(async {
                 let mut s = session.lock().await;
+                // FR-19 F4: install the shared budget only while this op holds
+                // the lock; clear it before release so it never leaks to a
+                // concurrent top-level call. begin_tool_operation inherits it.
+                s.set_operation_budget(budget.clone());
                 let resp = ops::dispatch(&mut s, request).await;
+                s.set_operation_budget(None);
                 if let Some(analytics) = s.analytics.clone() {
                     let resp_chars = response_chars(&resp);
                     let (saved_tokens, savings_pct) =
@@ -721,11 +740,14 @@ fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Respons
         None => with_ctx(|ctx| {
             let started = std::time::Instant::now();
             let request_chars = serde_json::to_string(args).map(|s| s.len()).unwrap_or(0);
+            let budget = ctx.budget.clone();
             ctx.handle.block_on(async {
                 let mut session = ctx.session.lock().await;
-                let Some((content, is_error, meta)) =
-                    crate::mcp::dispatch_local_tool(&mut session, name, args).await
-                else {
+                // FR-19 F4: shared budget bounded to this locked op (see above).
+                session.set_operation_budget(budget.clone());
+                let dispatched = crate::mcp::dispatch_local_tool(&mut session, name, args).await;
+                session.set_operation_budget(None);
+                let Some((content, is_error, meta)) = dispatched else {
                     if name.starts_with("mcp__") {
                         return Err(anyhow::anyhow!(
                             "remote MCP tool '{name}' is unavailable in execute_script: \

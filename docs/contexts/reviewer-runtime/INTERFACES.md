@@ -426,3 +426,18 @@ Implementation status (WP06, r3 review fixes): the model-facing catalog is now f
 Implementation status: WP06 (r2 review fixes) extends the above. The explicit policy now also filters schema lookup (`get_tool_schema`), the Starlark signature dump (`list_tool_signatures`), the MCP server-instructions signature section, the session-daemon socket listing, and the agent-print offered catalog — so the served, discovered, probed, dumped, and dispatched sets agree (ADR-023). With `--final-output`, an allowlist that omits the designated final-answer tool fails at startup with exit-2 `run_configuration_invalid` reason `tool_allowlist_missing_final_output`; the name is never added automatically (PM Q-FR-02-2). The reported `effective_tool_allowlist` is the intersection with the run's active legacy restriction (the agent-env `allowed_commands`), i.e. the set the run will actually permit. Config-registered custom local tools (`[tools.*]`) are part of the known catalog and may be allowlisted.
 
 Implementation status: WP06 (r4 review fixes) extends the above. Exit-2 taxonomy addition: a malformed or unreadable `--tool-allowlist` file fails at startup with `run_configuration_invalid` reason `tool_allowlist_invalid` (joining `tool_allowlist_unknown_entry` and `tool_allowlist_missing_final_output` as the three reserved WP06 exit-2 reasons; `tests/test_tool_allowlist.py::test_malformed_allowlist_file_fails_at_startup` and `::test_unreadable_allowlist_file_fails_at_startup`). Delegation (ADR-023 R1, PM Q-FR-02-1): the composite opcodes `tool_pipeline` and `lint_repair` (and the raw-protocol `tool_run`) now check their inner `tool_id` against the policy (`src/ops/tool_ops.rs` → `session.policy.admit(tool_id)`) before `ToolRegistry::pipeline`/`::repair`/`::run`, so a listed composite cannot reach an unlisted registered tool; the refused inner tool never runs (`tests/test_tool_allowlist.py::test_tool_pipeline_inner_tool_not_on_allowlist_is_refused`, `::test_lint_repair_inner_tool_not_on_allowlist_is_refused`, and the `ops::tool_ops` unit tests). In this package the allowlist names only native and config-registered `[tools.*]` tools; remote/worker names defer to WP10, and an active allowlist therefore removes every forwarded MCP tool from the catalog.
+
+_Status (WP18, fix run r4):_ r3 defects fixed. Input bytes are the bytes
+SCANNED: content `search` meters each file as its worker reads it
+(`tool_budget::BudgetedReader`) and stops mid-scan; `read_file` meters the file
+read. The index-answered `search mode=files` is REFUSED under
+`--tool-input-bytes`/`--tool-max-entries` with `tool_budget_unenforceable`. The
+deadline is checked by native readers and a passed deadline returns
+`tool_timeout`. The budget + deadline scope is installed at ONE place for every
+registry tool (`mcp::dispatch_tool_inner`); every plugin subprocess is reaped at
+the deadline, and plugins/`tool_pipeline` with unmeterable input are refused
+under an input/entry budget. `ToolBudget::charge_input` is the reserved name
+(was `charge_bytes`). A limit hit writes the reserved `limit_hit` audit event
+via `record_limit_hit`. `execute_script` holds its shared budget in the script
+context, installed only inside each per-op lock, so a concurrent top-level call
+cannot inherit it (F4). Open: process-level ACP/chat budget tests (F6).

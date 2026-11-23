@@ -438,6 +438,24 @@ async fn dispatch_tool_inner(
     }
     session.used_tools.insert(name.to_string());
 
+    // === FR-19 F3 (WP18, ADR-031): ONE place installs the operation budget and
+    // the deadline scope for EVERY registry tool (facade ops + plugins +
+    // git_read), not one match arm per tool. A composite child inherits the
+    // parent's budget (owned == false). A process-starting plugin whose logical
+    // input cannot be metered is refused when an input/entry budget is enabled
+    // (never silently exempted). The absolute deadline is threaded into
+    // managed_process so every subprocess group is reaped AT the deadline; a
+    // call whose deadline passed returns tool_timeout, never a late success. All
+    // a no-op when no budget option is set. ===
+    let budget_owned = session.begin_tool_operation();
+    if crate::tool_budget::tool_input_unmeterable(name) {
+        if let Some(failure) = session.budget_input_refusal(name) {
+            session.end_tool_operation(budget_owned);
+            return response_to_result(failure.into_response(name));
+        }
+    }
+    let budget_remaining = session.budget_remaining();
+    let dispatched = crate::managed_process::with_budget_deadline(budget_remaining, async {
     // Registry-based dispatch: route ops-backed tools through the facade.
     if let Some(resp) = tool_facade::invoke(session, name, args).await {
         session.last_response_meta = resp.meta.clone();
@@ -794,48 +812,30 @@ async fn dispatch_tool_inner(
 
         "git_read" => {
             let command = get_str(args, "command").unwrap_or_default();
-            // FR-19 (WP18, ADR-031): git_read is dispatched here directly, not
-            // through `ops::dispatch`, so it must install (or inherit, as a
-            // composite child) the operation budget itself. The remaining
-            // deadline is handed to the managed subprocess path so the git
-            // child's process group is reaped AT the deadline, not merely
-            // abandoned; the returned content is charged against the byte
-            // budget. A disabled budget leaves every path unchanged.
-            let owned = session.begin_tool_operation();
-            let deadline = session.budget_remaining();
+            // FR-19 (WP18, ADR-031): git_read runs inside the single budget +
+            // deadline scope installed above, so the git child's process group
+            // is reaped AT the deadline and a passed deadline becomes a typed
+            // tool_timeout at the post-dispatch check. Here we only meter the
+            // git object content it returned (the PM counts this as logical
+            // input): a byte-ceiling hit is tool_input_limit with no partial.
             let Some(registry) = &session.tool_registry else {
-                session.end_tool_operation(owned);
                 return err_text(serde_json::json!({"error":{"kind":"unavailable","message":"tool registry unavailable"}}).to_string());
             };
-            let run_result = crate::managed_process::with_budget_deadline(
-                deadline,
-                registry.run(
+            let run_result = registry
+                .run(
                     "git_read",
                     &command,
                     &session.workspace,
                     &session.env,
                     None,
                     Some(args),
-                ),
-            )
-            .await;
-            // A deadline hit stopped the child under us: report the typed
-            // `tool_timeout` with no partial result, however the subprocess
-            // layer surfaced the stop.
-            if deadline.is_some() {
-                if let Err(failure) = session.budget_check_deadline("git_read") {
-                    session.end_tool_operation(owned);
-                    return response_to_result(failure.into_response("git_read"));
-                }
-            }
-            let rendered = match run_result {
+                )
+                .await;
+            match run_result {
                 Ok(result) => {
                     let text = result.output.to_string();
-                    // Charge the logical bytes git_read read/returned (FR-19
-                    // req 4: meter git content, not only filesystem reads).
                     if let Err(failure) = session.budget_charge_bytes(text.len() as u64, "git_read")
                     {
-                        session.end_tool_operation(owned);
                         return response_to_result(failure.into_response("git_read"));
                     }
                     if result.exit_code == 0 {
@@ -848,9 +848,7 @@ async fn dispatch_tool_inner(
                     serde_json::json!({"error":{"kind":"unavailable","message":message}})
                         .to_string(),
                 ),
-            };
-            session.end_tool_operation(owned);
-            rendered
+            }
         }
         "git" => {
             let command = match get_str(args, "command") {
@@ -1188,6 +1186,19 @@ async fn dispatch_tool_inner(
 
         _ => Err(CallToolError::unknown_tool(name.to_string())),
     }
+    })
+    .await;
+    // FR-19 F2/F3 (WP18, ADR-031): a call whose deadline passed is a timeout,
+    // not a late result — even when the work finished just after the deadline,
+    // and even when a deadline-stopped subprocess surfaced as a plugin error
+    // string. Reclassify to the typed tool_timeout whenever the deadline has
+    // passed; otherwise keep the original result (success or a genuine error).
+    let dispatched = match session.budget_check_deadline(name) {
+        Ok(()) => dispatched,
+        Err(failure) => response_to_result(failure.into_response(name)),
+    };
+    session.end_tool_operation(budget_owned);
+    dispatched
 }
 
 fn extract_result_text(result: &CallToolResult) -> String {
@@ -1694,24 +1705,21 @@ async fn run_execute_script(
         .to_string();
     let timeout_secs =
         crate::script::bounded_timeout_secs(args.get("timeout").and_then(Value::as_i64));
-    // FR-19 (WP18, ADR-031): execute_script is a composite. Install ONE shared
-    // operation budget here, at the top-level call, so every tool its Starlark
-    // dispatches inherits the same remaining allowance and absolute deadline
-    // (each inner ops::dispatch re-enters begin_tool_operation, sees it is
-    // already installed, and does not reset it). Without this each inner call
-    // would get its own fresh budget and delegation could multiply the
-    // allowance. No-op when no budget option is set.
-    let owned = session.lock().await.begin_tool_operation();
-    let result = script::execute(
+    // FR-19 F4 (WP18, ADR-031): execute_script is a composite that owns ONE
+    // shared operation budget for all its inner ops. That budget is created and
+    // held inside the script context (src/script.rs) and installed on the
+    // session only inside each inner per-op lock, then cleared on release — it
+    // is deliberately NOT installed on the shared session here, because
+    // run_execute_script releases the lock while the script runs, and leaving
+    // it on the session across that window would let a concurrent top-level MCP
+    // call inherit it (wrong deadline/allowance). No-op when no budget option
+    // is set.
+    script::execute(
         &code,
         session.clone(),
         std::time::Duration::from_secs(timeout_secs),
     )
-    .await;
-    if owned {
-        session.lock().await.end_tool_operation(true);
-    }
-    result
+    .await
 }
 
 /// Convert the Send-safe script outcome only after all handler awaits finish;

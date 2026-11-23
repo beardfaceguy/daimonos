@@ -122,6 +122,20 @@ pub async fn tool_pipeline(session: &Session, op: &Op) -> Response {
         return failure.into_response(tool_id);
     }
 
+    // FR-19 F3 (WP18, ADR-031): a pipeline runs external plugin stages whose
+    // remaining deadline / logical input cannot be enforced stage-by-stage
+    // cooperatively. Rather than leave it "not cooperative", refuse the whole
+    // pipeline when any budget option is set (ADR-031 permits refusing the
+    // pipeline under --tool-timeout-ms; the same applies to input/entry). No
+    // budget option leaves it unchanged.
+    if session.budget_active() {
+        return crate::path_policy::ToolFailure::tool_budget_unenforceable(
+            Some("tool_pipeline"),
+            "a pipeline's external stages are not cooperatively budgeted",
+        )
+        .into_response("tool_pipeline");
+    }
+
     let stages = match &op.a {
         Some(s) if !s.is_empty() => s,
         _ => return Response::err(3, "tool_pipeline requires stage names in 'a'"),

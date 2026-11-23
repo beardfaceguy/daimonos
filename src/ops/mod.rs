@@ -152,17 +152,23 @@ async fn find(session: &Session, op: &Op) -> Response {
         None => None,
     };
 
+    // FR-19 F1 (WP18, ADR-031): the index-answered search (mode=files) reads
+    // cached index content, not scannable file content, so its logical input is
+    // not meterable as logical bytes; refuse an enabled input/entry budget
+    // rather than charge "bytes returned" (the owner choice stated in the
+    // handoff). The deadline IS enforced (checked before and after the search).
+    if let Some(failure) = session.budget_input_refusal("search") {
+        return failure.into_response("search");
+    }
+    if let Err(failure) = session.budget_check_deadline("search") {
+        return failure.into_response("search");
+    }
     idx.ensure_populated().await;
     let results = idx
         .search_scoped(&query, max, op.q.as_deref(), file_glob.as_ref())
         .await;
-    // FR-19 (WP18, ADR-031): charge the bytes returned from the cached index,
-    // so an index-answered search is accounted and not only filesystem reads.
-    // A byte-ceiling hit returns tool_input_limit with no partial results.
-    let payload = serde_json::to_string(&results)
-        .map(|text| text.len() as u64)
-        .unwrap_or(0);
-    if let Err(failure) = session.budget_charge_bytes(payload, "search") {
+    // A search that ran past the deadline is a timeout, not a late result.
+    if let Err(failure) = session.budget_check_deadline("search") {
         return failure.into_response("search");
     }
     let stats = idx.stats().await;
@@ -179,6 +185,13 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
     let Some(query) = &op.p else {
         return Response::err(3, "find requires query in 'p'");
     };
+    // FR-19 F1 (WP18, ADR-031): the confined files-mode search ranks index/name
+    // content, not scannable file content, so refuse an enabled input/entry
+    // budget rather than charge "bytes returned" (same choice as the plain
+    // index path). The deadline is enforced below.
+    if let Some(failure) = session.budget_input_refusal("search") {
+        return failure.into_response("search");
+    }
     let glob = match op.g.as_deref().map(glob::Pattern::new) {
         Some(Ok(pattern)) => Some(pattern),
         Some(Err(error)) => return Response::err(3, &format!("invalid glob: {error}")),
@@ -276,12 +289,9 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
     .await;
     match result {
         Ok(Ok((results, stats, skipped))) => {
-            // FR-19 (WP18, ADR-031): charge bytes returned from the cached
-            // index on the confined find path too.
-            let payload = serde_json::to_string(&results)
-                .map(|text| text.len() as u64)
-                .unwrap_or(0);
-            if let Err(failure) = session.budget_charge_bytes(payload, "search") {
+            // A search that ran past the deadline is a timeout, not a late
+            // result (FR-19 F2).
+            if let Err(failure) = session.budget_check_deadline("search") {
                 return failure.into_response("search");
             }
             let mut value = serde_json::json!({"results": results, "index": stats});

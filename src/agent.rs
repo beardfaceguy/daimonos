@@ -2147,6 +2147,16 @@ async fn run_inner(
                             tool_started.elapsed().as_millis() as u64,
                             None,
                         );
+                        // WP18 (FR-19 F5, ADR-031): a cooperative tool-budget
+                        // limit hit also writes the reserved `limit_hit` event
+                        // with the limit name, the tool, and the configured and
+                        // consumed values, through record_limit_hit.
+                        if let Some((limit, configured, consumed)) =
+                            crate::run_audit::budget_limit_hit(&content)
+                        {
+                            let _ =
+                                audit.record_limit_hit(&limit, Some(&name), configured, consumed);
+                        }
                         if audit.poisoned() {
                             terminate_reason = "audit_write_failed";
                             terminate = true;

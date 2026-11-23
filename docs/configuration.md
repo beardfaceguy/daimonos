@@ -1866,3 +1866,23 @@ budget is part of the session-daemon launch identity, so an attach to a daemon
 started under a different (or absent) budget is refused.
 
 See ADR-031 and `tests/test_tool_budgets.py`.
+
+#### Tool budgets — enforcement scope (WP18, FR-19)
+
+The default-off flags `--tool-timeout-ms`, `--tool-input-bytes`, and
+`--tool-max-entries` are cooperative:
+
+- Deadline: enforced everywhere. Native readers (`read_file`, `ls`, `search`)
+  check it at bounded work boundaries (between files and, for content search,
+  per read chunk). Plugin subprocesses are stopped and process-group reaped at
+  the deadline (Linux; elsewhere the process default timeout applies). A passed
+  deadline returns `tool_timeout`.
+- Input bytes: content search and `read_file` meter the file content SCANNED;
+  `git_read` meters the git object content returned.
+- Entries: `ls` meters directory entries walked.
+- Refused with `tool_budget_unenforceable` under an input/entry budget (input
+  not meterable): process-starting plugins (except `git_read`), the
+  index-answered `search mode=files`, and `tool_pipeline` (any budget option).
+
+Output truncation (`--no-output-spill`, `tool_output`) is a separate mechanism,
+never reported as a budget limit hit.

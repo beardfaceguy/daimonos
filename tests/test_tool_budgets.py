@@ -170,11 +170,13 @@ def test_input_bytes_meters_content_search_filesystem_path(daimonos_factory, tmp
     assert "matches" not in data, "no partial matches on a limit hit"
 
 
-def test_input_bytes_meters_file_search_index_path(daimonos_factory, tmp_path):
-    """--tool-input-bytes N on the INDEX search path (search mode=files ->
-    trigram index): the bytes the cached index returns are charged, so a result
-    that exceeds N is refused with ``tool_input_limit`` (FR-19 req 4: meter
-    bytes returned from cached indexes, not only filesystem reads).
+def test_input_bytes_refuses_index_search(daimonos_factory, tmp_path):
+    """F1 (M1): the INDEX search path (search mode=files -> trigram index)
+    reads the cached index, not scannable file content, so its logical input
+    cannot be metered. Under --tool-input-bytes the index-answered search is
+    REFUSED with a named error rather than charged "bytes returned" (ADR-031
+    allows refusing an enabled-but-unenforceable budget; the owner choice is
+    stated in the handoff). No partial results.
     """
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -185,9 +187,8 @@ def test_input_bytes_meters_file_search_index_path(daimonos_factory, tmp_path):
     result = client.call_tool("search", {"pattern": "wp18idx", "mode": "files"})
     assert result.get("isError") is True, result
     data = json.loads(_text(result))
-    assert data["code"] == "tool_input_limit", data
-    assert data["configured"] == 30, data
-    assert "results" not in data, "no partial index results on a limit hit"
+    assert data["code"] == "tool_budget_unenforceable", data
+    assert "results" not in data, "no partial index results on a refusal"
 
 
 # --- Composites share one budget (FR-19 requirement 2) ---
@@ -681,3 +682,299 @@ def test_unbudgeted_worker_route_is_not_refused_for_budget(daimonos_binary, tmp_
         provider.close()
     blob = completed.stdout + completed.stderr
     assert _WORKER_REFUSAL not in blob, blob
+
+
+# ======================================================================
+# FIX run r4 (defects M1-M5). Each test targets one integrator measurement.
+# ======================================================================
+
+
+def test_input_bytes_charges_bytes_scanned_not_returned(daimonos_factory, tmp_path):
+    """F1 (M1): a content search charges the bytes it SCANS, not the bytes it
+    returns. 40 files of 100 KB without the word plus one with it, under
+    --tool-input-bytes 2000: the scan must stop and the call must fail with
+    ``tool_input_limit`` even though the returned match set is tiny. ``consumed``
+    exceeds the limit (the scan was stopped mid-stream) and stays below the
+    total bytes on disk (it stopped early). No matches on a limit hit.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    blob = "x" * (100 * 1024)
+    for i in range(40):
+        (ws / f"pad_{i:02}.txt").write_text(blob)
+    (ws / "zzz_match.txt").write_text("needle\n")
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "2000"])
+
+    result = client.call_tool("search", {"pattern": "needle", "mode": "content"})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data["code"] == "tool_input_limit", data
+    assert data["configured"] == 2000, data
+    assert data["consumed"] > 2000, data
+    assert data["consumed"] <= 41 * 100 * 1024, data
+    assert "matches" not in data, "no partial matches on a limit hit"
+
+
+def test_input_bytes_content_search_below_limit_passes(daimonos_factory, tmp_path):
+    """F1 control: a content scan whose total scanned bytes stay under the
+    ceiling returns its matches normally (so the failure above is the ceiling,
+    not search being broken)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("needle here\n")  # ~12 bytes scanned
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "100000"])
+    result = client.call_tool("search", {"pattern": "needle", "mode": "content"})
+    assert result.get("isError") is not True, _text(result)
+    data = json.loads(_text(result))
+    assert len(data["matches"]) == 1, data
+
+
+def test_timeout_read_file_returns_timeout(daimonos_factory, tmp_path):
+    """F2 (M2): read_file checks the deadline before building its result; with a
+    1 ms deadline (already elapsed by the time the native reader runs) it
+    returns ``tool_timeout``, never a late success with content."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "big.txt").write_text("x" * (100 * 1024))
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
+    result = client.call_tool("read_file", {"path": "big.txt"})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data["code"] == "tool_timeout", data
+    assert "content" not in data, "no late content on a deadline hit"
+
+
+def test_timeout_ls_returns_timeout(daimonos_factory, tmp_path):
+    """F2 (M2): the ls walk checks the deadline before building its result."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for i in range(20):
+        (ws / f"f{i}.txt").write_text("x")
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
+    result = client.call_tool("ls", {"path": "."})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data["code"] == "tool_timeout", data
+    assert "entries" not in data, "no late listing on a deadline hit"
+
+
+def test_timeout_content_search_returns_timeout(daimonos_factory, tmp_path):
+    """F2 (M2): the content-search blocking worker itself checks the deadline
+    (passed into the worker), so a 1 ms deadline returns ``tool_timeout``, not a
+    late success."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for i in range(20):
+        (ws / f"f{i}.txt").write_text("needle\n")
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
+    result = client.call_tool("search", {"pattern": "needle", "mode": "content"})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data["code"] == "tool_timeout", data
+    assert "matches" not in data, "no late matches on a deadline hit"
+
+
+def test_timeout_file_search_returns_timeout(daimonos_factory, tmp_path):
+    """F2 (M2): the index (files-mode) search checks the deadline before the
+    result is built, so a 1 ms deadline returns ``tool_timeout``."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for i in range(20):
+        (ws / f"wp18f_{i}.rs").write_text("x")
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
+    result = client.call_tool("search", {"pattern": "wp18f", "mode": "files"})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data["code"] == "tool_timeout", data
+
+
+def test_ac_19_1_large_tree_search_times_out_within_bound(daimonos_factory, tmp_path):
+    """AC-19.1 / F2: a content search on a large tree (10000 files x ~1 KB =
+    ~10 MB; a full walk+scan of this many files clearly exceeds the limit on any
+    host in this environment, where opening 10000 files alone costs well over
+    100 ms) with a 100 ms limit returns ``tool_timeout`` within a stated upper
+    bound (8 s, far below the time a full scan would take), proving the deadline
+    STOPPED the work rather than the scan finishing on its own. The control with
+    no option returns success. Kept under ~10 s including setup.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    blob = "lorem ipsum dolor sit amet " * 38  # ~1 KB, no match
+    for i in range(10000):
+        (ws / f"f{i:05}.txt").write_text(blob)
+
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "100"])
+    start = time.monotonic()
+    result = client.call_tool("search", {"pattern": "needle", "mode": "content"})
+    elapsed = time.monotonic() - start
+    assert elapsed < 8, f"budget did not stop the search promptly: {elapsed:.1f}s"
+    assert result.get("isError") is True, result
+    assert json.loads(_text(result))["code"] == "tool_timeout", _text(result)
+
+    control = daimonos_factory(ws)
+    r2 = control.call_tool("search", {"pattern": "needle", "mode": "content"})
+    assert r2.get("isError") is not True, _text(r2)
+    assert "tool_timeout" not in _text(r2), _text(r2)
+
+
+# --- F3: plugin/managed-process tools (M3 curl, M4 git) ---
+
+
+def _slow_http(delay_s):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            time.sleep(delay_s)
+            body = b"wp18-slow-body"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, t
+
+
+def test_timeout_stops_curl_plugin(daimonos_factory, tmp_path):
+    """F3 (M3): the curl plugin starts a subprocess; a --tool-timeout-ms 700
+    deadline stops and reaps it, returning ``tool_timeout`` in under 3 s against
+    a server that would not answer for 4 s, and leaving no curl child alive."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    server, _t = _slow_http(4.0)
+    port = server.server_port
+    url = f"http://127.0.0.1:{port}/"
+    needle = f"wp18curl-{_os.getpid()}-{time.time_ns()}"
+    try:
+        client = daimonos_factory(ws, args=["--tool-timeout-ms", "700"])
+        start = time.monotonic()
+        # The url carries a unique marker so _survivors can spot a leaked child.
+        result = client.call_tool("curl", {"url": url + needle})
+        elapsed = time.monotonic() - start
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert elapsed < 3, f"curl ran past the deadline: {elapsed:.1f}s"
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data.get("code") == "tool_timeout", data
+    assert _poll_gone(needle, 3.0), "curl child survived the budget stop"
+
+
+def test_timeout_stops_git_plugin(daimonos_factory, tmp_path):
+    """F4-of-M4 (timeout half): the `git` plugin (a subprocess) is stopped by
+    --tool-timeout-ms 1 with ``tool_timeout``, not a success."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _init_repo(ws)
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
+    result = client.call_tool("git", {"command": "status"})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data.get("code") == "tool_timeout", data
+
+
+def test_input_bytes_refuses_git_plugin(daimonos_factory, tmp_path):
+    """F3 (M4 input half): the `git` plugin reads no meterable logical input, so
+    under --tool-input-bytes it is REFUSED with ``tool_budget_unenforceable``
+    rather than passing uncounted (ADR-031)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _init_repo(ws)
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "10"])
+    result = client.call_tool("git", {"command": "status"})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data.get("code") == "tool_budget_unenforceable", data
+
+
+def test_git_plugin_default_off_runs_normally(daimonos_factory, tmp_path):
+    """Regression: with no budget option the `git` plugin is unchanged."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _init_repo(ws)
+    client = daimonos_factory(ws)
+    result = client.call_tool("git", {"command": "status"})
+    assert result.get("isError") is not True, _text(result)
+    assert "tool_timeout" not in _text(result), _text(result)
+    assert "tool_budget_unenforceable" not in _text(result), _text(result)
+
+
+def test_budgeted_pipeline_is_refused(daimonos_factory, tmp_path):
+    """F3 (pipeline): tool_pipeline runs external plugin stages whose remaining
+    deadline/input cannot be enforced stage-by-stage, so rather than leave it
+    "not cooperative" it is REFUSED with ``tool_budget_unenforceable`` whenever
+    any budget option is set (ADR-031 allows refusing the pipeline when
+    --tool-timeout-ms is set; the same applies to input/entry). The call returns
+    promptly and starts no stage process."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _init_repo(ws)
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "700"])
+    start = time.monotonic()
+    result = client.call_tool("tool_pipeline",
+                              {"tool_id": "git", "stages": ["status"]})
+    elapsed = time.monotonic() - start
+    assert elapsed < 3, f"refusal was not prompt: {elapsed:.1f}s"
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data.get("code") == "tool_budget_unenforceable", data
+
+
+def test_pipeline_default_off_not_refused(daimonos_factory, tmp_path):
+    """Regression: with no budget option a tool_pipeline is not budget-refused."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _init_repo(ws)
+    client = daimonos_factory(ws)
+    result = client.call_tool("tool_pipeline",
+                              {"tool_id": "git", "stages": ["status"]})
+    assert "tool_budget_unenforceable" not in _text(result), _text(result)
+
+
+# --- F5: the audit limit_hit event, asserted by kind and fields ---
+
+
+def test_budget_hit_writes_limit_hit_audit_event(daimonos_binary, tmp_path):
+    """F5 (M5): a budget limit hit in a run with --audit-path writes the
+    reserved ``limit_hit`` audit event via record_limit_hit, carrying the limit
+    name, the tool, the configured value, and the consumed value. Asserted by
+    the event ``kind`` and its fields, not by a substring search for a code."""
+    workspace = tmp_path / "evidence"
+    workspace.mkdir()
+    (workspace / "big.txt").write_text("z" * 500)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    audit_path = tmp_path / "state" / "audit" / "run.jsonl"
+    provider = _FakeProvider([("call", "read_file", {"path": "big.txt"}), ("end", _DONE)])
+    try:
+        env = _isolated_env(tmp_path)
+        agent_env = _agent_env_file(tmp_path, provider)
+        cmd = [daimonos_binary, "--workspace", str(workspace),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "--tool-input-bytes", "100",
+               "agent", "--print", "--output", "json",
+               "--agent-env", str(agent_env), "do the read"]
+        completed = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=60, env=env)
+    finally:
+        provider.close()
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    events = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    hits = [ev for ev in events if ev.get("kind") == "limit_hit"]
+    assert hits, f"no limit_hit event: {[e.get('kind') for e in events]}"
+    hit = hits[0]
+    assert hit["tool"] == "read_file", hit
+    assert hit["limit"], hit
+    assert hit["configured"] == 100, hit
+    assert hit["consumed"] >= 500, hit

@@ -17,11 +17,38 @@
 //! Context: docs/contexts/reviewer-runtime/CONTEXT.md,
 //! docs/adr/031-cooperative-tool-budgets.md.
 
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::path_policy::ToolFailure;
+
+/// Tools that start external work (a subprocess) and read no logical file/git
+/// content we can meter. An input or entry budget cannot be enforced for them,
+/// so when such a budget is enabled the call is REFUSED rather than silently
+/// exempted (ADR-031; INTERFACES.md row WP18). The deadline, which CAN stop and
+/// reap the process group, is still enforced (see `managed_process::run`).
+/// `git_read` is deliberately absent: it returns the git object content it read,
+/// which the PM counts as logical input, so it is metered, not refused.
+pub fn tool_input_unmeterable(name: &str) -> bool {
+    matches!(
+        name,
+        "exec"
+            | "bg"
+            | "git"
+            | "gh"
+            | "cargo"
+            | "npm"
+            | "pytest"
+            | "docker"
+            | "shellcheck"
+            | "curl"
+            | "discord"
+            | "lint_repair"
+            | "tool_run"
+    )
+}
 
 /// Caller-configured budget options. All-absent means no budget is installed
 /// (legacy behavior). Caller-owned; never deserialized from workspace config.
@@ -125,10 +152,18 @@ impl ToolBudget {
         Ok(())
     }
 
+    /// True when an input-byte or directory-entry ceiling is configured (i.e.
+    /// a logical-input budget this tool would have to meter). Used to refuse a
+    /// tool that starts unmeterable external work (ADR-031).
+    pub fn has_input_limits(&self) -> bool {
+        self.input_limit.is_some() || self.entry_limit.is_some()
+    }
+
     /// Charge `n` logical input bytes. No-op when no byte limit is set. Returns
     /// a hit when the cumulative total exceeds the ceiling; the counter still
-    /// reflects the attempt so the reported `consumed` is honest.
-    pub fn charge_bytes(&self, n: u64) -> Result<(), BudgetHit> {
+    /// reflects the attempt so the reported `consumed` is honest. INTERFACES.md
+    /// reserves this name (`charge_input`).
+    pub fn charge_input(&self, n: u64) -> Result<(), BudgetHit> {
         if let Some(limit) = self.input_limit {
             let consumed = self.input_consumed.fetch_add(n, Ordering::Relaxed) + n;
             if consumed > limit {
@@ -186,5 +221,52 @@ impl BudgetHit {
                 consumed,
             } => ToolFailure::tool_input_limit(argument, which.label(), limit, consumed),
         }
+    }
+}
+
+/// A `Read` wrapper that charges scanned bytes and checks the deadline at every
+/// bounded read step, so a native search worker meters the bytes it SCANS (not
+/// the bytes it returns) and stops mid-file at the deadline or the byte ceiling
+/// (FR-19 F1/F2, ADR-031). The worker that owns the reader inspects
+/// [`BudgetedReader::hit`] after the search to surface the typed failure; the
+/// read error that aborts the search is only the stop signal. Wrap only when a
+/// budget is active — the unbudgeted path keeps its exact legacy behavior.
+pub struct BudgetedReader<R> {
+    inner: R,
+    budget: Arc<ToolBudget>,
+    hit: Option<BudgetHit>,
+}
+
+impl<R: Read> BudgetedReader<R> {
+    pub fn new(inner: R, budget: Arc<ToolBudget>) -> Self {
+        Self {
+            inner,
+            budget,
+            hit: None,
+        }
+    }
+
+    /// The budget violation that stopped the scan, if any.
+    pub fn hit(&self) -> Option<&BudgetHit> {
+        self.hit.as_ref()
+    }
+}
+
+impl<R: Read> Read for BudgetedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Deadline first: a bounded step boundary inside a large file.
+        if let Err(hit) = self.budget.check_deadline() {
+            self.hit = Some(hit);
+            return Err(io::Error::other("tool budget deadline"));
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            // Charge exactly the bytes just scanned.
+            if let Err(hit) = self.budget.charge_input(n as u64) {
+                self.hit = Some(hit);
+                return Err(io::Error::other("tool input budget"));
+            }
+        }
+        Ok(n)
     }
 }

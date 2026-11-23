@@ -211,3 +211,10 @@ flaking; each bound and its reason are stated in the test docstring. The
 the stop; the `git_read` proof installs a `$GIT_DIR`-gated fake `git` shim so
 repo discovery still uses the real git while an operation call hangs. These
 tests need a Unix host with `/proc` and a real `git`; a skip is not a pass.
+
+`tests/test_tool_budgets.py` (WP18, FR-19): process-level cooperative tool
+budget tests — scanned-byte metering for content search, native deadline checks
+(read_file/ls/both search modes), plugin deadline+reap (curl, git), the
+`tool_budget_unenforceable` refusals (git plugin, index search, pipeline), the
+AC-19.1 large-tree timeout bound, and the `limit_hit` audit event (by
+kind+fields). AC-19.1 writes 10000 small files and stays under ~10 s.
