@@ -14,9 +14,12 @@
 //! In-root symlinks (including ones
 //! with absolute targets that stay inside the root) resolve normally.
 //!
-//! No-follow (ADR-022 / WP14) is an independent future surface: [`WalkOptions`]
-//! carries the opt-in seam, but the full no-follow tool and the
-//! `--no-follow-symlinks` option are not implemented here.
+//! No-follow (ADR-022 / WP14) is an independent option enforced through this
+//! same authority: when enabled, [`FilesystemAuthority::no_follow`] is set so a
+//! read refuses any symlink component and reports its literal target text
+//! ([`FilesystemAuthority::open_read_no_follow`]), and confined walks pass
+//! `WalkOptions::follow_symlinks = false` to list links without traversing
+//! them. It is independent of confinement and can be combined with it.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -70,6 +73,19 @@ pub struct ToolFailure {
     pub message: String,
     pub tool: Option<String>,
     pub argument: Option<String>,
+    /// Literal, unresolved link text for a no-follow refusal (WP14, FR-12).
+    /// Set for EVERY link refused under the no-follow policy, including a link
+    /// whose literal target escapes the root: the value is the link text stored
+    /// inside the workspace, read with `readlink` without ever opening or
+    /// resolving the target, so it discloses no resolved outside content.
+    /// Confinement-only `symlink_refused` refusals (no-follow absent) leave this
+    /// `None`.
+    // `Box<String>` is deliberate: a thin 8-byte pointer keeps `ToolFailure`
+    // under clippy's `result_large_err` threshold (a bare `String`/`Box<str>`
+    // would push the many `Result<_, ToolFailure>` returns over 128 bytes).
+    #[allow(clippy::box_collection)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Box<String>>,
     #[serde(flatten)]
     pub budget: Option<Box<FailureBudget>>,
     pub retryable: bool,
@@ -90,6 +106,7 @@ impl ToolFailure {
             message: message.into(),
             tool: None,
             argument: argument.map(|p| p.to_string_lossy().into_owned()),
+            target: None,
             budget: None,
             retryable: false,
         }
@@ -115,6 +132,9 @@ impl ToolFailure {
         }
         if let Some(value) = self.argument {
             data.insert("argument".into(), serde_json::json!(value));
+        }
+        if let Some(value) = self.target {
+            data.insert("target".into(), serde_json::json!(value));
         }
         if let Some(budget) = self.budget {
             data.insert("limit".into(), serde_json::json!(budget.limit));
@@ -143,6 +163,22 @@ impl ToolFailure {
         )
     }
 
+    /// Independent no-follow refusal (WP14, FR-12): a symlink component is
+    /// refused because the no-follow option forbids reading or walking through
+    /// it, regardless of whether its literal target stays inside the root or
+    /// escapes it. The reviewed `symlink_refused` code carries the link's
+    /// literal target text as metadata without ever opening or resolving the
+    /// target.
+    pub fn symlink_not_followed(argument: &Path, target: &str) -> Self {
+        let mut failure = Self::refusal(
+            CODE_SYMLINK_REFUSED,
+            "symbolic link reported without following it (no-follow policy)",
+            Some(argument),
+        );
+        failure.target = Some(Box::new(target.to_string()));
+        failure
+    }
+
     pub fn walk_limit(argument: &Path, configured: usize, consumed: usize) -> Self {
         Self::budget_limit(argument, "max_walk_entries", configured, consumed)
     }
@@ -163,6 +199,77 @@ impl ToolFailure {
 
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::refusal(CODE_FILESYSTEM_POLICY_UNSUPPORTED, message, None)
+    }
+
+    /// Cooperative tool-budget deadline hit (WP18, FR-19, ADR-031). The
+    /// `configured_ms` value is reported as both the limit and the consumed
+    /// amount: the call ran until at least the deadline. No partial success.
+    pub fn tool_timeout(argument: Option<&str>, configured_ms: u64) -> Self {
+        let mut failure = Self::refusal(
+            "tool_timeout",
+            format!("tool deadline exceeded: configured_ms={configured_ms}"),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure.budget = Some(Box::new(FailureBudget {
+            limit: configured_ms,
+            configured: configured_ms,
+            consumed: configured_ms,
+        }));
+        failure
+    }
+
+    /// Cooperative tool-budget logical-input hit (WP18, FR-19, ADR-031). Used
+    /// for both the byte ceiling and the directory-entry ceiling; `which`
+    /// names the ceiling that was hit (integrator D56 keeps the single
+    /// reviewed `tool_input_limit` code). No partial success.
+    /// Cooperative tool-budget refusal (WP18, FR-19, ADR-031, R1): a tool whose
+    /// relevant budget cannot be enforced is REFUSED when that budget is
+    /// enabled, rather than silently exempted (INTERFACES.md row WP18). It
+    /// carries the REVIEWED `tool_policy_unsupported` code (integrator D60, no
+    /// new code is minted) and a message that names the budget option(s) and,
+    /// via `into_response`, the tool. Used for the allow-list refusal under
+    /// `--tool-input-bytes`/`--tool-max-entries`, the index-answered search
+    /// (cached index content is not a scannable byte count), and `tool_pipeline`
+    /// (external stages cannot be budgeted cooperatively). Deadline enforcement
+    /// is unaffected.
+    pub fn tool_budget_policy_unsupported(argument: Option<&str>, detail: &str) -> Self {
+        let mut failure = Self::refusal(
+            crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+            format!(
+                "cooperative tool budget (--tool-input-bytes/--tool-max-entries/\
+                 --tool-timeout-ms) cannot be enforced for this tool: {detail}"
+            ),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure
+    }
+
+    pub fn tool_input_limit(
+        argument: Option<&str>,
+        which: &str,
+        limit: u64,
+        consumed: u64,
+    ) -> Self {
+        let mut failure = Self::refusal(
+            "tool_input_limit",
+            format!("tool input limit exceeded ({which}): configured={limit}, consumed={consumed}"),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure.budget = Some(Box::new(FailureBudget {
+            limit,
+            configured: limit,
+            consumed,
+        }));
+        failure
     }
 }
 
@@ -261,6 +368,12 @@ pub struct WalkOptions {
     pub include_hidden: bool,
     /// Directory names that must not be emitted or traversed.
     pub skip_dirs: &'static [&'static str],
+    /// R2 (B4, WP18): optional cooperative-budget cap on the number of entries
+    /// to enumerate. When set, the walk STOPS once it has collected more than
+    /// this many entries (setting [`Walk::tool_entry_stop`]), so a
+    /// `--tool-max-entries` budget bounds the confined walk rather than walking
+    /// the whole tree. `None` (the default) keeps the legacy unbounded walk.
+    pub max_entries: Option<usize>,
 }
 
 impl Default for WalkOptions {
@@ -270,6 +383,7 @@ impl Default for WalkOptions {
             follow_symlinks: true,
             include_hidden: true,
             skip_dirs: &[],
+            max_entries: None,
         }
     }
 }
@@ -283,6 +397,10 @@ pub struct Walk {
     exhausted: bool,
     depth_exhausted: Option<usize>,
     failure: Option<ToolFailure>,
+    /// R2 (B4, WP18): set when the walk stopped early at the cooperative
+    /// [`WalkOptions::max_entries`] cap (distinct from the WP14 `exhausted`
+    /// walk-safety limit, which is a `walk_limit` refusal).
+    pub tool_entry_stop: bool,
 }
 
 /// An owned, already-authorized read handle to an in-root object.
@@ -378,6 +496,10 @@ impl std::fmt::Debug for PreFinalOpenObserver {
 pub struct FilesystemAuthority {
     root: PathBuf,
     limits: FsLimits,
+    /// Independent no-follow option (WP14, FR-12). When true, reads refuse any
+    /// symlink component (reporting its target text) and confined walks do not
+    /// traverse links. Orthogonal to the fixed-root confinement itself.
+    no_follow: bool,
     #[cfg(target_os = "linux")]
     root_fd: std::os::fd::OwnedFd,
     #[cfg(all(test, target_os = "linux"))]
@@ -409,6 +531,32 @@ impl FilesystemAuthority {
     /// Apply validated limits without reopening the pinned root.
     pub fn set_limits(&mut self, limits: FsLimits) {
         self.limits = limits;
+    }
+
+    /// Enable or disable the independent no-follow option (WP14, FR-12).
+    pub fn set_no_follow(&mut self, no_follow: bool) {
+        self.no_follow = no_follow;
+    }
+
+    /// True when the independent no-follow option is active.
+    pub fn no_follow(&self) -> bool {
+        self.no_follow
+    }
+
+    /// Open `path` for reading honoring the active no-follow policy (WP14).
+    /// When no-follow is enabled this refuses any symlink component and
+    /// surfaces its literal target text ([`open_read_no_follow`](Self::open_read_no_follow));
+    /// otherwise it follows in-root links exactly like
+    /// [`open_read`](Self::open_read). Tool consumers that open or scan an
+    /// explicitly named path or walk scope must use this, never `open_read`
+    /// directly, so a link named as the target or as a walk root is never read
+    /// or listed through.
+    pub fn open_read_policy(&self, path: &Path) -> Result<AuthorizedRead, ToolFailure> {
+        if self.no_follow {
+            self.open_read_no_follow(path)
+        } else {
+            self.open_read(path)
+        }
     }
 
     /// The fixed canonical root this authority confines to.
@@ -648,6 +796,7 @@ impl FilesystemAuthority {
         Ok(FilesystemAuthority {
             root: canonical,
             limits,
+            no_follow: false,
             root_fd,
             #[cfg(test)]
             pre_final_open: None,
@@ -696,6 +845,20 @@ impl FilesystemAuthority {
     pub fn open_read(&self, path: &Path) -> Result<AuthorizedRead, ToolFailure> {
         let rel = relativize(&self.root, path)?;
         let fd = self.resolve(path, &rel, libc::O_RDONLY)?;
+        Ok(AuthorizedRead {
+            file: std::fs::File::from(fd),
+            relative_path: rel,
+        })
+    }
+
+    /// Open `path` for reading under the independent no-follow policy (WP14,
+    /// FR-12). Any symlink component — intermediate or final — is refused with
+    /// its literal target text (`symlink_refused` + `target`); the target is
+    /// never opened or resolved. A link-free path resolves exactly like
+    /// [`open_read`](Self::open_read).
+    pub fn open_read_no_follow(&self, path: &Path) -> Result<AuthorizedRead, ToolFailure> {
+        let rel = relativize(&self.root, path)?;
+        let fd = self.resolve_manual(path, &rel, libc::O_RDONLY, true, false, true)?;
         Ok(AuthorizedRead {
             file: std::fs::File::from(fd),
             relative_path: rel,
@@ -870,16 +1033,18 @@ impl FilesystemAuthority {
             Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
                 // Absolute in-root links require manual translation. Procfs links
                 // are refused in this fallback because they may be magic links.
-                return self.resolve_manual(argument, rel, final_flags, true, false);
+                // No-follow is enforced only via `open_read_no_follow` so that
+                // walks can still resolve (stat) in-root links to list them.
+                return self.resolve_manual(argument, rel, final_flags, true, false, false);
             }
             Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
                 // Distinguish a configured link-budget failure from a magic
                 // link without following procfs links in this fallback.
-                return self.resolve_manual(argument, rel, final_flags, true, false);
+                return self.resolve_manual(argument, rel, final_flags, true, false, false);
             }
             Err(error) => return Err(map_open_err(argument, error)),
         };
-        let checked = self.resolve_manual(argument, rel, final_flags, false, false)?;
+        let checked = self.resolve_manual(argument, rel, final_flags, false, false, false)?;
         let expected =
             sys::fstat(node.as_raw_fd()).map_err(|error| map_open_err(argument, error))?;
         let actual =
@@ -910,6 +1075,7 @@ impl FilesystemAuthority {
         final_flags: libc::c_int,
         reject_procfs_links: bool,
         leave_final_symlink: bool,
+        no_follow: bool,
     ) -> Result<std::os::fd::OwnedFd, ToolFailure> {
         use std::collections::VecDeque;
         use std::ffi::OsString;
@@ -970,6 +1136,21 @@ impl FilesystemAuthority {
             if mode == libc::S_IFLNK {
                 if reject_procfs_links && sys::is_procfs(node.as_raw_fd()).unwrap_or(true) {
                     return Err(ToolFailure::symlink_refused(argument, None));
+                }
+                if no_follow {
+                    // No-follow (WP14): refuse the link and surface its literal
+                    // target text, without opening or resolving the target.
+                    let target =
+                        sys::readlink_fd(node.as_raw_fd(), self.limits.max_symlink_target_bytes)
+                            .map_err(|error| {
+                                map_link_error(
+                                    argument,
+                                    self.limits.max_symlink_target_bytes,
+                                    error,
+                                )
+                            })?;
+                    let text = String::from_utf8_lossy(&target).into_owned();
+                    return Err(ToolFailure::symlink_not_followed(argument, &text));
                 }
                 if symlink_budget == 0 {
                     return Err(ToolFailure::budget_limit(
@@ -1128,6 +1309,10 @@ impl FilesystemAuthority {
             f.argument = Some(path.to_string_lossy().into_owned());
             f
         })
+    }
+
+    pub fn open_read_no_follow(&self, path: &Path) -> Result<AuthorizedRead, ToolFailure> {
+        self.open_read(path)
     }
 
     pub fn bootstrap_reference(&self) -> PathBuf {
@@ -1379,12 +1564,24 @@ impl FilesystemAuthority {
             if descend {
                 subdirs.push(child_rel);
             }
+            // R2 (B4, WP18): stop the walk once it has collected more than the
+            // cooperative entry cap, so `--tool-max-entries` bounds the walk
+            // itself (not a post-hoc count). One past the cap lets the caller's
+            // charge report a consumed total that exceeds the ceiling.
+            if opts.max_entries.is_some_and(|cap| walk.entries.len() > cap) {
+                walk.tool_entry_stop = true;
+                break;
+            }
         }
         // SAFETY: `dirp` is open and is closed exactly once here.
         unsafe { libc::closedir(dirp) };
 
         for sub in subdirs {
-            if walk.exhausted || walk.depth_exhausted.is_some() || walk.failure.is_some() {
+            if walk.exhausted
+                || walk.depth_exhausted.is_some()
+                || walk.failure.is_some()
+                || walk.tool_entry_stop
+            {
                 break;
             }
             self.walk_dir(&sub, depth + 1, max_depth, opts, walk, budget);

@@ -80,9 +80,37 @@ pub struct Session {
     pub verbosity: crate::verbosity::Verbosity,
     /// Pinned filesystem authority shared by this run (ADR-022).
     pub authority: Option<Arc<crate::path_policy::FilesystemAuthority>>,
+    /// Read-only admission table for `--workspace-read-only` (FR-07, ADR-022).
+    /// Derived from `cfg.workspace_read_only`; consulted at every dispatch
+    /// boundary before an effect begins. Context: src/run_policy.rs.
+    pub admission: crate::run_policy::ToolAdmission,
+    /// Explicit tool allowlist for `--tool-allowlist` (FR-02, ADR-023). Derived
+    /// from `cfg.tool_allowlist`; consulted by name at every dispatch boundary
+    /// and model-visible listing. Unrestricted keeps legacy behavior.
+    /// Context: src/run_policy.rs::ToolPolicy.
+    pub policy: crate::run_policy::ToolPolicy,
+    /// Caller's cooperative tool-budget options (FR-19, WP18, ADR-031), copied
+    /// from `cfg.tool_budget`. Used to install a fresh operation budget at each
+    /// top-level tool call. Context: src/tool_budget.rs.
+    pub tool_budget_config: crate::tool_budget::ToolBudgetConfig,
+    /// The operation budget in force for the current top-level tool call, or
+    /// `None` between calls / when no budget option is set. Installed once per
+    /// top-level call and shared (inherited, never reset) by composite children
+    /// so delegation cannot multiply the allowance (ADR-031).
+    pub tool_budget: Option<Arc<crate::tool_budget::ToolBudget>>,
+    /// R3 (B3): the budget hit (code, configured, consumed) recorded IN-BAND by
+    /// the budget code when a genuine deadline/input/entry limit fired on this
+    /// call, so the run loop records the reserved `limit_hit` audit event from a
+    /// trusted signal instead of parsing attacker-influenceable result text.
+    /// Interior-mutable so the `&self` budget helpers can set it; drained by
+    /// `take_budget_hit` and cleared when a fresh top-level budget is installed.
+    pub budget_hit: std::sync::Mutex<Option<BudgetHitRecord>>,
 }
 
 pub type BgProcess = crate::managed_process::ManagedBackground;
+
+/// R3 (B3): an in-band cooperative budget hit: `(code, configured, consumed)`.
+pub type BudgetHitRecord = (String, Option<u64>, Option<u64>);
 
 impl Session {
     pub fn new(workspace: PathBuf, cfg: Arc<Config>) -> Self {
@@ -94,9 +122,25 @@ impl Session {
         };
         let env = Self::build_initial_env(&cfg);
         let snapshot_store =
-            SnapshotStore::for_workspace(workspace.clone(), cfg.snapshot_directory.as_ref());
+            SnapshotStore::for_workspace(workspace.clone(), cfg.snapshot_directory.as_ref())
+                .with_discovery_policy(cfg.discovery_policy);
         let verbosity = cfg.mcp.default_verbosity;
         let authority = cfg.filesystem_authority.clone();
+        // FR-07 (G1/G6): the KGL and snapshot stores are "relocated" only when
+        // they resolve outside the workspace; then their tools may proceed
+        // read-only. A workspace-relative configured path is treated as NOT
+        // relocated (fail-closed).
+        let relocated = |dir: Option<&std::path::PathBuf>| {
+            dir.map(|d| !crate::run_policy::resolves_inside(&workspace, d))
+                .unwrap_or(false)
+        };
+        let admission = crate::run_policy::ToolAdmission::new(
+            cfg.workspace_read_only,
+            relocated(cfg.kgl.state_directory.as_ref()),
+            relocated(cfg.snapshot_directory.as_ref()),
+        );
+        let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+        let tool_budget_config = cfg.tool_budget;
         Self {
             workspace,
             cwd,
@@ -120,7 +164,227 @@ impl Session {
             last_response_meta: ResponseMeta::default(),
             verbosity,
             authority,
+            admission,
+            policy,
+            tool_budget_config,
+            tool_budget: None,
+            budget_hit: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install a fresh operation budget for a top-level tool call unless one is
+    /// already active (a composite's children inherit the parent's). Returns
+    /// `true` when this call installed the budget and must clear it afterwards
+    /// (FR-19, WP18, ADR-031). Context: src/tool_budget.rs.
+    pub fn begin_tool_operation(&mut self) -> bool {
+        if self.tool_budget.is_some() {
+            return false;
+        }
+        // R3/R4: a fresh top-level call starts with no stale in-band hit.
+        *self.budget_hit.lock().expect("budget_hit poisoned") = None;
+        self.tool_budget = self.tool_budget_config.start();
+        self.tool_budget.is_some()
+    }
+
+    /// R3 (B3): record an in-band budget hit (the code and its numbers) so the
+    /// run loop can write the reserved `limit_hit` event without parsing result
+    /// text. Called by the budget helpers and the native readers on a genuine
+    /// hit only.
+    pub fn note_budget_hit(&self, hit: &crate::tool_budget::BudgetHit) {
+        use crate::tool_budget::BudgetHit;
+        let record = match hit {
+            BudgetHit::Timeout { configured_ms } => (
+                "tool_timeout".to_string(),
+                Some(*configured_ms),
+                Some(*configured_ms),
+            ),
+            BudgetHit::Input {
+                limit, consumed, ..
+            } => (
+                "tool_input_limit".to_string(),
+                Some(*limit),
+                Some(*consumed),
+            ),
+        };
+        *self.budget_hit.lock().expect("budget_hit poisoned") = Some(record);
+    }
+
+    /// R3 (B3): drain the in-band budget hit recorded during the last dispatch.
+    pub fn take_budget_hit(&self) -> Option<BudgetHitRecord> {
+        self.budget_hit.lock().expect("budget_hit poisoned").take()
+    }
+
+    /// Clear the operation budget if this call owned it. A composite child
+    /// (`owned == false`) leaves the parent's budget in place.
+    pub fn end_tool_operation(&mut self, owned: bool) {
+        if owned {
+            self.tool_budget = None;
+        }
+    }
+
+    /// Charge `bytes` logical input against the active budget. Returns the
+    /// typed [`crate::path_policy::ToolFailure`] when the ceiling is exceeded;
+    /// a no-op when no byte budget is active.
+    pub fn budget_charge_bytes(
+        &self,
+        bytes: u64,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            if let Err(hit) = budget.charge_input(bytes) {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
+        }
+        Ok(())
+    }
+
+    /// R2 (B4): refuse `bytes` against the active byte budget WITHOUT charging,
+    /// so `read_file` can reject a file by its metadata size before reading it.
+    /// Returns the typed `tool_input_limit` when the size alone would exceed the
+    /// remaining allowance; a no-op when no byte budget is active.
+    pub fn budget_precheck_bytes(
+        &self,
+        bytes: u64,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            if let Err(hit) = budget.precheck_input(bytes) {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
+        }
+        Ok(())
+    }
+
+    /// A clone of the active operation budget, for handing the shared `Arc`
+    /// into a blocking search worker so the worker itself meters scanned bytes
+    /// and checks the deadline (FR-19 F1/F2). `None` when no budget is active.
+    pub fn tool_budget(&self) -> Option<std::sync::Arc<crate::tool_budget::ToolBudget>> {
+        self.tool_budget.clone()
+    }
+
+    /// Install (or clear with `None`) the operation budget directly. Used by
+    /// `execute_script` (FR-19 F4): the script owns ONE shared budget and
+    /// installs it on the session only inside each inner per-op lock, clearing
+    /// it when the lock is released, so the budget never lingers on the shared
+    /// session between ops where a concurrent top-level call could inherit it.
+    /// `begin_tool_operation` then sees it already installed and inherits.
+    pub fn set_operation_budget(
+        &mut self,
+        budget: Option<std::sync::Arc<crate::tool_budget::ToolBudget>>,
+    ) {
+        self.tool_budget = budget;
+    }
+
+    /// True when ANY operation budget is active (deadline, byte, or entry).
+    /// Used to refuse composite routes whose external work cannot be governed
+    /// cooperatively (e.g. `tool_pipeline`).
+    pub fn budget_active(&self) -> bool {
+        self.tool_budget.is_some()
+    }
+
+    /// True when the active budget carries an input-byte or directory-entry
+    /// ceiling (a logical-input budget a tool must be able to meter).
+    pub fn budget_has_input_limits(&self) -> bool {
+        self.tool_budget
+            .as_ref()
+            .is_some_and(|b| b.has_input_limits())
+    }
+
+    /// R1 (B1, ADR-031): under an input-byte or directory-entry budget, admit a
+    /// tool only if it is on the explicit [`crate::tool_budget::tool_input_budget_admitted`]
+    /// allow-list (it meters its input or reads no workspace/external content).
+    /// Every other name is REFUSED with the reviewed `tool_policy_unsupported`
+    /// (D60), never silently exempted. Keyed on the configured budget, not an
+    /// installed one, so every frontend dispatch boundary (the MCP seam, the
+    /// agent/chat/ACP loop, and `execute_script`) can consult it uniformly
+    /// before a budget is even installed. `None` when no input/entry budget is
+    /// set (a bare `--tool-timeout-ms` refuses nothing here) or when `tool` is
+    /// admitted.
+    pub fn budget_input_refusal(&self, tool: &str) -> Option<crate::path_policy::ToolFailure> {
+        let cfg = &self.tool_budget_config;
+        let input_or_entry = cfg.input_bytes.is_some() || cfg.max_entries.is_some();
+        if input_or_entry && !crate::tool_budget::tool_input_budget_admitted(tool) {
+            Some(
+                crate::path_policy::ToolFailure::tool_budget_policy_unsupported(
+                    Some(tool),
+                    "it is not on the input/entry budget allow-list (it reads workspace \
+                 or external content that is not metered, or starts external work)",
+                ),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// R1 (ADR-031): the index-answered search (`search mode=files`) reads
+    /// cached-index content that is not a scannable byte count, so under an
+    /// input/entry budget it is REFUSED regardless of the admission allow-list
+    /// (which admits `search` for its byte-metered content mode). Checks the
+    /// installed budget (this runs inside `ops::dispatch`, after the budget was
+    /// installed). `None` when no input/entry budget is active.
+    pub fn budget_index_search_refusal(&self) -> Option<crate::path_policy::ToolFailure> {
+        if self.budget_has_input_limits() {
+            Some(
+                crate::path_policy::ToolFailure::tool_budget_policy_unsupported(
+                    Some("search"),
+                    "the index (files) search mode reads cached-index content that is not a \
+                 scannable byte count",
+                ),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Charge `entries` directory entries against the active budget.
+    pub fn budget_charge_entries(
+        &self,
+        entries: u64,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            if let Err(hit) = budget.charge_entries(entries) {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remaining time until the active budget's absolute deadline, to hand to
+    /// the managed-subprocess path so external work (exec, git_read) inherits
+    /// but never extends it (FR-19, WP18, ADR-031). `None` when no budget or no
+    /// deadline is active.
+    pub fn budget_remaining(&self) -> Option<std::time::Duration> {
+        self.tool_budget.as_ref().and_then(|b| b.remaining())
+    }
+
+    /// The typed `tool_timeout` failure for the active budget, used after the
+    /// managed-subprocess path reports it stopped external work at the
+    /// deadline. `None` when no budget is active.
+    pub fn budget_timeout_failure(
+        &self,
+        argument: &str,
+    ) -> Option<crate::path_policy::ToolFailure> {
+        self.tool_budget
+            .as_ref()
+            .map(|b| b.timeout_failure(Some(argument)))
+    }
+
+    /// Error if the active budget's absolute deadline has passed.
+    pub fn budget_check_deadline(
+        &self,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            if let Err(hit) = budget.check_deadline() {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
+        }
+        Ok(())
     }
 
     /// Build the initial session environment with an enhanced PATH.

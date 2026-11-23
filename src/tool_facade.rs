@@ -25,30 +25,59 @@ pub fn active_schemas(
     workspace: &Path,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
 ) -> Vec<NeutralToolSchema> {
-    active_schemas_for_policy(workspace, descriptions, false)
+    active_schemas_for_policy(
+        workspace,
+        descriptions,
+        false,
+        &crate::run_policy::ToolPolicy::unrestricted(),
+    )
 }
 
 /// Build the agent catalog from tools admitted by the run's filesystem policy.
+///
+/// FR-02 (WP06, ADR-023) R1 — single source of the model-facing catalog: an
+/// active explicit `--tool-allowlist` (`policy`) filters here, so EVERY
+/// frontend that offers this catalog to the model (agent print, chat, ACP, the
+/// session daemon) shows only allowlisted tools without its own `retain`. With
+/// no explicit list `policy.allows` is always true (legacy behavior). The
+/// dispatch boundary additionally refuses any unlisted name. Context:
+/// src/tool_facade.rs.
 pub fn active_schemas_for_policy(
     workspace: &Path,
     descriptions: &crate::tool_descriptions::ToolDescriptions,
     confined: bool,
+    policy: &crate::run_policy::ToolPolicy,
 ) -> Vec<NeutralToolSchema> {
     tools::all_tools()
         .into_iter()
         .filter(|t| t.tier.exposed_to_agent())
         .filter(|t| !confined || crate::path_policy::tool_allowed(t.name))
+        .filter(|t| policy.allows(t.name))
         .filter(|t| tools::passes_context_check(t.name, workspace))
         .map(|t| {
             let mut description = descriptions.full_or_name(t.name).to_string();
             if t.name == crate::agent::EXECUTE_SCRIPT_TOOL {
+                // FR-02 (WP06, ADR-023) R2: the execute_script DESCRIPTION
+                // embeds the Starlark signature dump; under an active allowlist
+                // it must list only allowlisted tools, so the served catalog and
+                // the dispatchable set agree. Unrestricted => the full dump.
                 description.push_str("\n\nExact Starlark tool signatures:\n");
-                description.push_str(&crate::script::tool_signatures_for_policy(confined));
+                description.push_str(&crate::script::tool_signatures_filtered(
+                    confined,
+                    &|name| policy.allows(name),
+                ));
             }
+            // WP16 (FR-14): the owned path annotation is a *caller-facing* schema
+            // mark (the `tool-contract` dump, `tools/list`, `get_tool_schema`). It
+            // is deliberately NOT applied here: this catalog becomes the tool
+            // schemas sent to the model endpoint, which FR-15 requires be
+            // preserved unchanged and which may reject an unknown keyword. ADR-029
+            // scopes the mark to serving/export and does not start a model run.
+            let input_schema = descriptions.schema_with_parameters(t.name, &t.schema);
             NeutralToolSchema {
                 name: t.name.to_string(),
                 description,
-                input_schema: descriptions.schema_with_parameters(t.name, &t.schema),
+                input_schema,
             }
         })
         .collect()
@@ -76,10 +105,11 @@ pub async fn invoke_with_progress(
     };
     if !response.ok {
         if let Some(data) = response.d.as_mut().and_then(Value::as_object_mut) {
-            if data
-                .get("code")
-                .is_some_and(|code| code == crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED)
-            {
+            if data.get("code").is_some_and(|code| {
+                code == crate::path_policy::CODE_FILESYSTEM_POLICY_UNSUPPORTED
+                    || code == crate::run_policy::CODE_WORKSPACE_WRITE_FORBIDDEN
+                    || code == crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED
+            }) {
                 data.insert("tool".into(), Value::String(name.to_string()));
             }
         }
@@ -104,6 +134,75 @@ mod tests {
     }
 
     // --- active_schemas ---
+
+    /// FR-02 (WP06, ADR-023) R1: the single-source catalog filter. With an
+    /// explicit allowlist, `active_schemas_for_policy` returns ONLY allowlisted
+    /// tools, so every frontend that builds its model catalog here (chat, ACP,
+    /// session daemon, agent print) offers only the allowlist.
+    #[test]
+    fn active_schemas_for_policy_filters_to_the_explicit_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = crate::run_policy::ToolPolicy::explicit(["read_file", "search"]);
+        let names: Vec<String> = active_schemas_for_policy(
+            dir.path(),
+            &crate::tool_descriptions::ToolDescriptions::default(),
+            false,
+            &policy,
+        )
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+        assert_eq!(
+            names
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["read_file".to_string(), "search".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// FR-02 (WP06, ADR-023) R2: the execute_script DESCRIPTION's embedded
+    /// Starlark signature dump is filtered by the same allowlist, so it cannot
+    /// reveal an unlisted tool (`write_file`).
+    #[test]
+    fn execute_script_description_signatures_respect_the_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = crate::run_policy::ToolPolicy::explicit(["read_file", "execute_script"]);
+        let schema = active_schemas_for_policy(
+            dir.path(),
+            &crate::tool_descriptions::ToolDescriptions::default(),
+            false,
+            &policy,
+        )
+        .into_iter()
+        .find(|s| s.name == "execute_script")
+        .expect("execute_script schema");
+        assert!(schema.description.contains("def read_file("));
+        assert!(!schema.description.contains("def write_file("));
+    }
+
+    /// WP16 (FR-14, I3/D28): the agent-facing catalog is the tool schemas sent
+    /// to the model endpoint, so it must NOT carry the owned `x-daimonos-path`
+    /// mark (FR-15 preserves supplied schemas; a strict endpoint may reject an
+    /// unknown keyword). The absence on the wire is proven end-to-end by the
+    /// process test `tests/test_path_annotations.py::
+    /// test_model_request_omits_owned_path_annotation` on both wires; the mark
+    /// lives only in the served/exported catalog (`tool-contract` dump,
+    /// `tools/list`, `get_tool_schema`).
+    #[test]
+    fn active_schemas_do_not_carry_owned_path_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let schemas = default_schemas(dir.path());
+        let read_file = schemas
+            .iter()
+            .find(|s| s.name == "read_file")
+            .expect("read_file schema");
+        assert!(read_file.input_schema["properties"]["path"]
+            .get(crate::path_annotations::PATH_ANNOTATION_KEY)
+            .is_none());
+    }
 
     #[test]
     fn execute_script_schema_includes_generated_tool_signatures() {

@@ -1,4 +1,9 @@
 //! Opt-in structural request trace. Never receives credentials or message bodies.
+//!
+//! WP07 (ADR-025, INVENTORIES W11): the controlled model transport
+//! ([`super::controlled_send`]) is a separate request path that never invokes
+//! [`RequestTrace::capture`], so structural tracing is disabled in controlled
+//! mode by construction regardless of `DAIMONOS_OPENROUTER_TRACE_DIR`.
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -217,6 +222,19 @@ mod tests {
 #[derive(Default)]
 pub(super) struct RequestTrace {
     pub(super) directory: Option<PathBuf>,
+}
+
+/// The configured structural request-trace directory, resolved EXACTLY as the
+/// writer resolves it (`RequestTrace::from_env`): the verbatim
+/// `DAIMONOS_OPENROUTER_TRACE_DIR` value (no tilde expansion, no relative
+/// normalization), empty-filtered. The `--workspace-read-only` startup guard
+/// (INVENTORIES W11, `src/main.rs`) consumes this so its inside-workspace check
+/// matches the writer's own destination byte-for-byte (R5) — e.g. a `~/sub`
+/// value stays a literal relative `~/sub`, which the guard resolves inside the
+/// workspace just as the writer would, instead of tilde-expanding it to $HOME
+/// and missing the write.
+pub(crate) fn configured_directory() -> Option<std::path::PathBuf> {
+    RequestTrace::from_env().directory
 }
 
 impl RequestTrace {

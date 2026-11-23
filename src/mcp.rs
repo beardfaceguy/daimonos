@@ -31,10 +31,19 @@ pub(crate) const DAIMONOS_MCP_META_KEY: &str = "io.daimonos/server-kind";
 pub(crate) const DAIMONOS_MCP_META_VALUE: &str = "mcp";
 
 fn mcp_identity_meta() -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
-        DAIMONOS_MCP_META_KEY.to_string(),
-        Value::String(DAIMONOS_MCP_META_VALUE.to_string()),
-    )])
+    // WP15 (FR-13, AC-13.2): report the standalone tool-contract version during
+    // initialization, distinct from `serverInfo.version` (the binary version).
+    // Context: docs/adr/029-effective-tool-contract.md.
+    serde_json::Map::from_iter([
+        (
+            DAIMONOS_MCP_META_KEY.to_string(),
+            Value::String(DAIMONOS_MCP_META_VALUE.to_string()),
+        ),
+        (
+            crate::tool_contract::CONTRACT_VERSION_META_KEY.to_string(),
+            Value::String(crate::tool_contract::CONTRACT_VERSION.to_string()),
+        ),
+    ])
 }
 
 /// Liveness signal shared by the request handlers and the idle watchdog.
@@ -414,17 +423,54 @@ async fn dispatch_tool_inner(
     name: &str,
     args: &Value,
 ) -> std::result::Result<CallToolResult, CallToolError> {
+    // FR-02 (WP06, ADR-023): the explicit tool allowlist is the first, immutable
+    // check at this boundary — before activation, use tracking, or any effect.
+    // It is reached by direct MCP calls, every batch child (via `dispatch_tool`),
+    // and Starlark non-opcode `tool()` fall-through, so a nested/composite call
+    // can never reach an unlisted tool. A refused name carries the reviewed
+    // `tool_not_allowed` code (recorded as a `tool_refusal` by WP08) and names
+    // the tool without exposing its arguments.
+    if let Err(failure) = session.policy.admit(name) {
+        return response_to_result(failure.into_response(name));
+    }
     if !session.exposed_tools.contains(name) {
         session.activate_tool(name);
     }
     session.used_tools.insert(name.to_string());
 
+    // === FR-19 F3 (WP18, ADR-031): ONE place installs the operation budget and
+    // the deadline scope for EVERY registry tool (facade ops + plugins +
+    // git_read), not one match arm per tool. A composite child inherits the
+    // parent's budget (owned == false). A process-starting plugin whose logical
+    // input cannot be metered is refused when an input/entry budget is enabled
+    // (never silently exempted). The absolute deadline is threaded into
+    // managed_process so every subprocess group is reaped AT the deadline; a
+    // call whose deadline passed returns tool_timeout, never a late success. All
+    // a no-op when no budget option is set. ===
+    let budget_owned = session.begin_tool_operation();
+    // R1 (B1, D60): the input/entry allow-list gate. Every registry tool that
+    // is not on `tool_budget::tool_input_budget_admitted` is refused here
+    // (`tool_policy_unsupported`) when an input/entry budget is set, so a
+    // process plugin, snapshot, kgl_*, edit_file, or any later-added name is
+    // never silently exempted. A bare deadline refuses nothing here.
+    if let Some(failure) = session.budget_input_refusal(name) {
+        session.end_tool_operation(budget_owned);
+        return response_to_result(failure.into_response(name));
+    }
+    let budget_remaining = session.budget_remaining();
+    let dispatched = crate::managed_process::with_budget_deadline(budget_remaining, async {
     // Registry-based dispatch: route ops-backed tools through the facade.
     if let Some(resp) = tool_facade::invoke(session, name, args).await {
         session.last_response_meta = resp.meta.clone();
         return response_to_result(resp);
     }
 
+    // FR-07 (ADR-022): non-opcode tools (external CLI plugins, repair helpers)
+    // are opaque under read-only; read/meta tools and git_read are admitted.
+    // Refuse before any effect begins; an allowlist cannot override this.
+    if let Err(failure) = session.admission.admit_tool(name) {
+        return response_to_result(failure.into_response(name));
+    }
     // ADR-022: non-opcode tools need an explicit safe classification.
     if session.authority.is_some() && !crate::path_policy::tool_allowed(name) {
         return response_to_result(
@@ -480,6 +526,9 @@ async fn dispatch_tool_inner(
             let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let results: Vec<Value> = all
                 .into_iter()
+                // FR-02 (WP06, R2, ADR-023): the probe/schema-lookup set must
+                // equal the allowlist — never reveal an unlisted tool's schema.
+                .filter(|t| session.policy.allows(&t.name))
                 .filter(|t| names.contains(&t.name))
                 .map(|t| {
                     json!({
@@ -491,7 +540,12 @@ async fn dispatch_tool_inner(
                 .collect();
 
             if results.is_empty() {
-                let known: Vec<&str> = tools::mcp_tool_names();
+                // The suggestion list is filtered too, so an unlisted name is
+                // never advertised as available (ADR-023).
+                let known: Vec<&str> = tools::mcp_tool_names()
+                    .into_iter()
+                    .filter(|&n| session.policy.allows(n))
+                    .collect();
                 err_text(format!(
                     "unknown tool(s): {:?}. Available: {:?}",
                     names, known
@@ -502,7 +556,15 @@ async fn dispatch_tool_inner(
         }
 
         "list_tool_signatures" => {
-            let sigs = script::tool_signatures_for_policy(session.authority.is_some());
+            // FR-02 (WP06, R3, ADR-023): the dumped Starlark signatures must
+            // match the dispatchable set, so filter them by the explicit
+            // allowlist when one is active.
+            let confined = session.authority.is_some();
+            let sigs = if session.policy.is_active() {
+                script::tool_signatures_filtered(confined, &|name| session.policy.allows(name))
+            } else {
+                script::tool_signatures_for_policy(confined)
+            };
             ok_text(sigs)
         }
 
@@ -511,6 +573,10 @@ async fn dispatch_tool_inner(
             let all = tools::tool_definitions(&session.cfg.prompts.resolved_tool_descriptions);
             let summary: Vec<Value> = all
                 .iter()
+                // FR-02 (WP06, AC-02.3): the lazy "load more tools" listing is
+                // filtered by the explicit allowlist too, so no tiered listing
+                // can reveal an unlisted tool (ADR-023).
+                .filter(|tool| session.policy.allows(&tool.name))
                 .filter(|tool| {
                     session.authority.is_none() || crate::path_policy::tool_allowed(&tool.name)
                 })
@@ -696,7 +762,9 @@ async fn dispatch_tool_inner(
             let previous = session.cwd.display().to_string();
             let new_cwd = session.resolve_path(&path);
             if let Some(authority) = &session.authority {
-                let authorized = match authority.open_read(&new_cwd) {
+                // WP14 (FR-12): refuse re-pinning cwd through a symlink
+                // component under no-follow instead of silently resolving it.
+                let authorized = match authority.open_read_policy(&new_cwd) {
                     Ok(authorized) => authorized,
                     Err(error) => {
                         return response_to_result(
@@ -747,10 +815,16 @@ async fn dispatch_tool_inner(
 
         "git_read" => {
             let command = get_str(args, "command").unwrap_or_default();
+            // FR-19 (WP18, ADR-031): git_read runs inside the single budget +
+            // deadline scope installed above, so the git child's process group
+            // is reaped AT the deadline and a passed deadline becomes a typed
+            // tool_timeout at the post-dispatch check. Here we only meter the
+            // git object content it returned (the PM counts this as logical
+            // input): a byte-ceiling hit is tool_input_limit with no partial.
             let Some(registry) = &session.tool_registry else {
                 return err_text(serde_json::json!({"error":{"kind":"unavailable","message":"tool registry unavailable"}}).to_string());
             };
-            match registry
+            let run_result = registry
                 .run(
                     "git_read",
                     &command,
@@ -759,10 +833,14 @@ async fn dispatch_tool_inner(
                     None,
                     Some(args),
                 )
-                .await
-            {
+                .await;
+            match run_result {
                 Ok(result) => {
                     let text = result.output.to_string();
+                    if let Err(failure) = session.budget_charge_bytes(text.len() as u64, "git_read")
+                    {
+                        return response_to_result(failure.into_response("git_read"));
+                    }
                     if result.exit_code == 0 {
                         ok_text(text)
                     } else {
@@ -1111,6 +1189,19 @@ async fn dispatch_tool_inner(
 
         _ => Err(CallToolError::unknown_tool(name.to_string())),
     }
+    })
+    .await;
+    // FR-19 F2/F3 (WP18, ADR-031): a call whose deadline passed is a timeout,
+    // not a late result — even when the work finished just after the deadline,
+    // and even when a deadline-stopped subprocess surfaced as a plugin error
+    // string. Reclassify to the typed tool_timeout whenever the deadline has
+    // passed; otherwise keep the original result (success or a genuine error).
+    let dispatched = match session.budget_check_deadline(name) {
+        Ok(()) => dispatched,
+        Err(failure) => response_to_result(failure.into_response(name)),
+    };
+    session.end_tool_operation(budget_owned);
+    dispatched
 }
 
 fn extract_result_text(result: &CallToolResult) -> String {
@@ -1228,8 +1319,10 @@ fn passes_session_context_check(session: &Session, name: &str) -> bool {
 /// workspace-scoped paths before changing the live session.
 fn apply_reroot(session: &mut Session, new_root: PathBuf) -> bool {
     if let Some(authority) = &session.authority {
+        // WP14 (FR-12): refuse re-rooting through a symlink component under
+        // no-follow; the link is not silently resolved.
         let allowed = authority
-            .open_read(&new_root)
+            .open_read_policy(&new_root)
             .ok()
             .and_then(|entry| entry.metadata().ok())
             .is_some_and(|metadata| metadata.is_dir());
@@ -1281,11 +1374,20 @@ fn apply_reroot(session: &mut Session, new_root: PathBuf) -> bool {
     session.workspace = new_root.clone();
     session.cwd = new_root.clone();
     session.snapshot_store =
-        SnapshotStore::for_workspace(new_root.clone(), session.cfg.snapshot_directory.as_ref());
+        SnapshotStore::for_workspace(new_root.clone(), session.cfg.snapshot_directory.as_ref())
+            .with_discovery_policy(session.cfg.discovery_policy);
     session.read_cache.clear();
     let should_warm = session.authority.is_none()
-        && crate::index::should_warm_index(&new_root, &session.cfg.index, true);
-    let idx = Arc::new(WorkspaceIndex::new(new_root, &session.cfg.index, false));
+        && crate::index::should_warm_index(
+            &new_root,
+            &session.cfg.index,
+            session.cfg.discovery_policy,
+            true,
+        );
+    let idx = Arc::new(
+        WorkspaceIndex::new(new_root, &session.cfg.index, false)
+            .with_discovery_policy(session.cfg.discovery_policy),
+    );
     if should_warm {
         idx.spawn_reindex();
     }
@@ -1352,7 +1454,18 @@ impl ServerHandler for DaimonosHandler {
         let verbosity = session.verbosity;
         let visible: Vec<Tool> = all
             .into_iter()
-            .filter(|t| session.exposed_tools.contains(&t.name))
+            // FR-02 (WP06, AC-02.3): when an explicit allowlist is in force the
+            // model sees EXACTLY the allowlisted tools — every one of them
+            // (even normally-lazy/on-demand tools) and nothing else — so served,
+            // discovered, and executable names agree (ADR-023). With no explicit
+            // list, the legacy lazy exposure set applies unchanged.
+            .filter(|t| {
+                if session.policy.is_active() {
+                    session.policy.allows(&t.name)
+                } else {
+                    session.exposed_tools.contains(&t.name)
+                }
+            })
             .filter(|t| passes_session_context_check(&session, &t.name))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
@@ -1400,6 +1513,12 @@ impl ServerHandler for DaimonosHandler {
         let mut session = self.session.lock().await;
 
         if params.name == "batch" {
+            // FR-02 (WP06, ADR-023): batch is a composite tool and must itself
+            // be on the explicit allowlist before any child runs; its children
+            // are checked independently at `dispatch_tool_inner`.
+            if let Err(failure) = session.policy.admit("batch") {
+                return response_to_result(failure.into_response("batch"));
+            }
             let ops = match args.get("ops").and_then(|v| v.as_array()) {
                 Some(arr) => arr.clone(),
                 None => return err_text("batch requires 'ops' array".into()),
@@ -1413,6 +1532,12 @@ impl ServerHandler for DaimonosHandler {
             let observe_on = crate::kgl::observe::enabled();
             let mut observed_ops: Vec<(String, Value)> = Vec::new();
 
+            // FR-19 (WP18, ADR-031): install ONE shared operation budget for
+            // the whole batch, so every sub-op (dispatched via dispatch_tool,
+            // which re-enters ops::dispatch) inherits the same remaining
+            // allowance and absolute deadline instead of each getting a fresh
+            // top-level budget. No-op when no budget option is set.
+            let batch_budget_owned = session.begin_tool_operation();
             let mut results = Vec::with_capacity(ops.len());
             for (i, op_val) in ops.iter().enumerate() {
                 let tool = match op_val.get("tool").and_then(|v| v.as_str()) {
@@ -1452,6 +1577,9 @@ impl ServerHandler for DaimonosHandler {
                 }
             }
 
+            if batch_budget_owned {
+                session.end_tool_operation(true);
+            }
             let payload = serde_json::to_string(&results).unwrap_or_default();
             // Read the dirty flag before the observe path may drop the lock.
             let tools_changed = session.take_tools_changed();
@@ -1480,6 +1608,13 @@ impl ServerHandler for DaimonosHandler {
             return bounded_text_tool_result(&output_cfg, "batch", payload, false).await;
         }
 
+        // FR-19 (WP18): a top-level call holds the session lock from here to
+        // its result, and each call clears the budget that it installed. So no
+        // budget of an earlier call can be on the session here.
+        debug_assert!(
+            session.tool_budget.is_none(),
+            "a tool budget leaked into the next top-level call"
+        );
         let result = dispatch_tool(&mut session, &params.name, &args).await;
         // Read the dirty flag before the observe path may drop the lock.
         let tools_changed = session.take_tools_changed();
@@ -1542,6 +1677,32 @@ async fn run_execute_script(
     session: Arc<Mutex<Session>>,
     args: &Value,
 ) -> Result<script::ScriptResult, String> {
+    // FR-02 (WP06, ADR-023): execute_script is itself a composite tool and must
+    // be on the explicit allowlist; otherwise refuse the whole call before any
+    // Starlark runs (a fabricated call to an unlisted composite never executes).
+    if !session.lock().await.policy.allows("execute_script") {
+        return Err(serde_json::json!({
+            "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
+            "message": "tool execute_script is not on the explicit tool allowlist",
+            "tool": "execute_script",
+            "retryable": false,
+        })
+        .to_string());
+    }
+    // FR-07 (ADR-022): execute_script is opaque — its inner effects cannot be
+    // mediated — so refuse it before any Starlark runs when the workspace is
+    // read-only. An allowlist entry cannot override this refusal. G7: return
+    // the same structured payload (code/message/tool/retryable) as every other
+    // refusal, serialized so `script_result_to_content` surfaces it verbatim.
+    if session.lock().await.admission.read_only() {
+        return Err(serde_json::json!({
+            "code": crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+            "message": "execute_script cannot be mediated while the workspace is read-only",
+            "tool": "execute_script",
+            "retryable": false,
+        })
+        .to_string());
+    }
     session
         .lock()
         .await
@@ -1554,7 +1715,21 @@ async fn run_execute_script(
         .to_string();
     let timeout_secs =
         crate::script::bounded_timeout_secs(args.get("timeout").and_then(Value::as_i64));
-    script::execute(&code, session, std::time::Duration::from_secs(timeout_secs)).await
+    // FR-19 F4 (WP18, ADR-031): execute_script is a composite that owns ONE
+    // shared operation budget for all its inner ops. That budget is created and
+    // held inside the script context (src/script.rs) and installed on the
+    // session only inside each inner per-op lock, then cleared on release — it
+    // is deliberately NOT installed on the shared session here, because
+    // run_execute_script releases the lock while the script runs, and leaving
+    // it on the session across that window would let a concurrent top-level MCP
+    // call inherit it (wrong deadline/allowance). No-op when no budget option
+    // is set.
+    script::execute(
+        &code,
+        session.clone(),
+        std::time::Duration::from_secs(timeout_secs),
+    )
+    .await
 }
 
 /// Convert the Send-safe script outcome only after all handler awaits finish;
@@ -1604,13 +1779,21 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
         ),
     ];
 
+    // FR-02 (WP06, listing inventory, ADR-023): the server instructions embed
+    // the Starlark tool signatures the model reads. Under an active explicit
+    // allowlist they are filtered too, so the instructions agree with the
+    // served/dispatched set and cannot reveal an unlisted tool.
+    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+    let confined = cfg.filesystem_authority.is_some();
+    let signatures = if policy.is_active() {
+        script::tool_signatures_filtered(confined, &|name| policy.allows(name))
+    } else if confined {
+        script::tool_signatures_for_policy(true)
+    } else {
+        script::tool_signatures()
+    };
     parts.push(format!(
-        "Starlark tool functions for execute_script:\n{}",
-        if cfg.filesystem_authority.is_some() {
-            script::tool_signatures_for_policy(true)
-        } else {
-            script::tool_signatures()
-        }
+        "Starlark tool functions for execute_script:\n{signatures}"
     ));
 
     if let Some(authority) = &cfg.filesystem_authority {
@@ -1631,8 +1814,10 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
             let detected: Vec<_> = markers
                 .into_iter()
                 .filter_map(|(file, language)| {
+                    // WP14 (FR-12): a symlinked marker must not satisfy
+                    // project-type detection under no-follow.
                     authority
-                        .open_read(&authority.root().join(file))
+                        .open_read_policy(&authority.root().join(file))
                         .ok()
                         .map(|_| language)
                 })
@@ -1640,7 +1825,10 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
             if !detected.is_empty() {
                 hints.push(format!("Project type: {}", detected.join(", ")));
             }
-            if authority.open_read(&authority.root().join(".git")).is_ok() {
+            if authority
+                .open_read_policy(&authority.root().join(".git"))
+                .is_ok()
+            {
                 hints.push("VCS: git".to_string());
             }
             if let Ok(walk) = authority.walk(
@@ -1649,7 +1837,9 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
                     max_depth: Some(0),
                     include_hidden: false,
                     skip_dirs: &["target", "node_modules"],
-                    ..Default::default()
+                    // WP14 (FR-12): never descend through a link under no-follow.
+                    follow_symlinks: !authority.no_follow(),
+                    max_entries: None,
                 },
             ) {
                 let mut dirs: Vec<_> = walk
@@ -1984,7 +2174,16 @@ fn socket_list_tools_json(session: &Session) -> Vec<Value> {
     let full_tool_schemas = config::effective_full_tool_schemas(&session.cfg);
     let verbosity = session.verbosity;
     all.into_iter()
-        .filter(|t| session.exposed_tools.contains(&t.name))
+        // FR-02 (WP06, listing inventory): the session-daemon socket listing is
+        // filtered by the explicit allowlist too (mirrors the MCP tools/list
+        // path), so an allowlisted daemon serves exactly the allowlisted tools.
+        .filter(|t| {
+            if session.policy.is_active() {
+                session.policy.allows(&t.name)
+            } else {
+                session.exposed_tools.contains(&t.name)
+            }
+        })
         .filter(|t| passes_session_context_check(session, &t.name))
         .map(|t| {
             let already_used = session.used_tools.contains(&t.name);
@@ -2440,6 +2639,29 @@ mod tests {
     fn pick_workspace_root_none_when_no_valid_root() {
         let roots = vec![root("https://example.com"), root("file:///no/such/dir/q")];
         assert_eq!(pick_workspace_root(&roots), None);
+    }
+
+    #[tokio::test]
+    async fn apply_reroot_no_follow_refuses_symlinked_root() {
+        use crate::config::Config;
+        // WP14 R3: set_root (apply_reroot) must not re-root onto a path whose
+        // component is a symlink under no-follow; the link is refused, not
+        // silently resolved, so the live workspace is preserved.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("realdir")).unwrap();
+        std::os::unix::fs::symlink("realdir", root.path().join("linkdir")).unwrap();
+        let mut cfg = Config::default();
+        let mut authority =
+            crate::path_policy::FilesystemAuthority::confined(root.path(), cfg.fs_limits())
+                .unwrap();
+        authority.set_no_follow(true);
+        cfg.filesystem_authority = Some(Arc::new(authority));
+        let root_canon = root.path().canonicalize().unwrap();
+        let mut session = Session::new(root_canon.clone(), Arc::new(cfg));
+        let before = session.workspace.clone();
+        let accepted = apply_reroot(&mut session, root_canon.join("linkdir"));
+        assert!(!accepted, "set_root followed a symlink under no-follow");
+        assert_eq!(session.workspace, before, "workspace must be preserved");
     }
 
     #[tokio::test]
@@ -3342,5 +3564,41 @@ mod tests {
                 stats.total_saved_tokens
             );
         }
+    }
+
+    /// FR-19 (WP18, review B2): a call that ends early because the session
+    /// has no tool registry leaves no budget on the session. The registry is
+    /// present in each process frontend, so only a Rust test reaches this path.
+    #[tokio::test]
+    async fn budgeted_git_read_without_a_registry_leaves_no_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("probe.txt"), "b".repeat(60)).unwrap();
+        let mut cfg = Config::default();
+        cfg.tool_budget.input_bytes = Some(100);
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        assert!(session.tool_registry.is_none());
+
+        // A 60-byte read first, so a leaked budget would hold 60 bytes.
+        let first = dispatch_tool(&mut session, "read_file", &json!({"path": "probe.txt"}))
+            .await
+            .unwrap();
+        assert_ne!(first.is_error, Some(true));
+        assert!(session.tool_budget.is_none());
+
+        let unavailable = dispatch_tool(&mut session, "git_read", &json!({"command": "log"}))
+            .await
+            .unwrap();
+        assert_eq!(unavailable.is_error, Some(true));
+        assert!(extract_result_text(&unavailable).contains("tool registry unavailable"));
+        assert!(
+            session.tool_budget.is_none(),
+            "the early return must clear the budget"
+        );
+
+        // The next call has a fresh allowance: 60 bytes fit under 100.
+        let next = dispatch_tool(&mut session, "read_file", &json!({"path": "probe.txt"}))
+            .await
+            .unwrap();
+        assert_ne!(next.is_error, Some(true), "{}", extract_result_text(&next));
     }
 }

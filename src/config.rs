@@ -95,10 +95,32 @@ impl Default for ToolLimitsConfig {
     }
 }
 
+/// Bounds for the caller-requested local run audit (WP08, FR-04 reqs 18-20).
+/// Context: ADR-026, reviewer-runtime INTERFACES.md `reviewer.audit`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ReviewerAuditConfig {
+    /// Maximum serialized bytes for one audit event. A larger event is a
+    /// required-audit failure, never a silent truncation.
+    pub max_event_bytes: usize,
+    /// Maximum number of audit events for one run.
+    pub max_events: u64,
+}
+
+impl Default for ReviewerAuditConfig {
+    fn default() -> Self {
+        Self {
+            max_event_bytes: 65536,
+            max_events: 100_000,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct ReviewerConfig {
     pub tool_limits: ToolLimitsConfig,
+    pub audit: ReviewerAuditConfig,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -145,6 +167,40 @@ pub struct Config {
     /// Pinned at startup and shared across sessions (ADR-022).
     #[serde(skip)]
     pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
+    /// `--workspace-read-only` (FR-07, ADR-022): prohibit every workspace
+    /// mutation. Caller-owned; never deserialized from workspace config.
+    #[serde(skip)]
+    pub workspace_read_only: bool,
+    /// `--audit-path` (WP08, FR-04): the caller-requested local audit
+    /// destination, already validated and resolved (outside evidence; under
+    /// the state root when an explicit state root is selected). Caller-owned;
+    /// never deserialized from workspace config.
+    #[serde(skip)]
+    pub audit_path: Option<std::path::PathBuf>,
+    /// `--tool-allowlist` (FR-02, WP06, ADR-023): the caller's explicit
+    /// allowlist of exact exported tool names, already loaded and validated at
+    /// startup. `None` keeps legacy behavior (all tools allowed); `Some(vec)`
+    /// is an explicit selection and `Some(empty)` grants no tools. Caller-owned;
+    /// never deserialized from workspace/user config, so nothing the caller did
+    /// not pass explicitly can widen or disable it (requirement 6).
+    #[serde(skip)]
+    pub tool_allowlist: Option<Vec<String>>,
+    /// The original `--tool-allowlist` file path, kept so the interactive
+    /// session daemon can be spawned with the same flag and carry it in its
+    /// launch identity (FR-02, WP06; mirrors `workspace_read_only`). Caller-owned.
+    #[serde(skip)]
+    pub tool_allowlist_path: Option<std::path::PathBuf>,
+    /// Caller-owned configuration discovery policy (ADR-021, FR-09). Never
+    /// deserialized from a config file; set once at startup from the CLI.
+    #[serde(skip)]
+    pub discovery_policy: crate::discovery_policy::DiscoveryPolicy,
+    /// `--tool-timeout-ms` / `--tool-input-bytes` / `--tool-max-entries`
+    /// (FR-19, WP18, ADR-031): the caller's cooperative per-call tool budgets.
+    /// Caller-owned; never deserialized from workspace/user config, so nothing
+    /// the caller did not pass explicitly can set or widen a limit. All-absent
+    /// keeps legacy behavior (no budget installed).
+    #[serde(skip)]
+    pub tool_budget: crate::tool_budget::ToolBudgetConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }
@@ -177,6 +233,9 @@ pub struct AgentSkillsConfig {
     /// Fixed filesystem authority for skill discovery (ADR-022).
     #[serde(skip)]
     pub filesystem_authority: Option<std::sync::Arc<crate::path_policy::FilesystemAuthority>>,
+    /// Explicit-only discovery (ADR-021, FR-09): skip every implicit skill root.
+    #[serde(skip)]
+    pub explicit_only: bool,
     pub max_skills: usize,
     pub max_file_bytes: u64,
     pub catalog_max_bytes: usize,
@@ -188,6 +247,7 @@ impl Default for AgentSkillsConfig {
         Self {
             global_dir: None,
             filesystem_authority: None,
+            explicit_only: false,
             max_skills: 128,
             max_file_bytes: 100 * 1024,
             catalog_max_bytes: 16 * 1024,
@@ -425,6 +485,11 @@ pub struct ToolOutputConfig {
     pub old_argument_max_chars: usize,
     /// Opt-in LLM reformatting of noisy verifier-tool output (vikunja #1235).
     pub reformat: ReformatConfig,
+    /// Save full copies and emit saved-file pointers for bounded output.
+    /// `false` (caller-owned `--no-output-spill`, ADR-021/FR-11) bounds oversized
+    /// results in place with paging/narrowing guidance only: no full copy is
+    /// written and no saved-file path is advertised. Context: ADR-021.
+    pub save_full_output: bool,
 }
 
 /// Opt-in LLM reformatting of high-volume, low-signal tool output — test
@@ -480,6 +545,7 @@ impl Default for ToolOutputConfig {
             intra_turn_keep_recent_results: 5,
             old_argument_max_chars: 2_000,
             reformat: ReformatConfig::default(),
+            save_full_output: true,
         }
     }
 }
@@ -1453,6 +1519,13 @@ pub struct McpConfig {
     /// introspection via `[mcp] full_tool_schemas = true` or
     /// `DAIMONOS_MCP_FULL_SCHEMAS=1`.
     pub full_tool_schemas: bool,
+    /// WP17 r6 (FR-15, integrator D53): set ONLY by the global
+    /// `--full-tool-schemas` CLI flag (never from TOML — hence `#[serde(skip)]`).
+    /// When true the flag forces full-schema mode on regardless of the
+    /// `DAIMONOS_MCP_FULL_SCHEMAS` variable, so an explicit flag is never
+    /// silently masked by a false-y env value. This is not a configuration key.
+    #[serde(skip)]
+    pub full_tool_schemas_forced: bool,
     /// Default per-session output verbosity level (vikunja #181): one of
     /// `full` (today's behavior), `compact`, `terse`. Overridable at startup
     /// via `DAIMONOS_MCP_VERBOSITY`; changeable mid-session via the
@@ -1494,6 +1567,7 @@ impl Default for McpConfig {
             client_gone_poll_ms: 250,
             startup_logs: false,
             full_tool_schemas: false,
+            full_tool_schemas_forced: false,
             default_verbosity: Verbosity::Full,
         }
     }
@@ -1694,6 +1768,13 @@ impl CoordinationConfig {
 /// Whether `list_tools` should expose full JSON Schemas for Terse-tier tools.
 /// Env `DAIMONOS_MCP_FULL_SCHEMAS` (`1`/`true`/`yes`/`on`) wins over config.
 pub fn effective_full_tool_schemas(cfg: &Config) -> bool {
+    // WP17 r6 (integrator D53): the global `--full-tool-schemas` flag wins over
+    // the env variable for every value, so an explicit flag is never silently
+    // masked by `DAIMONOS_MCP_FULL_SCHEMAS=0` (or `false`/`off`/empty). Without
+    // the flag the env still wins over the config key (precedence unchanged).
+    if cfg.mcp.full_tool_schemas_forced {
+        return true;
+    }
     if let Ok(raw) = std::env::var("DAIMONOS_MCP_FULL_SCHEMAS") {
         return matches!(
             raw.trim().to_ascii_lowercase().as_str(),
@@ -2473,6 +2554,41 @@ pub(crate) fn load_confined(
     Ok(Config::default())
 }
 
+/// Explicit-only configuration (ADR-021, FR-09): honour only the caller's
+/// explicit `--config` path. No workspace or user/home candidate is eligible,
+/// and an unreadable or invalid explicit config fails rather than falling back
+/// to another source.
+pub(crate) fn load_explicit_only(
+    explicit: Option<&Path>,
+    quiet_diagnostic_stderr: bool,
+) -> Result<Config, String> {
+    let Some(path) = explicit else {
+        if !quiet_diagnostic_stderr {
+            eprintln!("config: explicit-only mode; using built-in defaults");
+        }
+        return Ok(Config::default());
+    };
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read explicit config {}: {}",
+            path.display(),
+            error.kind()
+        )
+    })?;
+    let mut cfg = toml::from_str::<Config>(&content).map_err(|error| {
+        format!(
+            "invalid explicit config {}: {}",
+            path.display(),
+            error.message()
+        )
+    })?;
+    cfg.explicit_control_paths = true;
+    if !quiet_diagnostic_stderr {
+        eprintln!("config: loaded from {:?}", path);
+    }
+    Ok(cfg)
+}
+
 /// Ordered config-file search candidates, matching `load`'s discovery order:
 /// explicit `--config` path (if any), then `<workspace>/daimonos.toml`, then
 /// `$XDG_CONFIG_HOME`/`~/.config` `daimonos/config.toml`. Candidates that can't
@@ -2851,6 +2967,33 @@ mod tests {
         std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "1");
         assert!(effective_full_tool_schemas(&cfg));
         std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "false");
+        assert!(!effective_full_tool_schemas(&cfg));
+        std::env::remove_var("DAIMONOS_MCP_FULL_SCHEMAS");
+    }
+
+    #[test]
+    fn effective_full_tool_schemas_flag_forces_on_over_env() {
+        // WP17 r6 (integrator D53): the `--full-tool-schemas` flag (recorded as
+        // `full_tool_schemas_forced`) wins over the env variable for every
+        // false-y value; without the flag the env still wins over the config
+        // key. This is the single effective-value chokepoint the dump, the MCP
+        // server, the model-running frontends, and the session-daemon launch
+        // identity (agent_runtime -> BootstrapOptions.full_tool_schemas) all
+        // read, so pinning it here covers every frontend at once.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = Config::default();
+        cfg.mcp.full_tool_schemas_forced = true;
+        for value in ["0", "false", "off", ""] {
+            std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", value);
+            assert!(
+                effective_full_tool_schemas(&cfg),
+                "flag must force full mode on over env {value:?}"
+            );
+        }
+        // Without the flag the env variable still wins over a true config key.
+        cfg.mcp.full_tool_schemas_forced = false;
+        cfg.mcp.full_tool_schemas = true;
+        std::env::set_var("DAIMONOS_MCP_FULL_SCHEMAS", "0");
         assert!(!effective_full_tool_schemas(&cfg));
         std::env::remove_var("DAIMONOS_MCP_FULL_SCHEMAS");
     }
@@ -3376,6 +3519,35 @@ source_pattern = "*.rs"
         assert!(cfg.tools.contains_key("mytest"));
         assert_eq!(cfg.tools["mytest"].bin, "/usr/bin/test");
         assert_eq!(cfg.tools["mytest"].source_pattern.as_deref(), Some("*.rs"));
+    }
+
+    // WP11 R7 / D09 (FR-09, ADR-021): a hostile workspace `[tools.*]` plugin
+    // registration must not take effect under explicit-only mode. Generic CLI
+    // plugins are not surfaced through any MCP tool name, so this is proven at
+    // the config seam rather than through the process interface (D-WP11-05).
+    #[test]
+    fn explicit_only_does_not_register_workspace_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("daimonos.toml"),
+            "[tools.hostiletool]\nbin = \"/usr/bin/true\"\n",
+        )
+        .unwrap();
+        // Explicit-only with no caller `--config`: the workspace daimonos.toml
+        // is never read, so its `[tools.*]` entry (D09) cannot register.
+        let explicit_only = load_explicit_only(None, true).unwrap();
+        assert!(
+            !explicit_only.tools.contains_key("hostiletool"),
+            "explicit-only must not load workspace plugins: {:?}",
+            explicit_only.tools
+        );
+        // Opt-out regression: the default loader DOES register the same plugin.
+        let loaded = load(None, ws, true);
+        assert!(
+            loaded.tools.contains_key("hostiletool"),
+            "default discovery must honour a workspace [tools.*] registration"
+        );
     }
 
     #[test]

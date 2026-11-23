@@ -536,3 +536,38 @@ def test_only_an_error_stop_reason_exits_non_zero(daimonos_binary, tmp_path, fak
             assert done.returncode == exit_code, (stop_reason, json_output, done.stderr)
             if json_output:
                 assert only_json_document(done.stdout)["stop_reason"] == stop_reason
+
+
+# --- combined tree: ADR-036 options with the reviewer-runtime options ---
+
+def test_output_json_names_the_provider_label_of_a_controlled_profile(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("FROM THE PROFILE")])
+    harness = Harness(daimonos_binary, tmp_path, 1)  # the agent env endpoint is not used
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({
+        "provider_label": "profile-label", "model": "profile/model",
+        "base_url": f"http://127.0.0.1:{provider.port}/v1", "wire": "chat",
+        "credential_env": "PROFILE_TEST_KEY"}))
+    done = subprocess.run(
+        harness.command("--model-profile", str(profile), "--output", "json", "task"),
+        cwd=harness.workspace, env={**harness.environment(), "PROFILE_TEST_KEY": "test-key"},
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    doc = only_json_document(done.stdout)
+    assert (doc["provider"], doc["model"]) == ("profile-label", "profile/model")
+    assert doc["final_text"] == "FROM THE PROFILE"
+    assert len(provider.requests) == 1
+
+
+def test_session_options_are_refused_with_the_reviewer_runtime_options(daimonos_binary, tmp_path, fake_provider):
+    provider = fake_provider([text_reply("NEVER SENT")])
+    harness = Harness(daimonos_binary, tmp_path, provider.port)
+    for session in (["--session-id", "run-1"], ["--resume", "run-1"]):
+        for other in (["--final-output", "f.json"], ["--model-profile", "p.json"], ["--worker-config", "w.json"]):
+            done = harness.agent(*session, *other, "task")
+            assert done.returncode == 2 and done.stdout == "", (session, other, done.stderr)
+            assert "cannot be used with" in done.stderr
+    done = harness.agent("--output", "json", "--final-output", "f.json", "task")
+    assert done.returncode == 2 and done.stdout == ""
+    assert provider.requests == []
+    assert not (harness.home / ".daimonos" / "oneshot-sessions").exists()

@@ -1,0 +1,559 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+remerge CONFLICT (content): Merge conflict in CHANGELOG.md
+index da698f6..6a4bb13 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,7 +7,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
+ 
+ ## [Unreleased]
+ 
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+ ### Added
+ 
+ - **`--capability-probe-payload` (FR-04).** A default-off `agent --print`
+@@ -263,7 +262,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
+   is never read or walked through, including intermediate directory links and
+   links named as a tool/walk scope. Combines with `--confine-paths`; default off
+   leaves behavior unchanged.
+-=======
++
+ ### Changed
+ 
+ - **Releases start from CI.** A merge to `master` that changes the version in
+@@ -329,7 +328,6 @@ This release has the 13 PRs that merged after v0.1.5 (#252 to #263, and #284).
+ 
+ - Accepted ADRs 021 to 032 and the reviewer-runtime glossary (#256).
+ - Vikunja project URLs in `AGENTS.md` (#263).
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+ 
+ ## [0.1.5] - 2026-10-18
+ 
+diff --git a/docs/runtime-modes.md b/docs/runtime-modes.md
+index a35b249..d0c9c70 100644
+--- a/docs/runtime-modes.md
++++ b/docs/runtime-modes.md
+@@ -52,7 +52,19 @@ daimonos agent --resume run-42 --output json "The tests failed: <output>"
+ | `--output json` | Print one JSON result document on stdout. |
+ 
+ The three options conflict with `--interactive` and `--dry-run`. `--session-id`
+-and `--resume` conflict with each other. The top-level `--session-id` (before
++and `--resume` conflict with each other.
++
++Combinations with the reviewer-runtime options:
++
++- `--session-id` and `--resume` are refused with `--final-output`,
++  `--model-profile`, and `--worker-config`. These combinations are not built.
++  The session record does not hold the endpoint of a model profile.
++- `--output json` is refused with `--final-output`. Both options own stdout.
++  ADR-036 Decision 14 defines the combination. It is not built.
++- `--output json` works with `--model-profile`. The field `provider` is then
++  the `provider_label` of the profile.
++- `--output json` with `--worker-config` or `--audit-path` is accepted. No test
++  covers these two combinations. The top-level `--session-id` (before
+ `agent`) is a different option: it filters `--stats`.
+ 
+ **Sessions**
+diff --git a/src/acp_cmd.rs b/src/acp_cmd.rs
+remerge CONFLICT (content): Merge conflict in src/acp_cmd.rs
+index 44815fd..cb36020 100644
+--- a/src/acp_cmd.rs
++++ b/src/acp_cmd.rs
+@@ -1714,14 +1714,11 @@ fn build_agent_config(
+             failover_models,
+             ..crate::agent::ProviderRetryConfig::default()
+         },
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+         // WP08: --audit-path currently wires into the one-shot agent frontend
+         // only; ACP-session auditing is a future integrator hook.
+         audit: None,
+-=======
+         // ACP sessions do not mark a stable message prefix (ADR-036 is one-shot only).
+         stable_prefix: false,
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+         before_tool_call: Some(build_before_tool_call_hook(
+             Arc::clone(&connection),
+             session_id.clone(),
+diff --git a/src/agent.rs b/src/agent.rs
+remerge CONFLICT (content): Merge conflict in src/agent.rs
+index 76532a3..ad580f8 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -240,7 +240,6 @@ pub struct AgentConfig {
+     pub on_provider_notice: Option<ProviderNoticeHook>,
+     /// Bounded retry for *transient* provider failures (vikunja #1240).
+     pub provider_retry: ProviderRetryConfig,
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+     /// WP08 (FR-04, ADR-026): caller-requested local run audit sink. `None` =
+     /// audit off. When present, every provider response and tool dispatch in
+     /// this loop is recorded; a required-audit write failure poisons the sink
+@@ -270,12 +269,10 @@ pub struct AgentConfig {
+     /// (`final_output`) and is never forwarded to a worker. `None` leaves
+     /// dispatch unchanged (legacy ACP bridging stays fail-open).
+     pub worker_executor: Option<std::sync::Arc<crate::worker_runtime::WorkerExecutor>>,
+-=======
+     /// Mark the whole message list as the stable prefix on each request, so
+     /// the provider adapter can place its cache breakpoint at the end of the
+     /// conversation (ADR-036 Decision 7). `false` sends `stable_prefix_len: 0`.
+     pub stable_prefix: bool,
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+ }
+ 
+ /// How hard to retry a provider failure the adapter classified as transient
+diff --git a/src/agent_cmd.rs b/src/agent_cmd.rs
+remerge CONFLICT (content): Merge conflict in src/agent_cmd.rs
+index fde622c..7a1c5c1 100644
+--- a/src/agent_cmd.rs
++++ b/src/agent_cmd.rs
+@@ -267,13 +267,6 @@ pub async fn run_agent(
+     args: AgentCmdArgs,
+     out: &mut dyn Write,
+ ) -> Result<AgentResult> {
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+-    // FR-02 (WP06, ADR-023) R1: the explicit allowlist filters the offered
+-    // catalog at its single source (`active_schemas_for_policy`), so the
+-    // per-frontend `retain` below is gone. With no explicit list this is a
+-    // no-op (legacy behavior).
+-    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+-=======
+     run_agent_with(provider, workspace, cfg, args, RunOptions::default(), out).await
+ }
+ 
+@@ -289,7 +282,11 @@ pub async fn run_agent_with(
+     out: &mut dyn Write,
+ ) -> Result<AgentResult> {
+     let started = std::time::Instant::now();
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
++    // FR-02 (WP06, ADR-023) R1: the explicit allowlist filters the offered
++    // catalog at its single source (`active_schemas_for_policy`), so the
++    // per-frontend `retain` below is gone. With no explicit list this is a
++    // no-op (legacy behavior).
++    let policy = crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref());
+     let schemas = tool_facade::active_schemas_for_policy(
+         workspace,
+         &cfg.prompts.resolved_tool_descriptions,
+@@ -444,7 +441,6 @@ pub async fn run_agent_with(
+         tools.extend(mcp.tools().into_iter().filter(|t| policy.allows(&t.name)));
+     }
+ 
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+     // WP05 (ADR-024): offer the caller's final-answer tool with its schema
+     // unchanged and switch the loop to terminal-call accounting. The tool is
+     // intercepted model-side and never dispatched or routed to a worker.
+@@ -503,8 +499,6 @@ pub async fn run_agent_with(
+             });
+         }
+     }
+-    let model = args.model.unwrap_or_else(|| "claude-opus-4-8".to_string());
+-=======
+     // ADR-036 Decision 5: a resumed session keeps its request prefix. It runs
+     // on the saved model and thinking level with the saved system prompt, and
+     // a different tool list is refused before any provider call.
+@@ -526,7 +520,6 @@ pub async fn run_agent_with(
+         Some(saved) => saved.prefix.system.clone(),
+         None => crate::prompts::agent_system_for_workspace(&cfg, Some(workspace)).await,
+     };
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+     let before_tool_call = args.safety.map(|p| p.into_before_hook());
+     // #1575 (invariant 4 / R6): a thought-log open failure here is a post-probe
+     // early error; reap the owned worker through its managed lifecycle before
+@@ -572,7 +565,10 @@ pub async fn run_agent_with(
+             label: "agent".to_string(),
+         }),
+         remote_tool_dispatch: agent_mcp.as_ref().map(|mcp| mcp.dispatch_hook()),
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
++        // ADR-036 Decision 7. Only with prompt caching on: the Anthropic
++        // adapter sets a cache marker for any non-zero prefix length, and the
++        // mark must have no effect while prompt caching is off.
++        stable_prefix: options.session.is_some() && options.prompt_cache,
+         audit: args.audit.clone(),
+         // WP05 (ADR-024): final-output mode makes each generation exactly one
+         // HTTP attempt so the inclusive model-request ceiling is exact. Disable
+@@ -600,12 +596,6 @@ pub async fn run_agent_with(
+             0
+         },
+         worker_executor: worker_executor.clone(),
+-=======
+-        // ADR-036 Decision 7. Only with prompt caching on: the Anthropic
+-        // adapter sets a cache marker for any non-zero prefix length, and the
+-        // mark must have no effect while prompt caching is off.
+-        stable_prefix: options.session.is_some() && options.prompt_cache,
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+         ..AgentConfig::default()
+     };
+ 
+@@ -771,18 +761,6 @@ pub async fn run_agent_with(
+     // completed provider run has closed its span and reached analytics.
+     thought_capture_result?;
+ 
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+-    // WP05 (ADR-024): final-output mode owns stdout — only the validated
+-    // argument JSON (emitted by the caller) may appear there. Suppress the
+-    // normal assistant-text echo so nothing else reaches stdout (AC-01.7).
+-    if !final_output_active {
+-        for msg in &result.messages {
+-            if matches!(msg.role, Role::Assistant) {
+-                for block in &msg.content {
+-                    if let ContentBlock::Text(t) = block {
+-                        writeln!(out, "{t}")?;
+-                    }
+-=======
+     // Decision 15: a resumed run prints only the assistant text that this
+     // invocation added. Every other run prints as before.
+     let already_printed = if options.session.as_ref().is_some_and(|s| s.is_resume()) {
+@@ -790,12 +768,16 @@ pub async fn run_agent_with(
+     } else {
+         0
+     };
+-    for msg in result.messages.iter().skip(already_printed) {
+-        if matches!(msg.role, Role::Assistant) {
+-            for block in &msg.content {
+-                if let ContentBlock::Text(t) = block {
+-                    writeln!(out, "{t}")?;
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
++    // WP05 (ADR-024): final-output mode owns stdout — only the validated
++    // argument JSON (emitted by the caller) may appear there. Suppress the
++    // normal assistant-text echo so nothing else reaches stdout (AC-01.7).
++    if !final_output_active {
++        for msg in result.messages.iter().skip(already_printed) {
++            if matches!(msg.role, Role::Assistant) {
++                for block in &msg.content {
++                    if let ContentBlock::Text(t) = block {
++                        writeln!(out, "{t}")?;
++                    }
+                 }
+             }
+         }
+diff --git a/src/agent_runtime.rs b/src/agent_runtime.rs
+remerge CONFLICT (content): Merge conflict in src/agent_runtime.rs
+index 1d485ab..3a637af 100644
+--- a/src/agent_runtime.rs
++++ b/src/agent_runtime.rs
+@@ -322,11 +322,13 @@ pub async fn run_agent(
+         agent_env,
+         debug_thoughts,
+         debug_thoughts_path,
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+         model_profile,
+         final_output,
+         capability_probe_payload,
+         worker_config,
++        output,
++        oneshot_session_id,
++        resume,
+     } = args;
+     // WP09 (FR-04 reqs 14-17, ADR-027): the capability probe requires FR-01
+     // structured final output AND a complete controlled model profile (PM
+@@ -356,11 +358,6 @@ pub async fn run_agent(
+         Some(path) => Some(load_controlled_profile(path)?),
+         None => None,
+     };
+-=======
+-        output,
+-        oneshot_session_id,
+-        resume,
+-    } = args;
+     let session_request = oneshot_session_id
+         .map(crate::oneshot_session::SessionRequest::Start)
+         .or(resume.map(crate::oneshot_session::SessionRequest::Resume));
+@@ -368,7 +365,6 @@ pub async fn run_agent(
+         // ADR-036: a bad id is refused before any store or provider access.
+         crate::oneshot_session::validate_id(request.id())?;
+     }
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+     // Pre-resolution intent capture: the operator asked for interactive but
+     // no TTY is attached. Only the Print fallback's require_agent_task error
+@@ -706,7 +702,15 @@ pub async fn run_agent(
+     let agent = load_agent_env(agent_env, &cfg)?;
+     let cfg = with_skill_dir(cfg, &agent)?;
+     let effective_provider = provider.unwrap_or_else(|| agent.provider.clone());
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
++    // An explicit --model. The model of the agent env file is a default, not
++    // a request, so a resume does not compare it with the saved model.
++    let explicit_model = model.clone();
++    // ADR-036 with WP07: under a controlled profile, the JSON result document
++    // names the provider label of the profile, not the agent env provider.
++    let report_provider = controlled_profile
++        .as_ref()
++        .map(|profile| profile.spec.provider_label.clone())
++        .unwrap_or_else(|| effective_provider.clone());
+     // WP10 (R1, ADR-028): capture the resolved model credential BEFORE the
+     // provider consumes it, so a worker whose explicit env value or argv entry
+     // discloses it can be refused before any worker launches. Default provider:
+@@ -735,17 +739,6 @@ pub async fn run_agent(
+                 )?,
+             )
+         };
+-=======
+-    // An explicit --model. The model of the agent env file is a default, not
+-    // a request, so a resume does not compare it with the saved model.
+-    let explicit_model = model.clone();
+-    let effective_model = model.unwrap_or_else(|| agent.model.clone());
+-    let llm = build_provider(
+-        &effective_provider,
+-        &agent,
+-        providers::ProviderTimeouts::from_config(&cfg.provider_timeouts),
+-    )?;
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+     let analytics_store = if cfg.analytics.enabled {
+         let db_path = cfg.analytics.resolved_db_path();
+         match analytics::AnalyticsStore::open_async(&db_path, cfg.analytics.retention_days).await {
+@@ -819,7 +812,31 @@ pub async fn run_agent(
+         capability_probe_sink: capability_probe_sink.clone(),
+         worker_config: worker_config_runtime.clone(),
+     };
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
++    // The endpoints that `build_provider` uses: the primary base URL and each
++    // secondary provider that is not the selected provider.
++    let endpoint = crate::oneshot_session::endpoint_digest(
++        &agent.base_url,
++        agent
++            .secondary_providers
++            .iter()
++            .filter(|secondary| secondary.name != effective_provider)
++            .map(|secondary| (secondary.name.as_str(), secondary.base_url.as_str())),
++    );
++    let session = match session_request {
++        Some(request) => {
++            let session = open_oneshot_session(&cfg, request)?;
++            session.check_overrides(explicit_model.as_deref(), &effective_provider, &endpoint)?;
++            Some(session)
++        }
++        None => None,
++    };
++    let options = agent_cmd::RunOptions {
++        provider: report_provider,
++        output,
++        session,
++        prompt_cache: agent.prompt_cache,
++        endpoint,
++    };
+     // WP08 (R2, ADR-026): the terminal `run_end` audit event must be written —
+     // and any required-audit write failure surfaced as exit 23 — BEFORE the
+     // run's assistant output reaches stdout, so a finish-time audit failure can
+@@ -830,7 +847,9 @@ pub async fn run_agent(
+     let result = if let Some(audit) = &audit {
+         use std::io::Write as _;
+         let mut buffer: Vec<u8> = Vec::new();
+-        let result = agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut buffer).await;
++        let result =
++            agent_cmd::run_agent_with(llm.as_ref(), workspace, cfg, args, options, &mut buffer)
++                .await;
+         // WP09 (G1): peek (not take) the probe verdict so the terminal audit
+         // record agrees with the process exit that `emit_probe_outcome` will
+         // produce below; `emit_probe_outcome` still consumes the sink after.
+@@ -854,7 +873,15 @@ pub async fn run_agent(
+         stdout.flush()?;
+         result
+     } else {
+-        agent_cmd::run_agent(llm.as_ref(), workspace, cfg, args, &mut std::io::stdout()).await
++        agent_cmd::run_agent_with(
++            llm.as_ref(),
++            workspace,
++            cfg,
++            args,
++            options,
++            &mut std::io::stdout(),
++        )
++        .await
+     };
+     // WP10 (FR-05, ADR-028): a required worker failure (initialization, call,
+     // liveness, or teardown) ends the run with the reviewed `worker_unavailable`
+@@ -1077,42 +1104,6 @@ fn finalize_run_audit(
+         eprintln!("{}", failure.diagnostic_json());
+         std::process::exit(failure.exit_code());
+     }
+-=======
+-    // The endpoints that `build_provider` uses: the primary base URL and each
+-    // secondary provider that is not the selected provider.
+-    let endpoint = crate::oneshot_session::endpoint_digest(
+-        &agent.base_url,
+-        agent
+-            .secondary_providers
+-            .iter()
+-            .filter(|secondary| secondary.name != effective_provider)
+-            .map(|secondary| (secondary.name.as_str(), secondary.base_url.as_str())),
+-    );
+-    let session = match session_request {
+-        Some(request) => {
+-            let session = open_oneshot_session(&cfg, request)?;
+-            session.check_overrides(explicit_model.as_deref(), &effective_provider, &endpoint)?;
+-            Some(session)
+-        }
+-        None => None,
+-    };
+-    let options = agent_cmd::RunOptions {
+-        provider: effective_provider,
+-        output,
+-        session,
+-        prompt_cache: agent.prompt_cache,
+-        endpoint,
+-    };
+-    let result = agent_cmd::run_agent_with(
+-        llm.as_ref(),
+-        workspace,
+-        cfg,
+-        args,
+-        options,
+-        &mut std::io::stdout(),
+-    )
+-    .await?;
+-    check_agent_result(&result)
+ }
+ 
+ /// Claim a named one-shot session in its own store (ADR-036 Decision 2):
+@@ -1137,7 +1128,6 @@ fn open_oneshot_session(
+             cfg.session.session_store_busy_timeout_ms,
+         ));
+     crate::oneshot_session::open(store, request)
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+ }
+ 
+ pub async fn run_chat(
+diff --git a/src/cli.rs b/src/cli.rs
+remerge CONFLICT (content): Merge conflict in src/cli.rs
+index 1334121..3433ab0 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -54,7 +54,6 @@ pub struct AgentArgs {
+         conflicts_with = "interactive"
+     )]
+     pub debug_thoughts_path: Option<PathBuf>,
+-<<<<<<< 102d7e2 (merge(#1575): integrate WP14 (no-follow symlink policy) into dbunk/integration-wave7)
+     /// WP07 (FR-04): opt-in controlled model transport. Path to ONE JSON object
+     /// owning the five required values (`provider_label`, `model`, `base_url`,
+     /// `wire` = "chat"|"messages", `credential_env`) and the optional controlled
+@@ -113,14 +112,16 @@ pub struct AgentArgs {
+     /// and session-daemon frontends never carry this agent-only flag at all.
+     #[arg(long, value_name = "PATH", conflicts_with_all = ["interactive", "dry_run"])]
+     pub worker_config: Option<PathBuf>,
+-=======
+     /// One-shot stdout format. `json` prints one result document for each run
+     /// whose loop returned a result, including failed runs (ADR-036).
+     #[arg(
+         long,
+         value_enum,
+         default_value_t = AgentOutputFormat::Text,
+-        conflicts_with_all = ["interactive", "dry_run"]
++        // `final_output`: ADR-036 Decision 14 (the document carries the
++        // validated final output) is not built. Until then the combination
++        // is refused, because both options own stdout.
++        conflicts_with_all = ["interactive", "dry_run", "final_output"]
+     )]
+     pub output: AgentOutputFormat,
+     /// Start a named one-shot session and save it when the run ends. A later
+@@ -129,7 +130,16 @@ pub struct AgentArgs {
+     #[arg(
+         long = "session-id",
+         value_name = "ID",
+-        conflicts_with_all = ["interactive", "dry_run"]
++        // A session with structured final output, a controlled model profile,
++        // or workers is not built or tested: the prefix record does not hold
++        // the endpoint of a profile. The combination is refused.
++        conflicts_with_all = [
++            "interactive",
++            "dry_run",
++            "final_output",
++            "model_profile",
++            "worker_config"
++        ]
+     )]
+     pub oneshot_session_id: Option<String>,
+     /// Continue a named one-shot session with the task as the new input. The
+@@ -138,10 +148,16 @@ pub struct AgentArgs {
+     #[arg(
+         long,
+         value_name = "ID",
+-        conflicts_with_all = ["interactive", "dry_run", "oneshot_session_id"]
++        conflicts_with_all = [
++            "interactive",
++            "dry_run",
++            "oneshot_session_id",
++            "final_output",
++            "model_profile",
++            "worker_config"
++        ]
+     )]
+     pub resume: Option<String>,
+->>>>>>> f937035 (Merge pull request #286 from beardfaceguy/ci/1622-release-on-merge)
+ }
+ 
+ #[derive(Debug, Args)]
+@@ -842,4 +858,34 @@ mod tests {
+             );
+         }
+     }
++
++    /// The one-shot session options and `--output json` (ADR-036) are refused
++    /// with the reviewer-runtime options that they were not built with.
++    #[test]
++    fn agent_session_and_json_options_conflict_with_unbuilt_combinations() {
++        let refused = |extra: &[&str]| {
++            let mut argv = vec!["daimonos", "agent"];
++            argv.extend_from_slice(extra);
++            argv.push("task");
++            Cli::try_parse_from(argv).is_err()
++        };
++        for session in [["--session-id", "s1"], ["--resume", "s1"]] {
++            for other in [
++                ["--final-output", "f.json"],
++                ["--model-profile", "p.json"],
++                ["--worker-config", "w.json"],
++            ] {
++                assert!(
++                    refused(&[session[0], session[1], other[0], other[1]]),
++                    "{session:?} with {other:?}"
++                );
++            }
++        }
++        assert!(refused(&["--output", "json", "--final-output", "f.json"]));
++        // Combinations that stay available.
++        assert!(!refused(&["--final-output", "f.json"]));
++        assert!(!refused(&["--output", "json", "--model-profile", "p.json"]));
++        assert!(!refused(&["--output", "json", "--worker-config", "w.json"]));
++        assert!(!refused(&["--session-id", "s1", "--output", "json"]));
++    }
+ }
+diff --git a/tests/test_agent_oneshot_sessions.py b/tests/test_agent_oneshot_sessions.py
+index 318bd2e..27625a1 100644
+--- a/tests/test_agent_oneshot_sessions.py
++++ b/tests/test_agent_oneshot_sessions.py
+@@ -536,3 +536,38 @@ def test_only_an_error_stop_reason_exits_non_zero(daimonos_binary, tmp_path, fak
+             assert done.returncode == exit_code, (stop_reason, json_output, done.stderr)
+             if json_output:
+                 assert only_json_document(done.stdout)["stop_reason"] == stop_reason
++
++
++# --- combined tree: ADR-036 options with the reviewer-runtime options ---
++
++def test_output_json_names_the_provider_label_of_a_controlled_profile(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("FROM THE PROFILE")])
++    harness = Harness(daimonos_binary, tmp_path, 1)  # the agent env endpoint is not used
++    profile = tmp_path / "profile.json"
++    profile.write_text(json.dumps({
++        "provider_label": "profile-label", "model": "profile/model",
++        "base_url": f"http://127.0.0.1:{provider.port}/v1", "wire": "chat",
++        "credential_env": "PROFILE_TEST_KEY"}))
++    done = subprocess.run(
++        harness.command("--model-profile", str(profile), "--output", "json", "task"),
++        cwd=harness.workspace, env={**harness.environment(), "PROFILE_TEST_KEY": "test-key"},
++        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
++    assert done.returncode == 0, done.stderr
++    doc = only_json_document(done.stdout)
++    assert (doc["provider"], doc["model"]) == ("profile-label", "profile/model")
++    assert doc["final_text"] == "FROM THE PROFILE"
++    assert len(provider.requests) == 1
++
++
++def test_session_options_are_refused_with_the_reviewer_runtime_options(daimonos_binary, tmp_path, fake_provider):
++    provider = fake_provider([text_reply("NEVER SENT")])
++    harness = Harness(daimonos_binary, tmp_path, provider.port)
++    for session in (["--session-id", "run-1"], ["--resume", "run-1"]):
++        for other in (["--final-output", "f.json"], ["--model-profile", "p.json"], ["--worker-config", "w.json"]):
++            done = harness.agent(*session, *other, "task")
++            assert done.returncode == 2 and done.stdout == "", (session, other, done.stderr)
++            assert "cannot be used with" in done.stderr
++    done = harness.agent("--output", "json", "--final-output", "f.json", "task")
++    assert done.returncode == 2 and done.stdout == ""
++    assert provider.requests == []
++    assert not (harness.home / ".daimonos" / "oneshot-sessions").exists()

@@ -512,6 +512,14 @@ fn build_globals(
     op_count: Arc<AtomicUsize>,
     subcall: Option<SubcallEnv>,
 ) -> Globals {
+    // FR-19 F4 (WP18, ADR-031): create ONE shared operation budget for the
+    // whole script here, so every inner op charges the same cumulative
+    // allowance against the same absolute deadline. It is installed on the
+    // session only inside each per-op lock (see dispatch_request /
+    // dispatch_tool_by_name) and cleared when the lock is released, so it never
+    // lingers on the shared session where a concurrent top-level MCP call could
+    // inherit it. `None` when no budget option is set (legacy behavior).
+    let budget = handle.block_on(async { session.lock().await.cfg.tool_budget.start() });
     // We store session + handle + cancel flag in a thread-local so the
     // starlark_module functions can access them without capturing closures.
     TOOL_CTX.with(|ctx| {
@@ -521,6 +529,7 @@ fn build_globals(
             subcall,
             cancel,
             op_count,
+            budget,
         });
     });
 
@@ -572,6 +581,10 @@ struct ToolContext {
     /// Owned by the caller so the count survives even when the script errors
     /// after dispatching some ops.
     op_count: Arc<AtomicUsize>,
+    /// FR-19 F4: the one shared operation budget for this script, installed on
+    /// the session inside each per-op lock and cleared on release. `None` when
+    /// no budget option is set.
+    budget: Option<Arc<crate::tool_budget::ToolBudget>>,
 }
 
 thread_local! {
@@ -643,10 +656,16 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
         let child_span =
             crate::observability::ToolSpan::new(label, crate::observability::tool_kind(label));
         let session = ctx.session.clone();
+        let budget = ctx.budget.clone();
         let resp = child_span.span().in_scope(|| {
             ctx.handle.block_on(async {
                 let mut s = session.lock().await;
+                // FR-19 F4: install the shared budget only while this op holds
+                // the lock; clear it before release so it never leaks to a
+                // concurrent top-level call. begin_tool_operation inherits it.
+                s.set_operation_budget(budget.clone());
                 let resp = ops::dispatch(&mut s, request).await;
+                s.set_operation_budget(None);
                 if let Some(analytics) = s.analytics.clone() {
                     let resp_chars = response_chars(&resp);
                     let (saved_tokens, savings_pct) =
@@ -700,17 +719,49 @@ fn dispatch_request(request: Request, label: &str) -> Result<Response, anyhow::E
 /// `tool("…")` universal prevents the model
 /// from spending retry turns learning which names require dedicated bindings.
 fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Response, anyhow::Error> {
+    // FR-02 (WP06, ADR-023): the explicit allowlist is checked for EVERY inner
+    // Starlark call here — the compact opcode shortcut (`write_file(...)`) and
+    // the generic `tool("name", ...)` / plugin fall-through alike — so a listed
+    // `execute_script` can still reach only individually allowed names. Nested
+    // arbitrary Starlark cannot reset or widen the run policy. The refusal is a
+    // structured Response carrying the reviewed `tool_not_allowed` code.
+    if let Some(failure) = with_ctx(|ctx| {
+        let session = ctx.session.clone();
+        Ok(ctx
+            .handle
+            .block_on(async { session.lock().await.policy.admit(name) })
+            .err())
+    })? {
+        return Ok(failure.into_response(name));
+    }
+    // R1 (B1, D60): the input/entry budget allow-list gate for EVERY inner
+    // Starlark call, before the opcode shortcut or the plugin fall-through, so a
+    // script cannot reach an unmetered tool (edit_file, snapshot, kgl_*, a
+    // plugin, any later name) under `--tool-input-bytes`/`--tool-max-entries`.
+    // Keyed on the configured budget (consulted before the shared budget is
+    // installed on the locked op). A bare `--tool-timeout-ms` refuses nothing.
+    if let Some(failure) = with_ctx(|ctx| {
+        let session = ctx.session.clone();
+        Ok(ctx
+            .handle
+            .block_on(async { session.lock().await.budget_input_refusal(name) }))
+    })? {
+        return Ok(failure.into_response(name));
+    }
     let resp = match tools::build_request(name, args) {
         Some(Ok(request)) => dispatch_request(request, name)?,
         Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
         None => with_ctx(|ctx| {
             let started = std::time::Instant::now();
             let request_chars = serde_json::to_string(args).map(|s| s.len()).unwrap_or(0);
+            let budget = ctx.budget.clone();
             ctx.handle.block_on(async {
                 let mut session = ctx.session.lock().await;
-                let Some((content, is_error, meta)) =
-                    crate::mcp::dispatch_local_tool(&mut session, name, args).await
-                else {
+                // FR-19 F4: shared budget bounded to this locked op (see above).
+                session.set_operation_budget(budget.clone());
+                let dispatched = crate::mcp::dispatch_local_tool(&mut session, name, args).await;
+                session.set_operation_budget(None);
+                let Some((content, is_error, meta)) = dispatched else {
                     if name.starts_with("mcp__") {
                         return Err(anyhow::anyhow!(
                             "remote MCP tool '{name}' is unavailable in execute_script: \
@@ -1539,6 +1590,16 @@ pub fn tool_signatures() -> String {
 
 /// Render only signatures admitted by the current filesystem policy.
 pub fn tool_signatures_for_policy(confined: bool) -> String {
+    tool_signatures_filtered(confined, &|_| true)
+}
+
+/// Like [`tool_signatures_for_policy`], but also hides any tool the run's
+/// explicit `--tool-allowlist` disallows (FR-02 R3, ADR-023): the dumped
+/// Starlark signatures must match the dispatchable set, so
+/// `list_tool_signatures` and the server instructions cannot reveal an unlisted
+/// tool. `print`/`tool` are language builtins (not daimonos tools) and are
+/// always shown. Context: src/script.rs.
+pub fn tool_signatures_filtered(confined: bool, allow: &dyn Fn(&str) -> bool) -> String {
     let sigs = [
         "def read_file(path: str, *, offset: int = None, limit: int = None) -> dict: ...",
         "def write_file(path: str, content: str) -> dict: ...",
@@ -1572,20 +1633,21 @@ pub fn tool_signatures_for_policy(confined: bool) -> String {
         .into_iter()
         .filter(|t| t.to_request.is_some())
         .filter(|t| !confined || crate::path_policy::tool_allowed(t.name))
+        .filter(|t| allow(t.name))
         .map(|t| t.name)
         .collect();
     via_generic.sort_unstable();
     let shown: Vec<&str> = sigs
         .into_iter()
         .filter(|signature| {
-            if !confined {
-                return true;
-            }
             let name = signature
                 .strip_prefix("def ")
                 .and_then(|text| text.split('(').next())
                 .unwrap_or("");
-            name == "print" || name == "tool" || crate::path_policy::tool_allowed(name)
+            if name == "print" || name == "tool" {
+                return true;
+            }
+            (!confined || crate::path_policy::tool_allowed(name)) && allow(name)
         })
         .map(|signature| {
             if confined && signature.starts_with("def tool(") {
