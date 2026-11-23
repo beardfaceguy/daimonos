@@ -3565,4 +3565,40 @@ mod tests {
             );
         }
     }
+
+    /// FR-19 (WP18, review B2): a call that ends early because the session
+    /// has no tool registry leaves no budget on the session. The registry is
+    /// present in each process frontend, so only a Rust test reaches this path.
+    #[tokio::test]
+    async fn budgeted_git_read_without_a_registry_leaves_no_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("probe.txt"), "b".repeat(60)).unwrap();
+        let mut cfg = Config::default();
+        cfg.tool_budget.input_bytes = Some(100);
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        assert!(session.tool_registry.is_none());
+
+        // A 60-byte read first, so a leaked budget would hold 60 bytes.
+        let first = dispatch_tool(&mut session, "read_file", &json!({"path": "probe.txt"}))
+            .await
+            .unwrap();
+        assert_ne!(first.is_error, Some(true));
+        assert!(session.tool_budget.is_none());
+
+        let unavailable = dispatch_tool(&mut session, "git_read", &json!({"command": "log"}))
+            .await
+            .unwrap();
+        assert_eq!(unavailable.is_error, Some(true));
+        assert!(extract_result_text(&unavailable).contains("tool registry unavailable"));
+        assert!(
+            session.tool_budget.is_none(),
+            "the early return must clear the budget"
+        );
+
+        // The next call has a fresh allowance: 60 bytes fit under 100.
+        let next = dispatch_tool(&mut session, "read_file", &json!({"path": "probe.txt"}))
+            .await
+            .unwrap();
+        assert_ne!(next.is_error, Some(true), "{}", extract_result_text(&next));
+    }
 }
