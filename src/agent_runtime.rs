@@ -640,6 +640,57 @@ pub async fn run_acp(
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    // Install the handlers before the startup work that waits for the
+    // provider. A signal during startup then ends the process with code 0.
+    // No session and no tool process exists at that time, so no teardown is
+    // necessary (vikunja #1623).
+    let mut signals = acp_cmd::TerminationSignals::install()?;
+    let startup = tokio::select! {
+        startup = prepare_acp(args, cfg) => startup?,
+        signal = signals.recv() => {
+            tracing::info!(
+                target: "daimonos::acp",
+                event = "acp_stopped_during_startup",
+                signal,
+            );
+            return Ok(());
+        }
+    };
+    acp_cmd::run_acp(
+        startup.make_provider,
+        workspace,
+        startup.cfg,
+        startup.model,
+        startup.models,
+        startup.safety,
+        token_log,
+        startup.sessions_dir,
+        startup.compaction,
+        startup.analytics,
+        startup.timestamp_turns,
+        startup.thinking,
+        signals,
+    )
+    .await
+}
+
+/// What `acp` prepares before it serves its client.
+struct AcpStartup {
+    make_provider: acp_cmd::ProviderFactory,
+    cfg: Arc<config::Config>,
+    model: String,
+    models: Vec<String>,
+    safety: safety::SafetyPolicy,
+    sessions_dir: Option<PathBuf>,
+    compaction: crate::session_core::SessionCompaction,
+    analytics: Option<Arc<analytics::AnalyticsStore>>,
+    timestamp_turns: bool,
+    thinking: providers::ThinkingLevel,
+}
+
+/// The startup work of `acp`. It waits for the provider: the context window
+/// and the model catalog.
+async fn prepare_acp(args: AcpArgs, cfg: Arc<config::Config>) -> anyhow::Result<AcpStartup> {
     let AcpArgs {
         model,
         provider,
@@ -709,21 +760,21 @@ pub async fn run_acp(
     } else {
         None
     };
-    acp_cmd::run_acp(
+    Ok(AcpStartup {
         make_provider,
-        workspace,
         cfg,
-        effective_model,
+        model: effective_model,
         models,
         safety,
-        token_log,
         sessions_dir,
-        crate::session_core::SessionCompaction::new(compaction, compaction_follows_model),
-        analytics_store,
-        agent.timestamp_turns,
-        agent.thinking.clone(),
-    )
-    .await
+        compaction: crate::session_core::SessionCompaction::new(
+            compaction,
+            compaction_follows_model,
+        ),
+        analytics: analytics_store,
+        timestamp_turns: agent.timestamp_turns,
+        thinking: agent.thinking.clone(),
+    })
 }
 
 pub async fn run_session_daemon(

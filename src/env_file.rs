@@ -11,6 +11,11 @@
 //! A variable already present in the process environment is never overwritten,
 //! so values injected by the launcher (e.g. Zed's ACP `env` block) always win.
 //!
+//! The files of this module are the **implicit** files: no option selects
+//! them. [`implicit_keys`] names the variables that this process set from
+//! them. The agent frontends use it to rank an explicitly selected agent env
+//! file above these values (ADR-037, `agent_env`).
+//!
 //! ## Security
 //! `agent.env` typically lives in a checked-out repository — untrusted input —
 //! and daimonos' environment is inherited by every tool it exec's. To keep a
@@ -18,7 +23,22 @@
 //! that steer how executables/interpreters load are refused from the file (see
 //! [`DENYLIST`]); set those in the real environment if you truly need them.
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// The variables that this process set from an implicit `agent.env` file.
+static IMPLICIT_KEYS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Names of the variables that this process set from an implicit `agent.env`
+/// file. A variable that the launcher supplied is never in this set: an
+/// implicit file does not overwrite it.
+pub fn implicit_keys() -> BTreeSet<String> {
+    IMPLICIT_KEYS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
 /// Variables that alter loader/interpreter behaviour and are inherited by
 /// exec'd tools — classic injection vectors. Never settable from a file.
@@ -164,6 +184,10 @@ fn apply_content(content: &str, path: &Path, quiet: bool) {
         // the environment yet; mirrors `session::enhance_process_path()`.
         std::env::set_var(key, value);
     }
+    IMPLICIT_KEYS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(outcome.set.iter().map(|(key, _)| key.clone()));
     if !quiet && !outcome.set.is_empty() {
         eprintln!(
             "daimonos: loaded {} variable(s) from {}",

@@ -121,6 +121,33 @@ CLI behavior flags (for example --model) > process DAIMONOS_AGENT_* values
 > selected agent.env file values
 ```
 
+Daimonos also loads two **implicit** files into the process environment at
+startup: `<workspace>/agent.env`, then `~/.config/daimonos/agent.env`. They set
+only variables that the environment does not have. With `--state-dir` the home
+file is not read. With confinement only the workspace file is read.
+
+When the file is selected explicitly, with `--agent-env` or with
+`$DAIMONOS_AGENT_ENV` in the real environment, a value from an implicit file
+ranks below the selected file (ADR-037):
+
+```text
+CLI behavior flags > real environment DAIMONOS_AGENT_* values
+> explicitly selected agent.env file > implicit agent.env files
+```
+
+- A value from an implicit file fills only a setting that the selected file
+  omits or leaves blank.
+- Without an explicit selection, nothing changes: the selected file is the home
+  file, and each process value overrides it.
+- A selector that an implicit file sets (`DAIMONOS_AGENT_ENV=...` in
+  `<workspace>/agent.env`) is not an explicit selection.
+- The rule covers `DAIMONOS_AGENT_*` settings that the agent env file defines,
+  and `DAIMONOS_SKILL_DIR`. Five variables are read from the process
+  environment only, so a line in the selected file has no effect on them:
+  `DAIMONOS_AGENT_MODELS_DISCOVER`, `DAIMONOS_AGENT_MAX_TOKENS`,
+  `DAIMONOS_AGENT_ERROR_RESUME`, `DAIMONOS_AGENT_AUTO_CONTINUE`, and
+  `DAIMONOS_AGENT_SESSION_ID`.
+
 Required effective values remain
 `DAIMONOS_AGENT_PROVIDER`, `DAIMONOS_AGENT_MODEL`,
 `DAIMONOS_AGENT_BASE_URL`, `DAIMONOS_AGENT_APPROVAL_MODE`,

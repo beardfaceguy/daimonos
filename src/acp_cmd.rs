@@ -3879,6 +3879,38 @@ fn build_agent_with_state(
         )
 }
 
+/// The signals that end the ACP engine: SIGTERM, SIGHUP, and SIGINT.
+///
+/// The caller installs them before the startup work that waits for the
+/// provider (model discovery), so a signal during startup does not use the
+/// default action (vikunja #1623). A signal that arrives after `install` is
+/// kept until the next `recv`.
+pub struct TerminationSignals {
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl TerminationSignals {
+    pub fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Wait for one of the signals and return its name.
+    pub async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.hangup.recv() => "SIGHUP",
+            _ = self.interrupt.recv() => "SIGINT",
+        }
+    }
+}
+
 /// Run the `daimonos acp` engine to completion (until stdin closes).
 /// `make_provider` builds a fresh provider per session (Zed keeps one
 /// process across chat threads); it's validated once up front so a
@@ -3897,6 +3929,7 @@ pub async fn run_acp(
     analytics: Option<Arc<AnalyticsStore>>,
     timestamp_turns: bool,
     thinking: crate::providers::ThinkingLevel,
+    mut signals: TerminationSignals,
 ) -> anyhow::Result<()> {
     tracing::info!(
         target: "daimonos::acp",
@@ -3973,14 +4006,10 @@ pub async fn run_acp(
     tokio::pin!(eof_wait);
     // A client that stops the engine by signal gets the same teardown as EOF;
     // the default handlers would orphan running tool process groups (#1544).
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let (result, input_error, signal) = tokio::select! {
         result = &mut connection => (Some(result), None, None),
         input_error = &mut eof_wait => (None, input_error, None),
-        _ = tokio::signal::ctrl_c() => (None, None, Some("SIGINT")),
-        _ = terminate.recv() => (None, None, Some("SIGTERM")),
-        _ = hangup.recv() => (None, None, Some("SIGHUP")),
+        signal = signals.recv() => (None, None, Some(signal)),
     };
     tracing::info!(
         target: "daimonos::acp",

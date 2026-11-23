@@ -11,6 +11,11 @@
 //!   `--agent-env <path>`  >  `$DAIMONOS_AGENT_ENV`  >  `~/.config/daimonos/agent.env`
 //! Value precedence after selecting that file:
 //!   non-empty process `$DAIMONOS_AGENT_*`  >  value parsed from the file
+//!
+//! With an explicitly selected file (`--agent-env` or `$DAIMONOS_AGENT_ENV`),
+//! a process value that an implicit `agent.env` file supplied ranks below the
+//! selected file (ADR-037, `env_file::implicit_keys`):
+//!   real environment  >  selected file  >  implicit `agent.env` files
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -142,16 +147,28 @@ impl AgentEnv {
     pub fn load(flag: Option<PathBuf>) -> Result<AgentEnv, String> {
         // Use vars_os so an unrelated non-Unicode process variable cannot
         // panic agent startup. Non-Unicode agent keys/values are ignored.
-        let process_vars: HashMap<String, String> = std::env::vars_os()
-            .filter_map(|(key, value)| {
-                let key = key.into_string().ok()?;
-                if !key.starts_with("DAIMONOS_AGENT_") && key != crate::skills::SKILL_DIR_ENV {
-                    return None;
-                }
-                Some((key, value.into_string().ok()?))
-            })
-            .collect();
-        Self::load_with_process_vars(flag, &process_vars)
+        let implicit_keys = crate::env_file::implicit_keys();
+        let mut real = HashMap::new();
+        let mut implicit = HashMap::new();
+        for (key, value) in std::env::vars_os() {
+            let (Ok(key), Ok(value)) = (key.into_string(), value.into_string()) else {
+                continue;
+            };
+            if !key.starts_with("DAIMONOS_AGENT_") && key != crate::skills::SKILL_DIR_ENV {
+                continue;
+            }
+            if implicit_keys.contains(&key) {
+                implicit.insert(key, value);
+            } else {
+                real.insert(key, value);
+            }
+        }
+        let explicit = explicit_selection(
+            flag.is_some(),
+            std::env::var_os("DAIMONOS_AGENT_ENV").is_some(),
+            implicit_keys.contains("DAIMONOS_AGENT_ENV"),
+        );
+        Self::load_layered(flag, explicit, &real, &implicit)
     }
 
     /// Load only an explicitly selected agent env file under ADR-021.
@@ -164,9 +181,17 @@ impl AgentEnv {
 
     /// Injectable load seam used by tests to verify real file + process
     /// precedence without mutating the process-global environment.
-    fn load_with_process_vars(
+    ///
+    /// `real` holds the process values that the launcher supplied. `implicit`
+    /// holds the process values that an implicit `agent.env` file supplied.
+    /// ADR-037: with an explicitly selected file (`explicit`), an implicit
+    /// value only fills a setting that the selected file does not set.
+    /// Without one, both kinds override the selected file as before.
+    fn load_layered(
         flag: Option<PathBuf>,
-        process_vars: &HashMap<String, String>,
+        explicit: bool,
+        real: &HashMap<String, String>,
+        implicit: &HashMap<String, String>,
     ) -> Result<AgentEnv, String> {
         let path = Self::resolve_path(flag).ok_or_else(|| {
             "cannot resolve agent env file path — set --agent-env or $DAIMONOS_AGENT_ENV, \
@@ -181,8 +206,7 @@ impl AgentEnv {
                 REQUIRED.join(", ")
             )
         })?;
-        let mut vars = parse_dotenv(&content);
-        merge_process_overrides(&mut vars, process_vars);
+        let vars = layered_vars(&content, explicit, real, implicit);
         Self::from_vars(&vars, &path)
     }
 
@@ -567,6 +591,52 @@ fn merge_process_overrides(
     }
 }
 
+/// ADR-037: the caller selected the agent env file explicitly. That is so with
+/// `--agent-env`, and with `$DAIMONOS_AGENT_ENV` from the real environment. A
+/// selector that an implicit `agent.env` file supplied is not an explicit
+/// selection: that file then keeps its rank above the file that it selects.
+fn explicit_selection(flag_given: bool, selector_set: bool, selector_is_implicit: bool) -> bool {
+    flag_given || (selector_set && !selector_is_implicit)
+}
+
+/// The effective settings: the selected file, then the two kinds of process
+/// values in the order of ADR-037. Pure, so tests need no process environment.
+fn layered_vars(
+    content: &str,
+    explicit: bool,
+    real: &HashMap<String, String>,
+    implicit: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut vars = parse_dotenv(content);
+    if explicit {
+        fill_unset_from_implicit(&mut vars, implicit);
+    } else {
+        merge_process_overrides(&mut vars, implicit);
+    }
+    merge_process_overrides(&mut vars, real);
+    vars
+}
+
+/// Use a value from an implicit `agent.env` file only for a setting that the
+/// explicitly selected file does not set (ADR-037). A blank value in the
+/// selected file does not set the setting, as in [`merge_process_overrides`].
+fn fill_unset_from_implicit(
+    file_vars: &mut HashMap<String, String>,
+    implicit: &HashMap<String, String>,
+) {
+    for (key, value) in implicit {
+        let is_agent_setting = (key.starts_with("DAIMONOS_AGENT_")
+            || key == crate::skills::SKILL_DIR_ENV)
+            && key != "DAIMONOS_AGENT_ENV";
+        let unset_in_file = file_vars
+            .get(key)
+            .is_none_or(|existing| existing.trim().is_empty());
+        if is_agent_setting && unset_in_file && !value.trim().is_empty() {
+            file_vars.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 /// Build the picker's candidate model list: `current` is always present
 /// (prepended if the configured list omits it), duplicates removed while
 /// preserving first-seen order. Result is never empty.
@@ -793,9 +863,82 @@ mod tests {
             "anthropic/claude-opus-4.8".to_string(),
         )]);
 
-        let env = AgentEnv::load_with_process_vars(Some(path), &process_vars).unwrap();
+        let env = AgentEnv::load_layered(Some(path), true, &process_vars, &HashMap::new()).unwrap();
 
         assert_eq!(env.model, "anthropic/claude-opus-4.8");
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// ADR-037: real environment > explicitly selected file > implicit files.
+    #[test]
+    fn an_explicit_file_ranks_between_the_real_environment_and_implicit_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.env");
+        // The file sets the model, leaves the base URL blank, and omits the
+        // thinking level.
+        std::fs::write(
+            &path,
+            base().replace(
+                "DAIMONOS_AGENT_BASE_URL=https://openrouter.ai/api/v1\n",
+                "DAIMONOS_AGENT_BASE_URL=\n",
+            ),
+        )
+        .unwrap();
+        let implicit = vars(&[
+            ("DAIMONOS_AGENT_MODEL", "implicit/model"),
+            ("DAIMONOS_AGENT_BASE_URL", "https://implicit.example/v1"),
+            ("DAIMONOS_AGENT_THINKING", "high"),
+            ("DAIMONOS_AGENT_PROVIDER", "  "),
+            ("DAIMONOS_AGENT_ENV", "/implicit/selector"),
+        ]);
+
+        // The explicit file wins for a setting that it sets.
+        let env =
+            AgentEnv::load_layered(Some(path.clone()), true, &HashMap::new(), &implicit).unwrap();
+        assert_eq!(env.model, "anthropic/claude-sonnet-4.6");
+        assert_eq!(env.provider, "openrouter");
+        // An implicit value fills a setting that the file omits or leaves blank.
+        assert_eq!(env.base_url, "https://implicit.example/v1");
+        assert_eq!(env.thinking, ThinkingLevel::High);
+
+        // The real environment wins over the explicit file.
+        let real = vars(&[("DAIMONOS_AGENT_MODEL", "real/model")]);
+        let env = AgentEnv::load_layered(Some(path), true, &real, &implicit).unwrap();
+        assert_eq!(env.model, "real/model");
+        assert_eq!(env.base_url, "https://implicit.example/v1");
+    }
+
+    /// Without an explicit selection, the selected file is the home file, and
+    /// an implicit value overrides it as before ADR-037.
+    #[test]
+    fn without_an_explicit_selection_implicit_values_override_the_file() {
+        let implicit = vars(&[("DAIMONOS_AGENT_MODEL", "implicit/model")]);
+        let real = vars(&[("DAIMONOS_AGENT_API_KEY", "sk-real")]);
+        let model = |explicit: bool| {
+            let layered = layered_vars(&base(), explicit, &real, &implicit);
+            assert_eq!(layered["DAIMONOS_AGENT_API_KEY"], "sk-real");
+            layered["DAIMONOS_AGENT_MODEL"].clone()
+        };
+        assert_eq!(model(false), "implicit/model");
+        assert_eq!(model(true), "anthropic/claude-sonnet-4.6");
+    }
+
+    /// `--agent-env` and `$DAIMONOS_AGENT_ENV` of the real environment are
+    /// explicit selections. The same selector from an implicit file is not.
+    #[test]
+    fn only_the_option_and_the_real_selector_are_explicit_selections() {
+        // (flag given, selector set, selector is implicit) -> explicit
+        assert!(explicit_selection(true, false, false));
+        assert!(explicit_selection(true, true, true));
+        assert!(explicit_selection(false, true, false));
+        assert!(!explicit_selection(false, true, true));
+        assert!(!explicit_selection(false, false, false));
     }
 
     #[test]
