@@ -776,9 +776,15 @@ def test_timeout_content_search_returns_timeout(daimonos_factory, tmp_path):
     assert "matches" not in data, "no late matches on a deadline hit"
 
 
+def _child_failure(child):
+    """The parsed failure object of a failed batch child."""
+    assert child["ok"] is False, child
+    return json.loads(child["error"])
+
+
 def test_timeout_file_search_returns_timeout(daimonos_factory, tmp_path):
-    """F2 (M2): the index (files-mode) search checks the deadline before the
-    result is built.
+    """F2 (M2): a files-mode (index) search that runs after the deadline
+    returns ``tool_timeout`` and no result.
 
     The deadline must have passed for certain when the search runs. A 1 ms
     deadline does not give that: the index search can end in less than 1 ms on
@@ -786,28 +792,39 @@ def test_timeout_file_search_returns_timeout(daimonos_factory, tmp_path):
     second child of a batch. The children share one deadline of 300 ms. The
     first child sleeps and is stopped at that deadline, so the search starts
     after it.
+
+    The Rust test ``ops::tests::a_files_search_after_the_deadline_is_a_timeout``
+    covers a top-level search and the check inside the search itself.
     """
     ws = tmp_path / "ws"
     ws.mkdir()
     for i in range(20):
         (ws / f"wp18f_{i}.rs").write_text("x")
-    client = daimonos_factory(ws, args=["--tool-timeout-ms", "300"])
     search = {"tool": "search", "arguments": {"pattern": "wp18f", "mode": "files"}}
 
-    # Control: with time left, the same search succeeds.
-    alone = json.loads(_text(client.call_tool("batch", {"ops": [search]})))
+    # Control: with time left, the same search in a batch succeeds. The deadline
+    # is long, so a slow runner does not fail the control.
+    relaxed = daimonos_factory(ws, args=["--tool-timeout-ms", "60000"])
+    alone = json.loads(_text(relaxed.call_tool("batch", {"ops": [search]})))
     assert [child["ok"] for child in alone] == [True], alone
     assert "wp18f_0.rs" in json.dumps(alone[0])
 
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "300"])
     result = client.call_tool("batch", {"ops": [
         {"tool": "exec", "arguments": {"command": "sleep", "args": ["30"]}},
         search,
     ]})
     children = json.loads(_text(result))
-    assert [child["ok"] for child in children] == [False, False], children
-    late = json.dumps(children[1])
-    assert "tool_timeout" in late, late
-    assert "wp18f_0.rs" not in late, "no late result on a deadline hit"
+    assert [child["tool"] for child in children] == ["exec", "search"], children
+    # Precondition: the sleep was stopped by the deadline, not by another error.
+    # So the deadline passed before the search started.
+    stopped = _child_failure(children[0])
+    assert stopped["code"] == "tool_timeout", stopped
+    late = _child_failure(children[1])
+    assert late["code"] == "tool_timeout", late
+    assert late.get("tool") == "search", late
+    assert "results" not in late, "no late result on a deadline hit"
+    assert "wp18f_" not in children[1]["error"]
 
 
 def test_ac_19_1_large_tree_search_times_out_within_bound(daimonos_factory, tmp_path):

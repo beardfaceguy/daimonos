@@ -361,3 +361,80 @@ fn session_info(session: &Session) -> Response {
 
     Response::ok(info)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::sync::Arc;
+
+    fn files_search(pattern: &str) -> Request {
+        Request::Single(Op {
+            c: protocol::op::FIND,
+            p: Some(pattern.to_string()),
+            ..Op::default()
+        })
+    }
+
+    /// A session with an index over 20 small files and a 1 ms tool deadline.
+    fn indexed_session(dir: &std::path::Path) -> Session {
+        for i in 0..20 {
+            std::fs::write(dir.join(format!("wp18f_{i}.rs")), "x").unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.tool_budget.timeout_ms = Some(1);
+        let cfg = Arc::new(cfg);
+        let mut session = Session::new(dir.to_path_buf(), Arc::clone(&cfg));
+        session.index = Some(Arc::new(crate::index::WorkspaceIndex::new(
+            dir.to_path_buf(),
+            &cfg.index,
+            false,
+        )));
+        session
+    }
+
+    /// FR-19 (WP18): a top-level files-mode search whose deadline passed is a
+    /// timeout with no result. The check is in the search itself: this test
+    /// calls `ops::dispatch`, below the general check of the MCP dispatch.
+    ///
+    /// The budget is installed first and the test then waits, so the deadline
+    /// has passed for certain. A deadline that is only short (1 ms) is not
+    /// enough: the index search can end before it.
+    #[tokio::test]
+    async fn a_files_search_after_the_deadline_is_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = indexed_session(dir.path());
+
+        let budget = session.tool_budget_config.start().expect("a budget");
+        session.set_operation_budget(Some(Arc::clone(&budget)));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(budget.check_deadline().is_err(), "the deadline passed");
+
+        let response = dispatch(&mut session, files_search("wp18f")).await;
+        assert!(!response.ok, "{response:?}");
+        let failure = response.d.clone().expect("a typed failure");
+        assert_eq!(failure["code"], "tool_timeout", "{failure}");
+        assert_eq!(failure["tool"], "search", "{failure}");
+        assert!(failure.get("results").is_none(), "{failure}");
+        assert!(!format!("{response:?}").contains("wp18f_"), "{response:?}");
+        // The call did not install this budget, so it does not clear it.
+        assert!(session.tool_budget.is_some());
+    }
+
+    /// Control: the same search without an installed budget gets a new one and
+    /// can succeed. With a long deadline it returns the files.
+    #[tokio::test]
+    async fn a_files_search_with_time_left_returns_its_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = indexed_session(dir.path());
+        session.tool_budget_config.timeout_ms = Some(60_000);
+
+        let response = dispatch(&mut session, files_search("wp18f")).await;
+        assert!(response.ok, "{response:?}");
+        assert!(
+            format!("{response:?}").contains("wp18f_0.rs"),
+            "{response:?}"
+        );
+        assert!(session.tool_budget.is_none(), "the call cleared its budget");
+    }
+}
