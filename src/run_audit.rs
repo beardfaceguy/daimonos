@@ -596,7 +596,6 @@ pub const REFUSAL_CODES: &[&str] = &[
     "tool_policy_unsupported",
     "tool_timeout",
     "tool_input_limit",
-    "tool_budget_unenforceable",
     "offline_tool_forbidden",
 ];
 
@@ -669,23 +668,6 @@ pub fn refusal_code(result: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(result).ok()?;
     let code = value.get("code")?.as_str()?;
     REFUSAL_CODES.contains(&code).then(|| code.to_string())
-}
-
-/// A cooperative tool-budget limit hit parsed from a boundary result, so the
-/// run loop can write the reserved `limit_hit` audit event (WP18 FR-19 F5,
-/// ADR-031). Returns `(limit_name, configured, consumed)` when the result is a
-/// `tool_timeout` or `tool_input_limit` failure; `None` otherwise. The limit
-/// name is the failure `code` (e.g. `tool_timeout`, `tool_input_limit`); the
-/// numeric fields come from the failure's budget block.
-pub fn budget_limit_hit(result: &str) -> Option<(String, Option<u64>, Option<u64>)> {
-    let value: serde_json::Value = serde_json::from_str(result).ok()?;
-    let code = value.get("code")?.as_str()?;
-    if code != "tool_timeout" && code != "tool_input_limit" {
-        return None;
-    }
-    let configured = value.get("configured").and_then(serde_json::Value::as_u64);
-    let consumed = value.get("consumed").and_then(serde_json::Value::as_u64);
-    Some((code.to_string(), configured, consumed))
 }
 
 fn insert_opt_str(

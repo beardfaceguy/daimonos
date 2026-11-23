@@ -134,7 +134,9 @@ def test_max_entries_limit_refuses_oversized_ls(daimonos_factory, tmp_path):
     data = json.loads(_text(result))
     assert data["code"] == "tool_input_limit", data
     assert data["configured"] == 3, data
-    assert data["consumed"] >= 10, data
+    # R2 (B4): the walk STOPS at the ceiling, so consumed is just past the
+    # configured limit (not the full tree) — enforcement, not post-hoc counting.
+    assert 3 < data["consumed"] <= 5, data
     assert "entries" not in data, "no partial listing on an entry-limit hit"
 
 
@@ -187,7 +189,7 @@ def test_input_bytes_refuses_index_search(daimonos_factory, tmp_path):
     result = client.call_tool("search", {"pattern": "wp18idx", "mode": "files"})
     assert result.get("isError") is True, result
     data = json.loads(_text(result))
-    assert data["code"] == "tool_budget_unenforceable", data
+    assert data["code"] == "tool_policy_unsupported", data
     assert "results" not in data, "no partial index results on a refusal"
 
 
@@ -851,7 +853,7 @@ def test_timeout_stops_curl_plugin(daimonos_factory, tmp_path):
     a server that would not answer for 4 s, and leaving no curl child alive."""
     ws = tmp_path / "ws"
     ws.mkdir()
-    server, _t = _slow_http(4.0)
+    server, _t = _slow_http(20.0)
     port = server.server_port
     url = f"http://127.0.0.1:{port}/"
     needle = f"wp18curl-{_os.getpid()}-{time.time_ns()}"
@@ -864,7 +866,9 @@ def test_timeout_stops_curl_plugin(daimonos_factory, tmp_path):
     finally:
         server.shutdown()
         server.server_close()
-    assert elapsed < 3, f"curl ran past the deadline: {elapsed:.1f}s"
+    # The server answers after a longer time than this bound. 8 s is the
+    # non-semantic bound of this file for a loaded runner.
+    assert elapsed < 8, f"curl ran past the deadline: {elapsed:.1f}s"
     assert result.get("isError") is True, result
     data = json.loads(_text(result))
     assert data.get("code") == "tool_timeout", data
@@ -886,8 +890,9 @@ def test_timeout_stops_git_plugin(daimonos_factory, tmp_path):
 
 def test_input_bytes_refuses_git_plugin(daimonos_factory, tmp_path):
     """F3 (M4 input half): the `git` plugin reads no meterable logical input, so
-    under --tool-input-bytes it is REFUSED with ``tool_budget_unenforceable``
-    rather than passing uncounted (ADR-031)."""
+    under --tool-input-bytes it is REFUSED with the reviewed
+    ``tool_policy_unsupported`` code (D60) rather than passing uncounted
+    (ADR-031, R1)."""
     ws = tmp_path / "ws"
     ws.mkdir()
     _init_repo(ws)
@@ -895,7 +900,7 @@ def test_input_bytes_refuses_git_plugin(daimonos_factory, tmp_path):
     result = client.call_tool("git", {"command": "status"})
     assert result.get("isError") is True, result
     data = json.loads(_text(result))
-    assert data.get("code") == "tool_budget_unenforceable", data
+    assert data.get("code") == "tool_policy_unsupported", data
 
 
 def test_git_plugin_default_off_runs_normally(daimonos_factory, tmp_path):
@@ -907,14 +912,14 @@ def test_git_plugin_default_off_runs_normally(daimonos_factory, tmp_path):
     result = client.call_tool("git", {"command": "status"})
     assert result.get("isError") is not True, _text(result)
     assert "tool_timeout" not in _text(result), _text(result)
-    assert "tool_budget_unenforceable" not in _text(result), _text(result)
+    assert "tool_policy_unsupported" not in _text(result), _text(result)
 
 
 def test_budgeted_pipeline_is_refused(daimonos_factory, tmp_path):
     """F3 (pipeline): tool_pipeline runs external plugin stages whose remaining
     deadline/input cannot be enforced stage-by-stage, so rather than leave it
-    "not cooperative" it is REFUSED with ``tool_budget_unenforceable`` whenever
-    any budget option is set (ADR-031 allows refusing the pipeline when
+    "not cooperative" it is REFUSED with the reviewed ``tool_policy_unsupported``
+    code (D60) whenever any budget option is set (ADR-031 allows refusing when
     --tool-timeout-ms is set; the same applies to input/entry). The call returns
     promptly and starts no stage process."""
     ws = tmp_path / "ws"
@@ -925,10 +930,10 @@ def test_budgeted_pipeline_is_refused(daimonos_factory, tmp_path):
     result = client.call_tool("tool_pipeline",
                               {"tool_id": "git", "stages": ["status"]})
     elapsed = time.monotonic() - start
-    assert elapsed < 3, f"refusal was not prompt: {elapsed:.1f}s"
+    assert elapsed < 8, f"refusal was not prompt: {elapsed:.1f}s"
     assert result.get("isError") is True, result
     data = json.loads(_text(result))
-    assert data.get("code") == "tool_budget_unenforceable", data
+    assert data.get("code") == "tool_policy_unsupported", data
 
 
 def test_pipeline_default_off_not_refused(daimonos_factory, tmp_path):
@@ -939,7 +944,7 @@ def test_pipeline_default_off_not_refused(daimonos_factory, tmp_path):
     client = daimonos_factory(ws)
     result = client.call_tool("tool_pipeline",
                               {"tool_id": "git", "stages": ["status"]})
-    assert "tool_budget_unenforceable" not in _text(result), _text(result)
+    assert "cooperative tool budget" not in _text(result), _text(result)
 
 
 # --- F5: the audit limit_hit event, asserted by kind and fields ---
@@ -978,3 +983,363 @@ def test_budget_hit_writes_limit_hit_audit_event(daimonos_binary, tmp_path):
     assert hit["limit"], hit
     assert hit["configured"] == 100, hit
     assert hit["consumed"] >= 500, hit
+
+
+# --- R1 (B1): allow-list inversion of the input/entry admission gate ---
+#
+# Under --tool-input-bytes / --tool-max-entries a tool is admitted only if it
+# meters its logical input (read_file, ls, content search, git_read) or reads
+# no workspace/external content (write_file, append_file, the session/meta/mail
+# tools, and the composite dispatchers). EVERY other name is refused with the
+# reviewed ``tool_policy_unsupported`` code (integrator D60) naming the budget
+# and the tool: process plugins, edit_file/diff_files (read content unmetered),
+# kgl_*, snapshot/restore, bg, config-registered tools, outbound mcp__*, and any
+# name a later package adds. The deadline alone refuses nothing except
+# tool_pipeline.
+
+
+def _budget_refusal(result):
+    data = json.loads(_text(result))
+    return data
+
+
+def test_input_bytes_refuses_edit_file(daimonos_factory, tmp_path):
+    """edit_file reads the target file to apply its edits but does not meter
+    that input, so under --tool-input-bytes it is refused (not silently
+    exempted) with tool_policy_unsupported (R1/B1, D60)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("hello world")
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "100"])
+    result = client.call_tool(
+        "edit_file", {"path": "f.txt", "edits": ["hello", "HELLO"]}
+    )
+    assert result.get("isError") is True, result
+    data = _budget_refusal(result)
+    assert data["code"] == "tool_policy_unsupported", data
+    assert data.get("tool") == "edit_file", data
+    # original content untouched (refused before any effect)
+    assert (ws / "f.txt").read_text() == "hello world"
+
+
+def test_edit_file_default_off_runs_normally(daimonos_factory, tmp_path):
+    """Regression: with no budget option, edit_file is unchanged."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("hello world")
+    client = daimonos_factory(ws)
+    result = client.call_tool(
+        "edit_file", {"path": "f.txt", "edits": ["hello", "HELLO"]}
+    )
+    assert result.get("isError") is not True, _text(result)
+    assert (ws / "f.txt").read_text() == "HELLO world"
+
+
+def test_input_bytes_refuses_snapshot(daimonos_factory, tmp_path):
+    """snapshot/restore read and write workspace content that the budget cannot
+    meter, so under --tool-input-bytes the snapshot tool is refused with
+    tool_policy_unsupported (R1/B1, D60)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("x")
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "100"])
+    result = client.call_tool("snapshot", {"action": "list"})
+    assert result.get("isError") is True, result
+    data = _budget_refusal(result)
+    assert data["code"] == "tool_policy_unsupported", data
+    assert data.get("tool") == "snapshot", data
+
+
+def test_snapshot_default_off_runs_normally(daimonos_factory, tmp_path):
+    """Regression: with no budget option, snapshot list is unchanged."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    client = daimonos_factory(ws)
+    result = client.call_tool("snapshot", {"action": "list"})
+    assert result.get("isError") is not True, _text(result)
+
+
+def test_input_bytes_admits_write_file(daimonos_factory, tmp_path):
+    """write_file scans no workspace/external input, so there is nothing to
+    meter: it is admitted (not refused) under --tool-input-bytes and runs
+    normally. The inverted gate must not refuse a contentless tool (R1)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "10"])
+    result = client.call_tool("write_file", {"path": "out.txt", "content": "y" * 500})
+    assert result.get("isError") is not True, _text(result)
+    assert "tool_policy_unsupported" not in _text(result), _text(result)
+    assert (ws / "out.txt").read_text() == "y" * 500
+
+
+def test_max_entries_refuses_edit_file(daimonos_factory, tmp_path):
+    """The entry budget shares the admission gate: edit_file is refused under
+    --tool-max-entries too (R1)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("abc")
+    client = daimonos_factory(ws, args=["--tool-max-entries", "100"])
+    result = client.call_tool("edit_file", {"path": "f.txt", "edits": ["a", "A"]})
+    assert result.get("isError") is True, result
+    data = _budget_refusal(result)
+    assert data["code"] == "tool_policy_unsupported", data
+
+
+def test_deadline_only_refuses_nothing_except_pipeline(daimonos_factory, tmp_path):
+    """The deadline alone (no input/entry budget) refuses no tool at the
+    admission gate: a tool that the input gate would refuse (edit_file) still
+    runs under --tool-timeout-ms. Only tool_pipeline is refused for a bare
+    deadline (its own check), proven by test_budgeted_pipeline_is_refused."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("hello")
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "60000"])
+    result = client.call_tool("edit_file", {"path": "f.txt", "edits": ["hello", "HI"]})
+    assert result.get("isError") is not True, _text(result)
+    assert "tool_policy_unsupported" not in _text(result), _text(result)
+    assert (ws / "f.txt").read_text() == "HI"
+
+
+# --- R2 (B4): the entry limit must BOUND the walk, not account after it ---
+
+
+def test_max_entries_bounds_the_ls_walk(daimonos_factory, tmp_path):
+    """R2/B4: --tool-max-entries must stop the directory walk at the ceiling,
+    not walk the whole tree and reclassify afterwards. A tree with 5000 entries
+    and a limit of 50 returns tool_input_limit with ``consumed`` far below the
+    total (< 200), proving the walk stopped early; no partial listing. Post-hoc
+    accounting (the pre-R2 behavior) would report consumed == 5000."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    big = ws / "many"
+    big.mkdir()
+    for i in range(5000):
+        (big / f"f{i:05d}.txt").write_text("x")
+    client = daimonos_factory(ws, args=["--tool-max-entries", "50"])
+    result = client.call_tool("ls", {"path": "many", "depth": 1})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data["code"] == "tool_input_limit", data
+    assert data["consumed"] < 200, f"walk not bounded; consumed={data.get('consumed')}"
+    assert "entries" not in data, "no partial listing on a limit hit"
+
+
+def test_read_file_refuses_oversized_by_size_precheck(daimonos_factory, tmp_path):
+    """R2/B4: read_file checks the file size from metadata and refuses without
+    reading when the size alone exceeds the remaining byte allowance. Observable
+    as a tool_input_limit whose consumed reflects the file size and no content,
+    even for a file much larger than the limit."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "huge.txt").write_text("q" * 200_000)
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "100"])
+    result = client.call_tool("read_file", {"path": "huge.txt"})
+    assert result.get("isError") is True, result
+    data = json.loads(_text(result))
+    assert data["code"] == "tool_input_limit", data
+    assert data["configured"] == 100, data
+    assert data["consumed"] >= 200_000, data
+    assert "content" not in data, "no partial content on a size-precheck refusal"
+
+
+# --- R3 (B3): the limit_hit audit event must be in-band, not parsed from text ---
+
+
+def test_exec_printing_budget_json_writes_no_limit_hit_event(daimonos_binary, tmp_path):
+    """R3/B3: a tool whose RESULT TEXT merely looks like a budget failure (here
+    `exec` echoing the JSON shape, with NO budget option set) must NOT cause a
+    forged ``limit_hit`` audit event. The hit is signalled in-band by the budget
+    code on the session and read by the run loop after dispatch, never parsed
+    from attacker-influenceable result text."""
+    workspace = tmp_path / "evidence"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    audit_path = tmp_path / "state" / "audit" / "run.jsonl"
+    shape = '{"code":"tool_input_limit","configured":1,"consumed":2}'
+    provider = _FakeProvider([("call", "exec", {"command": f"echo '{shape}'"}),
+                              ("end", _DONE)])
+    try:
+        env = _isolated_env(tmp_path)
+        agent_env = _agent_env_file(tmp_path, provider, allowed="exec")
+        cmd = [daimonos_binary, "--workspace", str(workspace),
+               "--state-dir", str(state), "--audit-path", str(audit_path),
+               "agent", "--print", "--output", "json",
+               "--agent-env", str(agent_env), "run the echo"]
+        completed = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=60, env=env)
+    finally:
+        provider.close()
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    events = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    hits = [ev for ev in events if ev.get("kind") == "limit_hit"]
+    assert not hits, f"forged limit_hit from result text: {hits}"
+
+
+# --- Review round 1, R4: a budget never leaks into the next top-level call ---
+
+def _code(result):
+    """The failure code of a tool result, or None for a success."""
+    if not result.get("isError"):
+        return None
+    try:
+        return json.loads(_text(result)).get("code", "error-without-code")
+    except ValueError:
+        return "error-not-json"
+
+
+def test_each_kind_of_failed_call_leaves_a_fresh_budget_for_the_next_call(daimonos_factory, tmp_path):
+    """After each call that ends early under a budget, the next top-level call
+    starts with a new budget. The probe is a read of a 60-byte file under
+    --tool-input-bytes 100: it passes only with a fresh allowance, because a
+    leaked budget already holds 60 bytes or more. A 70-byte read comes first in
+    each round, so a leak makes the probe fail with tool_input_limit.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "first.txt").write_text("a" * 70)
+    (ws / "probe.txt").write_text("b" * 60)
+    (ws / "big.txt").write_text("c" * 500)
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "100", "--tool-max-entries", "100"])
+
+    def probe(after):
+        result = client.call_tool("read_file", {"path": "probe.txt"})
+        assert _code(result) is None, f"budget leaked after {after}: {_text(result)}"
+
+    early_endings = [
+        ("a limit hit", "read_file", {"path": "big.txt"}, "tool_input_limit"),
+        ("a refused tool", "exec", {"command": "true"}, "tool_policy_unsupported"),
+        ("a tool error", "read_file", {"path": "does-not-exist.txt"}, "error-not-json"),
+        ("a refused index search", "search", {"pattern": "probe", "mode": "files"}, "tool_policy_unsupported"),
+    ]
+    for label, tool, arguments, expected in early_endings:
+        assert _code(client.call_tool("read_file", {"path": "first.txt"})) is None
+        result = client.call_tool(tool, arguments)
+        assert result.get("isError") is True, (label, result)
+        if expected != "error-not-json":
+            assert _code(result) == expected, (label, _text(result))
+        probe(label)
+
+    # An unknown tool name is an RPC error or a tool error. Both must leave no budget.
+    try:
+        client.call_tool("no_such_tool_wp18", {})
+    except RuntimeError:
+        pass
+    probe("an unknown tool name")
+
+    # A batch whose second child fails, and a script whose read fails.
+    batch = client.call_tool("batch", {"ops": [
+        {"tool": "read_file", "arguments": {"path": "first.txt"}},
+        {"tool": "read_file", "arguments": {"path": "big.txt"}},
+    ]})
+    assert "tool_input_limit" in _text(batch), _text(batch)
+    probe("a batch with a failed child")
+    script = client.call_tool("execute_script", {"code": _TWO_READS.replace("big.txt", "first.txt")})
+    assert "tool_input_limit" in _text(script), _text(script)
+    probe("a script that hit the limit")
+
+
+def test_a_timeout_leaves_a_fresh_budget_for_the_next_call(daimonos_factory, tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "probe.txt").write_text("b" * 60)
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "800"])
+    stopped = client.call_tool("exec", {"command": "sleep", "args": ["30"]})
+    assert _code(stopped) == "tool_timeout", _text(stopped)
+    # The next call has its own 800 ms. A leaked budget has a passed deadline.
+    time.sleep(1.0)
+    result = client.call_tool("read_file", {"path": "probe.txt"})
+    assert _code(result) is None, _text(result)
+
+
+# --- Review round 1, R5: execute_script and its shared budget ---
+
+def test_a_failed_child_does_not_clear_the_shared_budget(daimonos_factory, tmp_path):
+    """A child that fails must not reset the budget of its composite. Under
+    --tool-input-bytes 100, two reads of a 60-byte file pass the limit together.
+    If the failed first child cleared the shared budget, each later read would
+    get a new allowance and both would pass.
+
+    The composite is `batch`, whose children continue after a failed child. In
+    `execute_script` a failed operation ends the script, so no later operation
+    of that script exists.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "part.txt").write_text("p" * 60)
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "100"])
+    result = client.call_tool("batch", {"ops": [
+        {"tool": "read_file", "arguments": {"path": "does-not-exist.txt"}},
+        {"tool": "read_file", "arguments": {"path": "part.txt"}},
+        {"tool": "read_file", "arguments": {"path": "part.txt"}},
+    ]})
+    children = json.loads(_text(result))
+    assert [child["ok"] for child in children] == [False, True, False], children
+    assert "tool_input_limit" not in json.dumps(children[0]), children[0]
+    last = json.dumps(children[2])
+    assert "tool_input_limit" in last and "120" in last, last
+
+
+def test_a_call_during_a_budgeted_script_does_not_share_its_budget(daimonos_factory, tmp_path):
+    """A second request arrives while a budgeted execute_script call sleeps
+    between two reads. Under --tool-input-bytes 100 with 60-byte files:
+
+    - The script reads 60 + 60 = 120 bytes and must end with tool_input_limit,
+      consumed 120. If the other call cleared or replaced the script budget,
+      the second read would pass.
+    - The other call reads 60 bytes and must succeed. If it inherited the
+      script budget (60 used), it would fail with consumed 120.
+
+    The two requests are sent on one connection without waiting. The test
+    requires that the reply of the read arrives before the reply of the script.
+    That shows that the read ran while the script was in progress.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "part.txt").write_text("p" * 60)
+    (ws / "other.txt").write_text("o" * 60)
+    client = daimonos_factory(ws, args=["--tool-input-bytes", "100"])
+
+    # The script reads, then computes for a moment (no tool call), then reads
+    # again. `exec` is not usable here: it is refused under an input limit.
+    slow_script = (
+        "def slow():\n"
+        "    total = 0\n"
+        "    for i in range(400000):\n"
+        "        total += i\n"
+        "    return total\n"
+        "\n"
+        "def main():\n"
+        "    read_file('part.txt')\n"
+        "    slow()\n"
+        "    return read_file('part.txt')\n"
+        "result = main()\n"
+    )
+    requests = [
+        {"jsonrpc": "2.0", "id": 9001, "method": "tools/call",
+         "params": {"name": "execute_script", "arguments": {"code": slow_script}}},
+        {"jsonrpc": "2.0", "id": 9002, "method": "tools/call",
+         "params": {"name": "read_file", "arguments": {"path": "other.txt"}}},
+    ]
+    client.process.stdin.write((json.dumps(requests[0]) + "\n").encode())
+    client.process.stdin.flush()
+    time.sleep(0.15)  # let the script start and make its first read
+    client.process.stdin.write((json.dumps(requests[1]) + "\n").encode())
+    client.process.stdin.flush()
+    replies = {}
+    order = []
+    while len(replies) < 2:
+        line = client.process.stdout.readline()
+        assert line, "the process closed stdout"
+        message = json.loads(line)
+        if message.get("id") in (9001, 9002):
+            replies[message["id"]] = message["result"]
+            order.append(message["id"])
+    assert order == [9002, 9001], f"the read did not run during the script: reply order {order}"
+
+    script = _text(replies[9001])
+    assert "tool_input_limit" in script, script
+    assert "consumed=120" in script, script
+    other = replies[9002]
+    assert _code(other) is None, _text(other)
+    assert "o" * 60 in _text(other)

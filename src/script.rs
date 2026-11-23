@@ -734,6 +734,20 @@ fn dispatch_tool_by_name(name: &str, args: &serde_json::Value) -> Result<Respons
     })? {
         return Ok(failure.into_response(name));
     }
+    // R1 (B1, D60): the input/entry budget allow-list gate for EVERY inner
+    // Starlark call, before the opcode shortcut or the plugin fall-through, so a
+    // script cannot reach an unmetered tool (edit_file, snapshot, kgl_*, a
+    // plugin, any later name) under `--tool-input-bytes`/`--tool-max-entries`.
+    // Keyed on the configured budget (consulted before the shared budget is
+    // installed on the locked op). A bare `--tool-timeout-ms` refuses nothing.
+    if let Some(failure) = with_ctx(|ctx| {
+        let session = ctx.session.clone();
+        Ok(ctx
+            .handle
+            .block_on(async { session.lock().await.budget_input_refusal(name) }))
+    })? {
+        return Ok(failure.into_response(name));
+    }
     let resp = match tools::build_request(name, args) {
         Some(Ok(request)) => dispatch_request(request, name)?,
         Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),

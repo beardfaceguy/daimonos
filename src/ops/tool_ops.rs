@@ -129,7 +129,7 @@ pub async fn tool_pipeline(session: &Session, op: &Op) -> Response {
     // pipeline under --tool-timeout-ms; the same applies to input/entry). No
     // budget option leaves it unchanged.
     if session.budget_active() {
-        return crate::path_policy::ToolFailure::tool_budget_unenforceable(
+        return crate::path_policy::ToolFailure::tool_budget_policy_unsupported(
             Some("tool_pipeline"),
             "a pipeline's external stages are not cooperatively budgeted",
         )

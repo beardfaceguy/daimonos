@@ -10,23 +10,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Added
 
 - **Cooperative tool budgets (FR-19, ADR-031).** Three default-off, global
-  options bound a single top-level tool call: `--tool-timeout-ms N` (an absolute
-  per-call deadline), `--tool-input-bytes N` (a logical input-byte ceiling,
-  charged for file *and* git content and for bytes returned from the cached
-  index, not only filesystem reads), and `--tool-max-entries N` (a
-  directory-entry ceiling; `(proposed)` spelling). A deadline hit returns the
-  reviewed `tool_timeout`; a byte or entry hit returns `tool_input_limit`
-  naming which ceiling was hit, the configured value, and the consumed value —
-  with no partial result. A composite (`batch`, `execute_script`) shares one
-  budget with its children: they inherit the remaining allowance and the
-  absolute deadline and cannot start a fresh one. For `exec` and `git_read` the
-  deadline stops the work, not merely the wait: the managed process group is
-  `SIGTERM`/`SIGKILL` reaped so no child or grandchild outlives the result.
-  Output truncation (`--no-output-spill`) stays a separate mechanism and is
-  never a budget failure. With none of the options set, every tool is exactly
-  unchanged. A budget option with `--worker-config` is refused at startup
-  (exit `2`, `run_configuration_invalid`, `tool_budget_worker_unenforceable`):
-  the budget cannot be enforced across the worker process boundary.
+  options limit one top-level tool call: `--tool-timeout-ms N` (a deadline),
+  `--tool-input-bytes N` (a limit for the file and git content that the call
+  reads or scans), and `--tool-max-entries N` (a limit for the directory
+  entries that the call walks; the name is proposed).
+  - A deadline hit returns `tool_timeout`. A byte or entry hit returns
+    `tool_input_limit` with the limit, the configured value, and the consumed
+    value. A hit returns no partial result and writes the `limit_hit` audit
+    event.
+  - `search` in content mode charges the bytes that it scans and stops during
+    the scan. `ls` stops the walk at the entry limit.
+  - `batch` and `execute_script` share one budget with their children.
+  - A subprocess of `exec`, `git_read`, or a plugin is stopped at the deadline
+    with its process group.
+  - Under an input or entry limit, a tool that cannot meter its input is
+    refused with `tool_policy_unsupported`: `exec`, the process plugins, the
+    index search, and each tool that is not on the admission list.
+    `tool_pipeline` is refused under each budget option. A budget option with
+    `--worker-config` is refused at startup (exit `2`).
+  - Without the options, each tool is unchanged.
 - **`--capability-probe-payload` (FR-04).** A default-off `agent --print`
   option (ADR-027) that sends exactly one unretried capability probe before any
   evidence tool runs, proving the endpoint can drive the same final-answer tool
@@ -424,25 +426,3 @@ binary now also reports its real version: earlier releases still said 0.1.1.
   which unbreaks tagged releases.
 
 - Enforced tool allowlist (`--tool-allowlist PATH`, FR-02/WP06): an explicit JSON array of exact exported tool names is the effective policy at every model listing (tools/list, `list_all_tools`) and every dispatch boundary (direct MCP, batch children, Starlark `tool()`/opcode shortcuts, `execute_script`, the agent loop). Omitted = legacy (all tools); `[]` = none; unknown names fail at startup (exit 2 `run_configuration_invalid`). Caller-owned (never widened by workspace/env config); part of the session-daemon launch identity; refusals carry `tool_not_allowed` and reach the `--audit-path` record. The policy also filters `get_tool_schema`, `list_tool_signatures`, the MCP server instructions, the session-daemon socket listing, and the agent's offered catalog, so served/probed/dumped/dispatched sets agree; with `--final-output` an allowlist omitting the final-answer tool fails startup (`tool_allowlist_missing_final_output`); the reported effective list is the intersection with the agent-env `allowed_commands`; config-registered `[tools.*]` tools may be allowlisted. (r3) The model-facing catalog is now filtered at one source (`tool_facade::active_schemas_for_policy`), so `daimonos chat`, `daimonos acp`, and the session-daemon agent — not only `agent --print` — offer the model exactly the allowlist; forwarded MCP tools and the `execute_script` description's embedded Starlark signatures are filtered by the same policy. (r4) The composite opcodes `tool_pipeline` and `lint_repair` now check their inner `tool_id` against the allowlist before running it, so a listed composite can never reach an unlisted registered `[tools.*]` tool; a malformed or unreadable `--tool-allowlist` file fails startup with reason `tool_allowlist_invalid`; remote/worker tool names cannot be allowlisted in this package (deferred to WP10), so an active allowlist removes every forwarded MCP tool from the catalog.
-
-### WP18 FR-19 cooperative tool budgets — fix run (r4)
-
-- Content search (`search mode=content`) meters the bytes it SCANS (not bytes
-  returned); the blocking worker checks the deadline per read chunk and stops
-  mid-scan (`tool_input_limit`/`tool_timeout`, no partial matches).
-- `read_file`, `ls`, and both search modes check the deadline before building a
-  result; a passed deadline returns `tool_timeout`, never a late success.
-- The budget + deadline scope is installed at ONE place for every registry
-  tool; every plugin subprocess (`git`, `gh`, `cargo`, `npm`, `pytest`,
-  `docker`, `shellcheck`, `curl`, …) is stopped and process-group reaped at the
-  deadline.
-- Unmeterable-input tools are refused with the named `tool_budget_unenforceable`
-  under `--tool-input-bytes`/`--tool-max-entries`: process-starting plugins, the
-  index-answered `search mode=files`, and `tool_pipeline` (refused under any
-  budget option).
-- `ToolBudget::charge_input(bytes)` is the reserved method name.
-- A budget limit hit writes the reserved `limit_hit` audit event (limit, tool,
-  configured, consumed) via `record_limit_hit`.
-- `execute_script` holds its one shared budget in the script context, installed
-  only inside each inner per-op lock, so a concurrent top-level call cannot
-  inherit it.

@@ -24,29 +24,84 @@ use std::time::{Duration, Instant};
 
 use crate::path_policy::ToolFailure;
 
-/// Tools that start external work (a subprocess) and read no logical file/git
-/// content we can meter. An input or entry budget cannot be enforced for them,
-/// so when such a budget is enabled the call is REFUSED rather than silently
-/// exempted (ADR-031; INTERFACES.md row WP18). The deadline, which CAN stop and
-/// reap the process group, is still enforced (see `managed_process::run`).
-/// `git_read` is deliberately absent: it returns the git object content it read,
-/// which the PM counts as logical input, so it is metered, not refused.
-pub fn tool_input_unmeterable(name: &str) -> bool {
+/// R1 (B1, ADR-031): the ALLOW-LIST that governs admission under an input-byte
+/// or directory-entry budget (`--tool-input-bytes` / `--tool-max-entries`). A
+/// tool is admitted ONLY if it appears here; every other name — process
+/// plugins, config-registered `[tools.*]`/`tool_run`, `kgl_*`, snapshot and
+/// restore, `bg`, outbound `mcp__*`, and any name a later package adds — is
+/// REFUSED with the reviewed `tool_policy_unsupported` (D60), never silently
+/// exempted. Inverting the old deny-list closes the silent-exemption surface:
+/// a new unmeterable tool is refused by default, not admitted by omission.
+///
+/// Admitted because they METER the logical input they read:
+/// `read_file` (charges file content bytes read); `ls` (charges directory
+/// entries walked); `search` (content mode charges scanned bytes in the
+/// blocking worker — the index/files mode is refused separately in `ops::find`
+/// because cached-index content is not a scannable byte count); `git_read`
+/// (metered by the bytes of git object content it returns — D61 approximation,
+/// recorded in docs/configuration.md).
+///
+/// Admitted because they read NO workspace or external content to meter:
+/// `write_file`, `append_file` (write output only; they scan no input);
+/// `batch`, `execute_script` (composite dispatchers — each child re-enters this
+/// gate and is metered or refused on its own while sharing the one budget per
+/// ADR-031, so admitting the wrapper exempts nothing); the session/runtime
+/// state tools `set_cwd`, `set_verbosity`, `set_external_session_id`,
+/// `session_stats` (in-process session state, not workspace files); the static
+/// tool-catalog tools `get_tool_schema`, `list_tool_signatures`,
+/// `list_all_tools` (static schemas, not workspace content); the agent-mail
+/// tools `register_agent`, `list_agents`, `send_message`, `reply_message`,
+/// `fetch_inbox`, `mark_read`, `acknowledge`, `fetch_thread` and the advisory
+/// reservation tools `reserve_paths`, `renew_reservations`,
+/// `release_reservations`, `check_conflicts`, `list_reservations` (agent-mail /
+/// reservation store per ADR-009, not workspace file/git content); and
+/// `update_plan` (in-memory agent plan state).
+///
+/// Deliberately ABSENT (refused under an input/entry budget): `edit_file` and
+/// `diff_files` (read workspace files unmetered), `skill` (reads a skill file),
+/// `workspace_info` (reads the root listing unmetered), `kgl_query`/`kgl_assert`
+/// (knowledge-graph store), `snapshot` (snapshot store content), `tool_pipeline`
+/// (external stages), and every process plugin.
+pub fn tool_input_budget_admitted(name: &str) -> bool {
     matches!(
         name,
-        "exec"
-            | "bg"
-            | "git"
-            | "gh"
-            | "cargo"
-            | "npm"
-            | "pytest"
-            | "docker"
-            | "shellcheck"
-            | "curl"
-            | "discord"
-            | "lint_repair"
-            | "tool_run"
+        // Meter their logical input.
+        "read_file"
+            | "ls"
+            | "search"
+            | "git_read"
+            // No input to meter (write-only).
+            | "write_file"
+            | "append_file"
+            // Composite dispatchers: children are gated individually.
+            | "batch"
+            | "execute_script"
+            // Session / runtime state.
+            | "set_cwd"
+            | "set_verbosity"
+            | "set_external_session_id"
+            | "session_stats"
+            // Static tool-catalog introspection.
+            | "get_tool_schema"
+            | "list_tool_signatures"
+            | "list_all_tools"
+            // Agent-mail store (ADR-009).
+            | "register_agent"
+            | "list_agents"
+            | "send_message"
+            | "reply_message"
+            | "fetch_inbox"
+            | "mark_read"
+            | "acknowledge"
+            | "fetch_thread"
+            // Advisory-reservation store (ADR-009).
+            | "reserve_paths"
+            | "renew_reservations"
+            | "release_reservations"
+            | "check_conflicts"
+            | "list_reservations"
+            // In-memory agent plan state.
+            | "update_plan"
     )
 }
 
@@ -165,7 +220,14 @@ impl ToolBudget {
     /// reserves this name (`charge_input`).
     pub fn charge_input(&self, n: u64) -> Result<(), BudgetHit> {
         if let Some(limit) = self.input_limit {
-            let consumed = self.input_consumed.fetch_add(n, Ordering::Relaxed) + n;
+            // `fetch_add` wraps on overflow, so the sum is saturated here. Two
+            // concurrent children can each pass this check for a moment while
+            // their sum passes the limit: the budget is cooperative, and the
+            // later charge of either child then fails.
+            let consumed = self
+                .input_consumed
+                .fetch_add(n, Ordering::Relaxed)
+                .saturating_add(n);
             if consumed > limit {
                 return Err(BudgetHit::Input {
                     which: Limit::Bytes,
@@ -177,10 +239,44 @@ impl ToolBudget {
         Ok(())
     }
 
+    /// R2 (B4): check whether reading `n` more input bytes WOULD exceed the
+    /// ceiling, WITHOUT charging. Lets a reader (`read_file`) refuse by file
+    /// size from metadata before reading a single byte. Returns the hit it
+    /// would raise (reporting the would-be consumed total). No-op (Ok) when no
+    /// byte limit is set.
+    pub fn precheck_input(&self, n: u64) -> Result<(), BudgetHit> {
+        if let Some(limit) = self.input_limit {
+            let would_be = self
+                .input_consumed
+                .load(Ordering::Relaxed)
+                .saturating_add(n);
+            if would_be > limit {
+                return Err(BudgetHit::Input {
+                    which: Limit::Bytes,
+                    limit,
+                    consumed: would_be,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// R2 (B4): the remaining directory-entry allowance (`entry_limit` minus
+    /// what has already been charged), so a walker can be given a hard cap and
+    /// stop early instead of walking the whole tree. `None` when no entry limit
+    /// is set.
+    pub fn entry_remaining(&self) -> Option<u64> {
+        self.entry_limit
+            .map(|limit| limit.saturating_sub(self.entry_consumed.load(Ordering::Relaxed)))
+    }
+
     /// Charge `n` directory entries. No-op when no entry limit is set.
     pub fn charge_entries(&self, n: u64) -> Result<(), BudgetHit> {
         if let Some(limit) = self.entry_limit {
-            let consumed = self.entry_consumed.fetch_add(n, Ordering::Relaxed) + n;
+            let consumed = self
+                .entry_consumed
+                .fetch_add(n, Ordering::Relaxed)
+                .saturating_add(n);
             if consumed > limit {
                 return Err(BudgetHit::Input {
                     which: Limit::Entries,
@@ -268,5 +364,75 @@ impl<R: Read> Read for BudgetedReader<R> {
             }
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R1 (B1): the admission allow-list. Tools that meter their input or read
+    /// no workspace/external content are admitted under an input/entry budget;
+    /// every other name — process plugins, config-registered tools, kgl_*,
+    /// snapshot, bg, outbound mcp__*, and ANY unknown/future name — is refused.
+    #[test]
+    fn input_budget_admits_only_metered_or_contentless_tools() {
+        // Admitted: they meter their logical input.
+        for name in ["read_file", "ls", "search", "git_read"] {
+            assert!(
+                tool_input_budget_admitted(name),
+                "{name} should be admitted"
+            );
+        }
+        // Admitted: they read no workspace/external content, or are composite
+        // dispatchers whose children are gated individually.
+        for name in [
+            "write_file",
+            "append_file",
+            "batch",
+            "execute_script",
+            "set_cwd",
+            "session_stats",
+            "get_tool_schema",
+            "register_agent",
+            "send_message",
+            "reserve_paths",
+            "list_reservations",
+        ] {
+            assert!(
+                tool_input_budget_admitted(name),
+                "{name} should be admitted"
+            );
+        }
+        // Refused: read workspace/external content unmetered or start a
+        // subprocess. Includes the exact classes the reviewer named (B1).
+        for name in [
+            "edit_file",
+            "diff_files",
+            "skill",
+            "workspace_info",
+            "kgl_query",
+            "kgl_assert",
+            "snapshot",
+            "bg",
+            "tool_run",
+            "tool_pipeline",
+            "exec",
+            "git",
+            "cargo",
+            "curl",
+            "lint_repair",
+        ] {
+            assert!(
+                !tool_input_budget_admitted(name),
+                "{name} should be refused"
+            );
+        }
+        // Refused: outbound remote MCP tools (mcp__*) are never admitted.
+        assert!(!tool_input_budget_admitted("mcp__server__some_tool"));
+        // Refused by default: an unknown name a later package might add is NOT
+        // silently exempted — the whole point of inverting the deny-list.
+        assert!(!tool_input_budget_admitted("some_future_tool"));
+        assert!(!tool_input_budget_admitted(""));
     }
 }

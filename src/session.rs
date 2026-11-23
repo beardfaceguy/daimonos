@@ -98,9 +98,19 @@ pub struct Session {
     /// top-level call and shared (inherited, never reset) by composite children
     /// so delegation cannot multiply the allowance (ADR-031).
     pub tool_budget: Option<Arc<crate::tool_budget::ToolBudget>>,
+    /// R3 (B3): the budget hit (code, configured, consumed) recorded IN-BAND by
+    /// the budget code when a genuine deadline/input/entry limit fired on this
+    /// call, so the run loop records the reserved `limit_hit` audit event from a
+    /// trusted signal instead of parsing attacker-influenceable result text.
+    /// Interior-mutable so the `&self` budget helpers can set it; drained by
+    /// `take_budget_hit` and cleared when a fresh top-level budget is installed.
+    pub budget_hit: std::sync::Mutex<Option<BudgetHitRecord>>,
 }
 
 pub type BgProcess = crate::managed_process::ManagedBackground;
+
+/// R3 (B3): an in-band cooperative budget hit: `(code, configured, consumed)`.
+pub type BudgetHitRecord = (String, Option<u64>, Option<u64>);
 
 impl Session {
     pub fn new(workspace: PathBuf, cfg: Arc<Config>) -> Self {
@@ -158,6 +168,7 @@ impl Session {
             policy,
             tool_budget_config,
             tool_budget: None,
+            budget_hit: std::sync::Mutex::new(None),
         }
     }
 
@@ -169,8 +180,38 @@ impl Session {
         if self.tool_budget.is_some() {
             return false;
         }
+        // R3/R4: a fresh top-level call starts with no stale in-band hit.
+        *self.budget_hit.lock().expect("budget_hit poisoned") = None;
         self.tool_budget = self.tool_budget_config.start();
         self.tool_budget.is_some()
+    }
+
+    /// R3 (B3): record an in-band budget hit (the code and its numbers) so the
+    /// run loop can write the reserved `limit_hit` event without parsing result
+    /// text. Called by the budget helpers and the native readers on a genuine
+    /// hit only.
+    pub fn note_budget_hit(&self, hit: &crate::tool_budget::BudgetHit) {
+        use crate::tool_budget::BudgetHit;
+        let record = match hit {
+            BudgetHit::Timeout { configured_ms } => (
+                "tool_timeout".to_string(),
+                Some(*configured_ms),
+                Some(*configured_ms),
+            ),
+            BudgetHit::Input {
+                limit, consumed, ..
+            } => (
+                "tool_input_limit".to_string(),
+                Some(*limit),
+                Some(*consumed),
+            ),
+        };
+        *self.budget_hit.lock().expect("budget_hit poisoned") = Some(record);
+    }
+
+    /// R3 (B3): drain the in-band budget hit recorded during the last dispatch.
+    pub fn take_budget_hit(&self) -> Option<BudgetHitRecord> {
+        self.budget_hit.lock().expect("budget_hit poisoned").take()
     }
 
     /// Clear the operation budget if this call owned it. A composite child
@@ -190,9 +231,28 @@ impl Session {
         argument: &str,
     ) -> Result<(), crate::path_policy::ToolFailure> {
         if let Some(budget) = &self.tool_budget {
-            budget
-                .charge_input(bytes)
-                .map_err(|hit| hit.into_failure(Some(argument)))?;
+            if let Err(hit) = budget.charge_input(bytes) {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
+        }
+        Ok(())
+    }
+
+    /// R2 (B4): refuse `bytes` against the active byte budget WITHOUT charging,
+    /// so `read_file` can reject a file by its metadata size before reading it.
+    /// Returns the typed `tool_input_limit` when the size alone would exceed the
+    /// remaining allowance; a no-op when no byte budget is active.
+    pub fn budget_precheck_bytes(
+        &self,
+        bytes: u64,
+        argument: &str,
+    ) -> Result<(), crate::path_policy::ToolFailure> {
+        if let Some(budget) = &self.tool_budget {
+            if let Err(hit) = budget.precheck_input(bytes) {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
         }
         Ok(())
     }
@@ -232,16 +292,47 @@ impl Session {
             .is_some_and(|b| b.has_input_limits())
     }
 
-    /// Refuse `tool` when an input/entry budget is enabled but the tool reads
-    /// no meterable logical input (a process-starting plugin, the index
-    /// search): return the typed `tool_budget_unenforceable` failure rather
-    /// than exempt it silently (ADR-031). `None` when nothing need be refused.
+    /// R1 (B1, ADR-031): under an input-byte or directory-entry budget, admit a
+    /// tool only if it is on the explicit [`crate::tool_budget::tool_input_budget_admitted`]
+    /// allow-list (it meters its input or reads no workspace/external content).
+    /// Every other name is REFUSED with the reviewed `tool_policy_unsupported`
+    /// (D60), never silently exempted. Keyed on the configured budget, not an
+    /// installed one, so every frontend dispatch boundary (the MCP seam, the
+    /// agent/chat/ACP loop, and `execute_script`) can consult it uniformly
+    /// before a budget is even installed. `None` when no input/entry budget is
+    /// set (a bare `--tool-timeout-ms` refuses nothing here) or when `tool` is
+    /// admitted.
     pub fn budget_input_refusal(&self, tool: &str) -> Option<crate::path_policy::ToolFailure> {
+        let cfg = &self.tool_budget_config;
+        let input_or_entry = cfg.input_bytes.is_some() || cfg.max_entries.is_some();
+        if input_or_entry && !crate::tool_budget::tool_input_budget_admitted(tool) {
+            Some(
+                crate::path_policy::ToolFailure::tool_budget_policy_unsupported(
+                    Some(tool),
+                    "it is not on the input/entry budget allow-list (it reads workspace \
+                 or external content that is not metered, or starts external work)",
+                ),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// R1 (ADR-031): the index-answered search (`search mode=files`) reads
+    /// cached-index content that is not a scannable byte count, so under an
+    /// input/entry budget it is REFUSED regardless of the admission allow-list
+    /// (which admits `search` for its byte-metered content mode). Checks the
+    /// installed budget (this runs inside `ops::dispatch`, after the budget was
+    /// installed). `None` when no input/entry budget is active.
+    pub fn budget_index_search_refusal(&self) -> Option<crate::path_policy::ToolFailure> {
         if self.budget_has_input_limits() {
-            Some(crate::path_policy::ToolFailure::tool_budget_unenforceable(
-                Some(tool),
-                "it starts external work whose logical input is not metered",
-            ))
+            Some(
+                crate::path_policy::ToolFailure::tool_budget_policy_unsupported(
+                    Some("search"),
+                    "the index (files) search mode reads cached-index content that is not a \
+                 scannable byte count",
+                ),
+            )
         } else {
             None
         }
@@ -254,9 +345,10 @@ impl Session {
         argument: &str,
     ) -> Result<(), crate::path_policy::ToolFailure> {
         if let Some(budget) = &self.tool_budget {
-            budget
-                .charge_entries(entries)
-                .map_err(|hit| hit.into_failure(Some(argument)))?;
+            if let Err(hit) = budget.charge_entries(entries) {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
         }
         Ok(())
     }
@@ -287,9 +379,10 @@ impl Session {
         argument: &str,
     ) -> Result<(), crate::path_policy::ToolFailure> {
         if let Some(budget) = &self.tool_budget {
-            budget
-                .check_deadline()
-                .map_err(|hit| hit.into_failure(Some(argument)))?;
+            if let Err(hit) = budget.check_deadline() {
+                self.note_budget_hit(&hit);
+                return Err(hit.into_failure(Some(argument)));
+            }
         }
         Ok(())
     }

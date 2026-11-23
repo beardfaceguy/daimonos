@@ -156,8 +156,10 @@ async fn find(session: &Session, op: &Op) -> Response {
     // cached index content, not scannable file content, so its logical input is
     // not meterable as logical bytes; refuse an enabled input/entry budget
     // rather than charge "bytes returned" (the owner choice stated in the
-    // handoff). The deadline IS enforced (checked before and after the search).
-    if let Some(failure) = session.budget_input_refusal("search") {
+    // handoff). Uses the mode-specific refusal because the allow-list admits
+    // `search` for its byte-metered content mode (R1/D60). The deadline IS
+    // enforced (checked before and after the search).
+    if let Some(failure) = session.budget_index_search_refusal() {
         return failure.into_response("search");
     }
     if let Err(failure) = session.budget_check_deadline("search") {
@@ -189,7 +191,7 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
     // content, not scannable file content, so refuse an enabled input/entry
     // budget rather than charge "bytes returned" (same choice as the plain
     // index path). The deadline is enforced below.
-    if let Some(failure) = session.budget_input_refusal("search") {
+    if let Some(failure) = session.budget_index_search_refusal() {
         return failure.into_response("search");
     }
     let glob = match op.g.as_deref().map(glob::Pattern::new) {

@@ -14,6 +14,23 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
         None => return Response::err(3, "read requires path in 'p'"),
     };
 
+    // R2 (B4, FR-19): refuse by file size BEFORE reading when the size alone
+    // exceeds the remaining byte allowance, so a budget bounds the bytes read
+    // rather than only reclassifying a completed read. Charging the exact
+    // content length still happens after the read for files that pass.
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) => {
+            if let Err(failure) =
+                session.budget_precheck_bytes(meta.len(), op.p.as_deref().unwrap_or("read_file"))
+            {
+                return failure.into_response("read_file");
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Response::err(1, &format!("not found: {}", path.display()))
+        }
+        Err(e) => return Response::err(4, &format!("io: {e}")),
+    }
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -450,21 +467,31 @@ pub async fn ls(session: &Session, op: &Op) -> Response {
         type_filter: op.n2,
     };
 
+    // R2 (B4, FR-19, ADR-031): charge each entry INSIDE the walk and STOP at
+    // the ceiling, so an entry budget bounds the directory walk rather than
+    // walking the whole tree and reclassifying afterwards. The deadline is
+    // checked per entry too, so a bare deadline also stops a huge walk. A hit
+    // returns tool_input_limit (D56) / tool_timeout with no partial listing.
+    let budget = session.tool_budget();
     let mut entries = Vec::new();
     let mut walked = 0u64;
-    if let Err(e) = ls_recurse(&path, &path, depth, &opts, &mut entries, &mut walked).await {
-        return Response::err(4, &format!("ls: {e}"));
-    }
-    // FR-19 F2 (WP18, ADR-031): a walk that ran past the deadline is a timeout,
-    // not a late listing; check before the result is built.
-    if let Err(failure) = session.budget_check_deadline("ls") {
-        return failure.into_response("ls");
-    }
-    // FR-19 (WP18, ADR-031): charge directory entries walked. An entry-ceiling
-    // hit returns tool_input_limit (integrator D56) naming the entry limit,
-    // with no partial listing. No-op when no entry budget is set.
-    if let Err(failure) = session.budget_charge_entries(walked, "ls") {
-        return failure.into_response("ls");
+    match ls_recurse(
+        &path,
+        &path,
+        depth,
+        &opts,
+        &mut entries,
+        &mut walked,
+        budget.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(WalkStop::Io(e)) => return Response::err(4, &format!("ls: {e}")),
+        Err(WalkStop::Budget(hit)) => {
+            session.note_budget_hit(&hit);
+            return hit.into_failure(Some("ls")).into_response("ls");
+        }
     }
 
     entries.sort_by(|a, b| {
@@ -506,6 +533,12 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
         op.q.as_deref()
             .and_then(|pattern| glob::Pattern::new(pattern).ok());
     let filter = op.n2;
+    // R2 (B4, WP18): cap the confined walk at the remaining entry allowance so
+    // `--tool-max-entries` bounds the walk itself; `None` keeps it unbounded.
+    let entry_cap = session
+        .tool_budget()
+        .and_then(|b| b.entry_remaining())
+        .map(|remaining| remaining as usize);
     let result = tokio::task::spawn_blocking(move || {
         // WP14: honor no-follow for the explicit scope so a symlink named as
         // the ls root is refused with its target, never listed through.
@@ -519,6 +552,7 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
                 follow_symlinks: !authority.no_follow(),
                 include_hidden: show_all,
                 skip_dirs: SKIP_DIRS,
+                max_entries: entry_cap,
             },
         )?;
         Ok::<_, crate::path_policy::ToolFailure>((base, walk))
@@ -589,6 +623,14 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
     Response::ok(response)
 }
 
+/// R2 (B4): why a bounded `ls` walk stopped. `Io` is a filesystem error;
+/// `Budget` is a cooperative tool-budget hit (entry ceiling or deadline) raised
+/// MID-walk so a huge tree is not walked to completion.
+enum WalkStop {
+    Io(String),
+    Budget(crate::tool_budget::BudgetHit),
+}
+
 async fn ls_recurse(
     root: &std::path::Path,
     path: &std::path::Path,
@@ -596,19 +638,31 @@ async fn ls_recurse(
     opts: &LsOpts<'_>,
     entries: &mut Vec<serde_json::Value>,
     walked: &mut u64,
-) -> Result<(), String> {
+    budget: Option<&std::sync::Arc<crate::tool_budget::ToolBudget>>,
+) -> Result<(), WalkStop> {
     let mut dir = tokio::fs::read_dir(path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+        WalkStop::Io(if e.kind() == std::io::ErrorKind::NotFound {
             format!("not found: {}", path.display())
         } else {
             format!("{e}")
-        }
+        })
     })?;
 
     while let Ok(Some(entry)) = dir.next_entry().await {
         // FR-19 (WP18, ADR-031): every directory entry visited counts, before
         // any hidden/skip/type/glob filter, so the charged input is honest.
         *walked += 1;
+        // R2 (B4): check the deadline and charge this entry BEFORE doing any
+        // per-entry work, and STOP the walk on a hit so the ceiling truly
+        // bounds the walk. No-op when no budget is active.
+        if let Some(b) = budget {
+            if let Err(hit) = b.check_deadline() {
+                return Err(WalkStop::Budget(hit));
+            }
+            if let Err(hit) = b.charge_entries(1) {
+                return Err(WalkStop::Budget(hit));
+            }
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         if !opts.show_all && name.starts_with('.') {
             continue;
@@ -675,15 +729,22 @@ async fn ls_recurse(
         }
 
         if is_dir && depth > 1 {
-            let _ = Box::pin(ls_recurse(
+            // Propagate a budget stop out of the recursion so the whole walk
+            // ends at the ceiling (an I/O error in a subdir is still skipped).
+            match Box::pin(ls_recurse(
                 root,
                 &entry.path(),
                 depth - 1,
                 opts,
                 entries,
                 walked,
+                budget,
             ))
-            .await;
+            .await
+            {
+                Ok(()) | Err(WalkStop::Io(_)) => {}
+                Err(stop @ WalkStop::Budget(_)) => return Err(stop),
+            }
         }
     }
 
@@ -1011,7 +1072,10 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
             }
             Response::ok(json!({"matches": matches}))
         }
-        Ok(Err(GrepStop::Budget(hit))) => hit.into_failure(Some("search")).into_response("search"),
+        Ok(Err(GrepStop::Budget(hit))) => {
+            session.note_budget_hit(&hit);
+            hit.into_failure(Some("search")).into_response("search")
+        }
         Ok(Err(GrepStop::Io(e))) => Response::err(4, &format!("grep: {e}")),
         Err(e) => Response::err(4, &format!("grep task: {e}")),
     }

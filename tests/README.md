@@ -215,6 +215,9 @@ tests need a Unix host with `/proc` and a real `git`; a skip is not a pass.
 `tests/test_tool_budgets.py` (WP18, FR-19): process-level cooperative tool
 budget tests — scanned-byte metering for content search, native deadline checks
 (read_file/ls/both search modes), plugin deadline+reap (curl, git), the
-`tool_budget_unenforceable` refusals (git plugin, index search, pipeline), the
+`tool_policy_unsupported` refusals (each tool that is not on the admission
+list, the index search, the pipeline), the entry limit that stops the `ls`
+walk, the budget that does not leak into the next call or into a concurrent
+call, the
 AC-19.1 large-tree timeout bound, and the `limit_hit` audit event (by
 kind+fields). AC-19.1 writes 10000 small files and stays under ~10 s.

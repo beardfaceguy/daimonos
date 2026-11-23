@@ -448,11 +448,14 @@ async fn dispatch_tool_inner(
     // call whose deadline passed returns tool_timeout, never a late success. All
     // a no-op when no budget option is set. ===
     let budget_owned = session.begin_tool_operation();
-    if crate::tool_budget::tool_input_unmeterable(name) {
-        if let Some(failure) = session.budget_input_refusal(name) {
-            session.end_tool_operation(budget_owned);
-            return response_to_result(failure.into_response(name));
-        }
+    // R1 (B1, D60): the input/entry allow-list gate. Every registry tool that
+    // is not on `tool_budget::tool_input_budget_admitted` is refused here
+    // (`tool_policy_unsupported`) when an input/entry budget is set, so a
+    // process plugin, snapshot, kgl_*, edit_file, or any later-added name is
+    // never silently exempted. A bare deadline refuses nothing here.
+    if let Some(failure) = session.budget_input_refusal(name) {
+        session.end_tool_operation(budget_owned);
+        return response_to_result(failure.into_response(name));
     }
     let budget_remaining = session.budget_remaining();
     let dispatched = crate::managed_process::with_budget_deadline(budget_remaining, async {
@@ -1605,6 +1608,13 @@ impl ServerHandler for DaimonosHandler {
             return bounded_text_tool_result(&output_cfg, "batch", payload, false).await;
         }
 
+        // FR-19 (WP18): a top-level call holds the session lock from here to
+        // its result, and each call clears the budget that it installed. So no
+        // budget of an earlier call can be on the session here.
+        debug_assert!(
+            session.tool_budget.is_none(),
+            "a tool budget leaked into the next top-level call"
+        );
         let result = dispatch_tool(&mut session, &params.name, &args).await;
         // Read the dirty flag before the observe path may drop the lock.
         let tools_changed = session.take_tools_changed();
@@ -1829,6 +1839,7 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
                     skip_dirs: &["target", "node_modules"],
                     // WP14 (FR-12): never descend through a link under no-follow.
                     follow_symlinks: !authority.no_follow(),
+                    max_entries: None,
                 },
             ) {
                 let mut dirs: Vec<_> = walk

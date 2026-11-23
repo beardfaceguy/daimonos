@@ -1821,10 +1821,10 @@ top-level tool call may consume. They are caller-owned (never read from
 
 - **`--tool-timeout-ms N`** — an absolute deadline, in milliseconds, for the
   call. A hit returns the reviewed `tool_timeout` code with no partial result.
-- **`--tool-input-bytes N`** — a logical input-byte ceiling for the call. Bytes
-  are counted for file content read, git content read, and the bytes returned
-  from the cached (trigram) index — not only filesystem reads, and never the
-  displayed/truncated output bytes. A hit returns `tool_input_limit`.
+- **`--tool-input-bytes N`** — a logical input-byte ceiling for the call. It
+  counts the file content that a tool reads or scans, and the git content that
+  `git_read` returns. It never counts the displayed or truncated output bytes.
+  A hit returns `tool_input_limit`.
 - **`--tool-max-entries N`** *(proposed)* — a directory-entry ceiling for the
   call (e.g. `ls` walking). A hit returns `tool_input_limit` naming
   `directory entries`. (The reviewed interface row has no separate code for the
@@ -1869,20 +1869,34 @@ See ADR-031 and `tests/test_tool_budgets.py`.
 
 #### Tool budgets — enforcement scope (WP18, FR-19)
 
-The default-off flags `--tool-timeout-ms`, `--tool-input-bytes`, and
+The default-off options `--tool-timeout-ms`, `--tool-input-bytes`, and
 `--tool-max-entries` are cooperative:
 
-- Deadline: enforced everywhere. Native readers (`read_file`, `ls`, `search`)
-  check it at bounded work boundaries (between files and, for content search,
-  per read chunk). Plugin subprocesses are stopped and process-group reaped at
-  the deadline (Linux; elsewhere the process default timeout applies). A passed
-  deadline returns `tool_timeout`.
-- Input bytes: content search and `read_file` meter the file content SCANNED;
-  `git_read` meters the git object content returned.
-- Entries: `ls` meters directory entries walked.
-- Refused with `tool_budget_unenforceable` under an input/entry budget (input
-  not meterable): process-starting plugins (except `git_read`), the
-  index-answered `search mode=files`, and `tool_pipeline` (any budget option).
+- **Deadline.** Each tool call has the deadline. `read_file`, `ls`, and `search`
+  check it at work boundaries: between files, and for each read chunk of a
+  content search. A subprocess of `exec`, `git_read`, or a plugin is stopped at
+  the deadline with its process group (Linux; on other platforms the process
+  default timeout applies). A passed deadline returns `tool_timeout`. The check
+  is not preemptive: one slow system call can pass the deadline before the next
+  check.
+- **Input bytes.** `search` in content mode charges the bytes that it scans and
+  stops during the scan. `read_file` checks the file size before the read and
+  charges the whole file, also when `offset` and `limit` select a part.
+  `git_read` charges the bytes of the content that it returns, after git ended.
+  That is an approximation of the git content read: it does not stop git early.
+- **Entries.** `ls` charges each directory entry during the walk and stops at
+  the limit.
+- **Refused under an input or entry limit.** With `--tool-input-bytes` or
+  `--tool-max-entries`, a tool is admitted only when it meters its input or
+  reads no workspace or external content. Each other tool is refused with
+  `tool_policy_unsupported`: `exec`, the process plugins (`git`, `gh`, `cargo`,
+  `npm`, `pytest`, `docker`, `shellcheck`, `curl`), `edit_file`, `snapshot`,
+  `workspace_info`, tools from configuration, outbound MCP tools, and `search`
+  in files mode (the index does not report the content that it reads). With
+  `--confine-paths`, the offered tools `read_file`, `ls`, and `search` in
+  content mode stay available.
+- **Refused under each budget option.** `tool_pipeline`, and a run with
+  `--worker-config` (at startup).
 
 Output truncation (`--no-output-spill`, `tool_output`) is a separate mechanism,
 never reported as a budget limit hit.
