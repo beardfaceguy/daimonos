@@ -31,7 +31,14 @@ pub async fn dispatch_with_progress(
     req: Request,
     on_exec_progress: Option<&ExecProgressCallback<'_>>,
 ) -> Response {
-    match req {
+    // FR-19 (WP18, ADR-031): install a fresh operation budget for this
+    // top-level call. A composite's children re-enter here and inherit the
+    // parent's budget (`owned == false`), so delegation cannot multiply the
+    // allowance or extend the deadline; the installing call clears it on
+    // return so each sequential top-level call starts fresh. When no budget
+    // option is set nothing is installed and behavior is unchanged.
+    let owned = session.begin_tool_operation();
+    let result = match req {
         Request::Single(op) => dispatch_op(session, op, on_exec_progress).await,
         Request::Batch { batch } => {
             let mut results = Vec::with_capacity(batch.len());
@@ -40,7 +47,9 @@ pub async fn dispatch_with_progress(
             }
             Response::ok(serde_json::to_value(results).unwrap())
         }
-    }
+    };
+    session.end_tool_operation(owned);
+    result
 }
 
 async fn dispatch_op(
@@ -143,10 +152,27 @@ async fn find(session: &Session, op: &Op) -> Response {
         None => None,
     };
 
+    // FR-19 F1 (WP18, ADR-031): the index-answered search (mode=files) reads
+    // cached index content, not scannable file content, so its logical input is
+    // not meterable as logical bytes; refuse an enabled input/entry budget
+    // rather than charge "bytes returned" (the owner choice stated in the
+    // handoff). Uses the mode-specific refusal because the allow-list admits
+    // `search` for its byte-metered content mode (R1/D60). The deadline IS
+    // enforced (checked before and after the search).
+    if let Some(failure) = session.budget_index_search_refusal() {
+        return failure.into_response("search");
+    }
+    if let Err(failure) = session.budget_check_deadline("search") {
+        return failure.into_response("search");
+    }
     idx.ensure_populated().await;
     let results = idx
         .search_scoped(&query, max, op.q.as_deref(), file_glob.as_ref())
         .await;
+    // A search that ran past the deadline is a timeout, not a late result.
+    if let Err(failure) = session.budget_check_deadline("search") {
+        return failure.into_response("search");
+    }
     let stats = idx.stats().await;
 
     Response::ok(serde_json::json!({
@@ -161,6 +187,13 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
     let Some(query) = &op.p else {
         return Response::err(3, "find requires query in 'p'");
     };
+    // FR-19 F1 (WP18, ADR-031): the confined files-mode search ranks index/name
+    // content, not scannable file content, so refuse an enabled input/entry
+    // budget rather than charge "bytes returned" (same choice as the plain
+    // index path). The deadline is enforced below.
+    if let Some(failure) = session.budget_index_search_refusal() {
+        return failure.into_response("search");
+    }
     let glob = match op.g.as_deref().map(glob::Pattern::new) {
         Some(Ok(pattern)) => Some(pattern),
         Some(Err(error)) => return Response::err(3, &format!("invalid glob: {error}")),
@@ -258,6 +291,11 @@ async fn find_confined(session: &Session, op: &Op) -> Response {
     .await;
     match result {
         Ok(Ok((results, stats, skipped))) => {
+            // A search that ran past the deadline is a timeout, not a late
+            // result (FR-19 F2).
+            if let Err(failure) = session.budget_check_deadline("search") {
+                return failure.into_response("search");
+            }
             let mut value = serde_json::json!({"results": results, "index": stats});
             if skipped > 0 {
                 value["skipped"] = serde_json::json!(skipped)

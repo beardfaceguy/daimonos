@@ -18,6 +18,31 @@ use tokio::sync::Mutex;
 
 pub type ProgressCallback<'a> = dyn Fn(String) + Send + Sync + 'a;
 
+tokio::task_local! {
+    /// Cooperative tool-budget deadline (remaining time) in force for the
+    /// current operation, set by the dispatch seam via [`with_budget_deadline`].
+    /// Subprocesses that [`run`] spawns inside the scope inherit it so the OS
+    /// process group is reaped AT the deadline, never merely waited on
+    /// (FR-19, WP18, ADR-031). Context: src/tool_budget.rs.
+    static BUDGET_DEADLINE: Option<Duration>;
+}
+
+/// Run `fut` with the cooperative tool-budget deadline in scope. A `None`
+/// deadline (no `--tool-timeout-ms`, or no deadline left to inherit) leaves the
+/// legacy behavior of [`run`] unchanged. The deadline bounds but never extends
+/// the process default timeout (FR-19, WP18, ADR-031).
+pub async fn with_budget_deadline<F: std::future::Future>(
+    deadline: Option<Duration>,
+    fut: F,
+) -> F::Output {
+    BUDGET_DEADLINE.scope(deadline, fut).await
+}
+
+/// The cooperative deadline in scope, or `None` outside a budgeted operation.
+fn scoped_budget_deadline() -> Option<Duration> {
+    BUDGET_DEADLINE.try_with(|d| *d).unwrap_or(None)
+}
+
 /// Captured process output. Each stream is bounded while it is read.
 pub struct ManagedOutput {
     pub status: ExitStatus,
@@ -468,14 +493,28 @@ pub async fn run(
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd);
     apply_environment(&mut command, cfg, overlays);
-    let output = capture(&mut command, cfg, None, stdin_data).await?;
+    // FR-19 (WP18, ADR-031): a cooperative tool-budget deadline in scope caps
+    // this subprocess and reaps its process group at the deadline. `None`
+    // preserves the legacy process-default behavior exactly.
+    let (output, budget_fired) = capture_budgeted(
+        &mut command,
+        cfg,
+        None,
+        stdin_data,
+        scoped_budget_deadline(),
+    )
+    .await?;
     if output.timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!(
-                "{program} timed out after {} seconds",
-                cfg.default_timeout_secs
-            ),
+            if budget_fired {
+                format!("{program} stopped at the tool budget deadline")
+            } else {
+                format!(
+                    "{program} timed out after {} seconds",
+                    cfg.default_timeout_secs
+                )
+            },
         ));
     }
     Ok(output)
@@ -488,6 +527,33 @@ pub async fn capture(
     progress: Option<&ProgressCallback<'_>>,
     stdin_data: Option<&[u8]>,
 ) -> io::Result<ManagedOutput> {
+    capture_inner(command, cfg, progress, stdin_data, None)
+        .await
+        .map(|(output, _)| output)
+}
+
+/// Like [`capture`], but also stops the child at `budget_deadline` when set,
+/// using the same TERM->grace->KILL process-group reap — never a bare timeout
+/// wrapper that leaves work running underneath (FR-19, WP18, ADR-031). Returns
+/// the output plus `true` when the stop was the cooperative tool budget's
+/// deadline rather than the process default timeout. Context: src/tool_budget.rs.
+pub async fn capture_budgeted(
+    command: &mut Command,
+    cfg: &ProcessConfig,
+    progress: Option<&ProgressCallback<'_>>,
+    stdin_data: Option<&[u8]>,
+    budget_deadline: Option<Duration>,
+) -> io::Result<(ManagedOutput, bool)> {
+    capture_inner(command, cfg, progress, stdin_data, budget_deadline).await
+}
+
+async fn capture_inner(
+    command: &mut Command,
+    cfg: &ProcessConfig,
+    progress: Option<&ProgressCallback<'_>>,
+    stdin_data: Option<&[u8]>,
+    budget_deadline: Option<Duration>,
+) -> io::Result<(ManagedOutput, bool)> {
     command
         .stdin(if stdin_data.is_some() {
             Stdio::piped()
@@ -506,18 +572,37 @@ pub async fn capture(
         .take()
         .ok_or_else(|| io::Error::other("spawned process has no stderr pipe"))?;
     let stdin = child.stdin_mut().take();
-    let timeout =
+    let proc_timeout =
         (cfg.default_timeout_secs > 0).then(|| Duration::from_secs(cfg.default_timeout_secs));
+    // FR-19 (WP18, ADR-031): the cooperative tool budget caps this wait at its
+    // remaining deadline and never extends the process default. The effective
+    // stop is the sooner of the two; `budget_is_tighter` records that the
+    // budget deadline was (at least as) soon, so the caller returns the typed
+    // `tool_timeout` rather than the legacy process-timeout error. Either stop
+    // reaps the whole process group through `ManagedChild::terminate`.
+    let effective_timeout = match (proc_timeout, budget_deadline) {
+        (Some(p), Some(b)) => Some(p.min(b)),
+        (Some(p), None) => Some(p),
+        (None, b) => b,
+    };
+    let budget_is_tighter = match (proc_timeout, budget_deadline) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(p), Some(b)) => b <= p,
+    };
     let grace = Duration::from_millis(cfg.termination_grace_ms);
 
     let wait = async {
-        if let Some(timeout) = timeout {
+        if let Some(timeout) = effective_timeout {
             match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(status) => status.map(|status| (status, false)),
-                Err(_) => child.terminate(grace).await.map(|status| (status, true)),
+                Ok(status) => status.map(|status| (status, false, false)),
+                Err(_) => child
+                    .terminate(grace)
+                    .await
+                    .map(|status| (status, true, budget_is_tighter)),
             }
         } else {
-            child.wait().await.map(|status| (status, false))
+            child.wait().await.map(|status| (status, false, false))
         }
     };
     let write_stdin = async {
@@ -545,16 +630,19 @@ pub async fn capture(
     );
     let stdout = stdout?;
     let stderr = stderr?;
-    let (status, timed_out) = status?;
+    let (status, timed_out, budget_fired) = status?;
     stdin?;
-    Ok(ManagedOutput {
-        status,
-        stdout: stdout.render(),
-        stderr: stderr.render(),
-        stdout_truncated: stdout.truncated(),
-        stderr_truncated: stderr.truncated(),
-        timed_out,
-    })
+    Ok((
+        ManagedOutput {
+            status,
+            stdout: stdout.render(),
+            stderr: stderr.render(),
+            stdout_truncated: stdout.truncated(),
+            stderr_truncated: stderr.truncated(),
+            timed_out,
+        },
+        budget_fired,
+    ))
 }
 
 struct BoundedStream {

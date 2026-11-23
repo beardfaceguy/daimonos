@@ -200,6 +200,77 @@ impl ToolFailure {
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::refusal(CODE_FILESYSTEM_POLICY_UNSUPPORTED, message, None)
     }
+
+    /// Cooperative tool-budget deadline hit (WP18, FR-19, ADR-031). The
+    /// `configured_ms` value is reported as both the limit and the consumed
+    /// amount: the call ran until at least the deadline. No partial success.
+    pub fn tool_timeout(argument: Option<&str>, configured_ms: u64) -> Self {
+        let mut failure = Self::refusal(
+            "tool_timeout",
+            format!("tool deadline exceeded: configured_ms={configured_ms}"),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure.budget = Some(Box::new(FailureBudget {
+            limit: configured_ms,
+            configured: configured_ms,
+            consumed: configured_ms,
+        }));
+        failure
+    }
+
+    /// Cooperative tool-budget logical-input hit (WP18, FR-19, ADR-031). Used
+    /// for both the byte ceiling and the directory-entry ceiling; `which`
+    /// names the ceiling that was hit (integrator D56 keeps the single
+    /// reviewed `tool_input_limit` code). No partial success.
+    /// Cooperative tool-budget refusal (WP18, FR-19, ADR-031, R1): a tool whose
+    /// relevant budget cannot be enforced is REFUSED when that budget is
+    /// enabled, rather than silently exempted (INTERFACES.md row WP18). It
+    /// carries the REVIEWED `tool_policy_unsupported` code (integrator D60, no
+    /// new code is minted) and a message that names the budget option(s) and,
+    /// via `into_response`, the tool. Used for the allow-list refusal under
+    /// `--tool-input-bytes`/`--tool-max-entries`, the index-answered search
+    /// (cached index content is not a scannable byte count), and `tool_pipeline`
+    /// (external stages cannot be budgeted cooperatively). Deadline enforcement
+    /// is unaffected.
+    pub fn tool_budget_policy_unsupported(argument: Option<&str>, detail: &str) -> Self {
+        let mut failure = Self::refusal(
+            crate::run_policy::CODE_TOOL_POLICY_UNSUPPORTED,
+            format!(
+                "cooperative tool budget (--tool-input-bytes/--tool-max-entries/\
+                 --tool-timeout-ms) cannot be enforced for this tool: {detail}"
+            ),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure
+    }
+
+    pub fn tool_input_limit(
+        argument: Option<&str>,
+        which: &str,
+        limit: u64,
+        consumed: u64,
+    ) -> Self {
+        let mut failure = Self::refusal(
+            "tool_input_limit",
+            format!("tool input limit exceeded ({which}): configured={limit}, consumed={consumed}"),
+            None,
+        );
+        if let Some(arg) = argument {
+            failure.argument = Some(arg.to_string());
+        }
+        failure.budget = Some(Box::new(FailureBudget {
+            limit,
+            configured: limit,
+            consumed,
+        }));
+        failure
+    }
 }
 
 /// Configurable bounds for the authority. Caller/config supplied — no hidden
@@ -297,6 +368,12 @@ pub struct WalkOptions {
     pub include_hidden: bool,
     /// Directory names that must not be emitted or traversed.
     pub skip_dirs: &'static [&'static str],
+    /// R2 (B4, WP18): optional cooperative-budget cap on the number of entries
+    /// to enumerate. When set, the walk STOPS once it has collected more than
+    /// this many entries (setting [`Walk::tool_entry_stop`]), so a
+    /// `--tool-max-entries` budget bounds the confined walk rather than walking
+    /// the whole tree. `None` (the default) keeps the legacy unbounded walk.
+    pub max_entries: Option<usize>,
 }
 
 impl Default for WalkOptions {
@@ -306,6 +383,7 @@ impl Default for WalkOptions {
             follow_symlinks: true,
             include_hidden: true,
             skip_dirs: &[],
+            max_entries: None,
         }
     }
 }
@@ -319,6 +397,10 @@ pub struct Walk {
     exhausted: bool,
     depth_exhausted: Option<usize>,
     failure: Option<ToolFailure>,
+    /// R2 (B4, WP18): set when the walk stopped early at the cooperative
+    /// [`WalkOptions::max_entries`] cap (distinct from the WP14 `exhausted`
+    /// walk-safety limit, which is a `walk_limit` refusal).
+    pub tool_entry_stop: bool,
 }
 
 /// An owned, already-authorized read handle to an in-root object.
@@ -1482,12 +1564,24 @@ impl FilesystemAuthority {
             if descend {
                 subdirs.push(child_rel);
             }
+            // R2 (B4, WP18): stop the walk once it has collected more than the
+            // cooperative entry cap, so `--tool-max-entries` bounds the walk
+            // itself (not a post-hoc count). One past the cap lets the caller's
+            // charge report a consumed total that exceeds the ceiling.
+            if opts.max_entries.is_some_and(|cap| walk.entries.len() > cap) {
+                walk.tool_entry_stop = true;
+                break;
+            }
         }
         // SAFETY: `dirp` is open and is closed exactly once here.
         unsafe { libc::closedir(dirp) };
 
         for sub in subdirs {
-            if walk.exhausted || walk.depth_exhausted.is_some() || walk.failure.is_some() {
+            if walk.exhausted
+                || walk.depth_exhausted.is_some()
+                || walk.failure.is_some()
+                || walk.tool_entry_stop
+            {
                 break;
             }
             self.walk_dir(&sub, depth + 1, max_depth, opts, walk, budget);

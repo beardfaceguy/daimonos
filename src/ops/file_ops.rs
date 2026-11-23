@@ -14,6 +14,23 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
         None => return Response::err(3, "read requires path in 'p'"),
     };
 
+    // R2 (B4, FR-19): refuse by file size BEFORE reading when the size alone
+    // exceeds the remaining byte allowance, so a budget bounds the bytes read
+    // rather than only reclassifying a completed read. Charging the exact
+    // content length still happens after the read for files that pass.
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) => {
+            if let Err(failure) =
+                session.budget_precheck_bytes(meta.len(), op.p.as_deref().unwrap_or("read_file"))
+            {
+                return failure.into_response("read_file");
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Response::err(1, &format!("not found: {}", path.display()))
+        }
+        Err(e) => return Response::err(4, &format!("io: {e}")),
+    }
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -23,6 +40,19 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
     };
     if let Some(index) = &session.index {
         index.observe_path(&path).await;
+    }
+    // FR-19 F2 (WP18, ADR-031): a read that completed after the deadline is a
+    // timeout, not a late success with content; check before building a result.
+    if let Err(failure) = session.budget_check_deadline(op.p.as_deref().unwrap_or("read_file")) {
+        return failure.into_response("read_file");
+    }
+    // FR-19 (WP18, ADR-031): charge the logical file content read before
+    // producing any result. A byte-ceiling hit returns tool_input_limit with no
+    // partial content (output truncation is a separate mechanism).
+    if let Err(failure) =
+        session.budget_charge_bytes(content.len() as u64, op.p.as_deref().unwrap_or("read_file"))
+    {
+        return failure.into_response("read_file");
     }
 
     let total_lines = content.lines().count();
@@ -114,6 +144,12 @@ async fn read_confined(session: &mut Session, op: &Op) -> Response {
         Ok(Err(error)) => return Response::err(4, &format!("io: {error}")),
         Err(error) => return Response::err(4, &format!("io: {error}")),
     };
+    // FR-19 (WP18, ADR-031): charge logical file content for confined reads too.
+    if let Err(failure) =
+        session.budget_charge_bytes(content.len() as u64, op.p.as_deref().unwrap_or("read_file"))
+    {
+        return failure.into_response("read_file");
+    }
     let total_lines = content.lines().count();
     let offset = op.n.unwrap_or(0).max(0) as usize;
     let limit = op.n2.unwrap_or(0);
@@ -431,9 +467,31 @@ pub async fn ls(session: &Session, op: &Op) -> Response {
         type_filter: op.n2,
     };
 
+    // R2 (B4, FR-19, ADR-031): charge each entry INSIDE the walk and STOP at
+    // the ceiling, so an entry budget bounds the directory walk rather than
+    // walking the whole tree and reclassifying afterwards. The deadline is
+    // checked per entry too, so a bare deadline also stops a huge walk. A hit
+    // returns tool_input_limit (D56) / tool_timeout with no partial listing.
+    let budget = session.tool_budget();
     let mut entries = Vec::new();
-    if let Err(e) = ls_recurse(&path, &path, depth, &opts, &mut entries).await {
-        return Response::err(4, &format!("ls: {e}"));
+    let mut walked = 0u64;
+    match ls_recurse(
+        &path,
+        &path,
+        depth,
+        &opts,
+        &mut entries,
+        &mut walked,
+        budget.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(WalkStop::Io(e)) => return Response::err(4, &format!("ls: {e}")),
+        Err(WalkStop::Budget(hit)) => {
+            session.note_budget_hit(&hit);
+            return hit.into_failure(Some("ls")).into_response("ls");
+        }
     }
 
     entries.sort_by(|a, b| {
@@ -475,6 +533,12 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
         op.q.as_deref()
             .and_then(|pattern| glob::Pattern::new(pattern).ok());
     let filter = op.n2;
+    // R2 (B4, WP18): cap the confined walk at the remaining entry allowance so
+    // `--tool-max-entries` bounds the walk itself; `None` keeps it unbounded.
+    let entry_cap = session
+        .tool_budget()
+        .and_then(|b| b.entry_remaining())
+        .map(|remaining| remaining as usize);
     let result = tokio::task::spawn_blocking(move || {
         // WP14: honor no-follow for the explicit scope so a symlink named as
         // the ls root is refused with its target, never listed through.
@@ -488,6 +552,7 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
                 follow_symlinks: !authority.no_follow(),
                 include_hidden: show_all,
                 skip_dirs: SKIP_DIRS,
+                max_entries: entry_cap,
             },
         )?;
         Ok::<_, crate::path_policy::ToolFailure>((base, walk))
@@ -503,6 +568,16 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
         Err(error) => return Response::err(4, &format!("ls: {error}")),
     };
     let (skipped, skipped_links) = walk.skipped_summary();
+    // FR-19 (WP18, ADR-031): charge directory entries walked on the confined
+    // path too (entries visited plus those skipped by the walk). No-op when no
+    // entry budget is set.
+    let walked = walk.entries.len() as u64 + skipped as u64 + skipped_links as u64;
+    if let Err(failure) = session.budget_check_deadline("ls") {
+        return failure.into_response("ls");
+    }
+    if let Err(failure) = session.budget_charge_entries(walked, "ls") {
+        return failure.into_response("ls");
+    }
     let mut entries = Vec::new();
     for entry in walk.entries {
         let Ok(relative) = entry.relative_path.strip_prefix(&base) else {
@@ -548,22 +623,46 @@ async fn ls_confined(session: &Session, op: &Op) -> Response {
     Response::ok(response)
 }
 
+/// R2 (B4): why a bounded `ls` walk stopped. `Io` is a filesystem error;
+/// `Budget` is a cooperative tool-budget hit (entry ceiling or deadline) raised
+/// MID-walk so a huge tree is not walked to completion.
+enum WalkStop {
+    Io(String),
+    Budget(crate::tool_budget::BudgetHit),
+}
+
 async fn ls_recurse(
     root: &std::path::Path,
     path: &std::path::Path,
     depth: usize,
     opts: &LsOpts<'_>,
     entries: &mut Vec<serde_json::Value>,
-) -> Result<(), String> {
+    walked: &mut u64,
+    budget: Option<&std::sync::Arc<crate::tool_budget::ToolBudget>>,
+) -> Result<(), WalkStop> {
     let mut dir = tokio::fs::read_dir(path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+        WalkStop::Io(if e.kind() == std::io::ErrorKind::NotFound {
             format!("not found: {}", path.display())
         } else {
             format!("{e}")
-        }
+        })
     })?;
 
     while let Ok(Some(entry)) = dir.next_entry().await {
+        // FR-19 (WP18, ADR-031): every directory entry visited counts, before
+        // any hidden/skip/type/glob filter, so the charged input is honest.
+        *walked += 1;
+        // R2 (B4): check the deadline and charge this entry BEFORE doing any
+        // per-entry work, and STOP the walk on a hit so the ceiling truly
+        // bounds the walk. No-op when no budget is active.
+        if let Some(b) = budget {
+            if let Err(hit) = b.check_deadline() {
+                return Err(WalkStop::Budget(hit));
+            }
+            if let Err(hit) = b.charge_entries(1) {
+                return Err(WalkStop::Budget(hit));
+            }
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         if !opts.show_all && name.starts_with('.') {
             continue;
@@ -630,7 +729,22 @@ async fn ls_recurse(
         }
 
         if is_dir && depth > 1 {
-            let _ = Box::pin(ls_recurse(root, &entry.path(), depth - 1, opts, entries)).await;
+            // Propagate a budget stop out of the recursion so the whole walk
+            // ends at the ceiling (an I/O error in a subdir is still skipped).
+            match Box::pin(ls_recurse(
+                root,
+                &entry.path(),
+                depth - 1,
+                opts,
+                entries,
+                walked,
+                budget,
+            ))
+            .await
+            {
+                Ok(()) | Err(WalkStop::Io(_)) => {}
+                Err(stop @ WalkStop::Budget(_)) => return Err(stop),
+            }
         }
     }
 
@@ -922,6 +1036,11 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
     let workspace = session.workspace.clone();
     // D08 (ADR-021, FR-09): explicit-only runs let no implicit ignore file steer the walk.
     let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
+    // FR-19 (WP18, ADR-031): hand the shared budget into the blocking worker so
+    // the worker itself meters the bytes it SCANS (not the bytes it returns)
+    // and checks the deadline per read chunk, stopping mid-scan. `None` keeps
+    // the legacy fast path byte-for-byte.
+    let budget = session.tool_budget();
 
     let result = tokio::task::spawn_blocking(move || {
         grep_blocking(
@@ -931,6 +1050,7 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
             max,
             file_glob.as_deref(),
             apply_ignore_files,
+            budget,
         )
     })
     .await;
@@ -945,9 +1065,18 @@ pub async fn grep(session: &Session, op: &Op) -> Response {
                     .collect::<Vec<_>>();
                 index.observe_paths(observed).await;
             }
+            // A scan that completed exactly at the deadline is a timeout, not a
+            // late success (FR-19 F2). Bytes were already charged while reading.
+            if let Err(failure) = session.budget_check_deadline("search") {
+                return failure.into_response("search");
+            }
             Response::ok(json!({"matches": matches}))
         }
-        Ok(Err(e)) => Response::err(4, &format!("grep: {e}")),
+        Ok(Err(GrepStop::Budget(hit))) => {
+            session.note_budget_hit(&hit);
+            hit.into_failure(Some("search")).into_response("search")
+        }
+        Ok(Err(GrepStop::Io(e))) => Response::err(4, &format!("grep: {e}")),
         Err(e) => Response::err(4, &format!("grep task: {e}")),
     }
 }
@@ -982,11 +1111,42 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
     // even under confinement (--confine-paths), so a hostile ignore file cannot
     // steer confined evidence grep.
     let apply_ignore_files = session.cfg.discovery_policy.allows_implicit();
+    // FR-19 F1/F2 (ADR-031): meter scanned bytes and check the deadline inside
+    // the confined blocking worker too. `None` keeps the legacy path.
+    let budget = session.tool_budget();
     let result = tokio::task::spawn_blocking(move || {
         let mut searcher = Searcher::new();
+        let budget_hit: std::cell::RefCell<Option<crate::tool_budget::BudgetHit>> =
+            std::cell::RefCell::new(None);
         let mut scan = |file: std::fs::File,
                         relative: String,
                         matches: &mut Vec<serde_json::Value>| {
+            if let Some(b) = &budget {
+                if let Err(hit) = b.check_deadline() {
+                    *budget_hit.borrow_mut() = Some(hit);
+                    return false;
+                }
+                let mut reader =
+                    crate::tool_budget::BudgetedReader::new(file, std::sync::Arc::clone(b));
+                let ok = searcher
+                    .search_reader(
+                        &matcher,
+                        &mut reader,
+                        UTF8(|line_num, line| {
+                            if matches.len() < max {
+                                matches.push(
+                                    json!({"f": relative, "l": line_num, "t": line.trim_end()}),
+                                );
+                            }
+                            Ok(matches.len() < max)
+                        }),
+                    )
+                    .is_ok();
+                if let Some(hit) = reader.hit() {
+                    *budget_hit.borrow_mut() = Some(hit.clone());
+                }
+                return ok;
+            }
             searcher
                 .search_reader(
                     &matcher,
@@ -1017,6 +1177,9 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
                     .to_string_lossy()
                     .to_string();
                 let skipped = usize::from(!scan(start.into_file(), relative, &mut matches));
+                if let Some(hit) = budget_hit.borrow_mut().take() {
+                    return Err(hit.into_failure(Some("search")));
+                }
                 return Ok::<_, crate::path_policy::ToolFailure>((matches, skipped));
             }
             return Ok((matches, 0));
@@ -1068,12 +1231,23 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
             if !scan(authorized.into_file(), relative, &mut matches) {
                 skipped += 1
             }
+            if budget_hit.borrow().is_some() {
+                break;
+            }
+        }
+        if let Some(hit) = budget_hit.borrow_mut().take() {
+            return Err(hit.into_failure(Some("search")));
         }
         Ok::<_, crate::path_policy::ToolFailure>((matches, skipped))
     })
     .await;
     match result {
         Ok(Ok((matches, skipped))) => {
+            // Bytes were charged while scanning; a scan that finished exactly at
+            // the deadline is still a timeout, not a late success (FR-19 F2).
+            if let Err(failure) = session.budget_check_deadline("search") {
+                return failure.into_response("search");
+            }
             let mut value = json!({"matches": matches});
             if skipped > 0 {
                 value["skipped"] = json!(skipped)
@@ -1087,6 +1261,13 @@ async fn grep_confined(session: &Session, op: &Op) -> Response {
     }
 }
 
+/// How a budgeted grep worker stopped: an I/O/regex error, or a cooperative
+/// tool-budget hit the worker detected while scanning (FR-19 F1/F2, ADR-031).
+pub(crate) enum GrepStop {
+    Io(String),
+    Budget(crate::tool_budget::BudgetHit),
+}
+
 fn grep_blocking(
     pattern: &str,
     root: &Path,
@@ -1094,13 +1275,14 @@ fn grep_blocking(
     max: usize,
     file_glob: Option<&str>,
     apply_ignore_files: bool,
-) -> Result<Vec<serde_json::Value>, String> {
+    budget: Option<std::sync::Arc<crate::tool_budget::ToolBudget>>,
+) -> Result<Vec<serde_json::Value>, GrepStop> {
     use grep_regex::RegexMatcher;
     use grep_searcher::sinks::UTF8;
     use grep_searcher::Searcher;
     use ignore::WalkBuilder;
 
-    let matcher = RegexMatcher::new(pattern).map_err(|e| format!("regex: {e}"))?;
+    let matcher = RegexMatcher::new(pattern).map_err(|e| GrepStop::Io(format!("regex: {e}")))?;
     let mut searcher = Searcher::new();
     let mut matches = Vec::new();
 
@@ -1142,6 +1324,42 @@ fn grep_blocking(
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
+
+        // FR-19 F1/F2 (ADR-031): when a budget is active, the worker itself
+        // meters the bytes it SCANS and checks the deadline at a bounded step
+        // (between files, and inside a large file per read chunk via
+        // BudgetedReader), stopping the scan the moment the ceiling or the
+        // deadline is hit. Without a budget the legacy search_path fast path is
+        // unchanged.
+        if let Some(budget) = &budget {
+            if let Err(hit) = budget.check_deadline() {
+                return Err(GrepStop::Budget(hit));
+            }
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            let mut reader =
+                crate::tool_budget::BudgetedReader::new(file, std::sync::Arc::clone(budget));
+            let _ = searcher.search_reader(
+                &matcher,
+                &mut reader,
+                UTF8(|line_num, line| {
+                    if matches.len() < max {
+                        matches.push(serde_json::json!({
+                            "f": rel,
+                            "l": line_num,
+                            "t": line.trim_end(),
+                        }));
+                    }
+                    Ok(matches.len() < max)
+                }),
+            );
+            if let Some(hit) = reader.hit() {
+                return Err(GrepStop::Budget(hit.clone()));
+            }
+            continue;
+        }
 
         let _ = searcher.search_path(
             &matcher,

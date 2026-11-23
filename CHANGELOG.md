@@ -9,6 +9,26 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **Cooperative tool budgets (FR-19, ADR-031).** Three default-off, global
+  options limit one top-level tool call: `--tool-timeout-ms N` (a deadline),
+  `--tool-input-bytes N` (a limit for the file and git content that the call
+  reads or scans), and `--tool-max-entries N` (a limit for the directory
+  entries that the call walks; the name is proposed).
+  - A deadline hit returns `tool_timeout`. A byte or entry hit returns
+    `tool_input_limit` with the limit, the configured value, and the consumed
+    value. A hit returns no partial result and writes the `limit_hit` audit
+    event.
+  - `search` in content mode charges the bytes that it scans and stops during
+    the scan. `ls` stops the walk at the entry limit.
+  - `batch` and `execute_script` share one budget with their children.
+  - A subprocess of `exec`, `git_read`, or a plugin is stopped at the deadline
+    with its process group.
+  - Under an input or entry limit, a tool that cannot meter its input is
+    refused with `tool_policy_unsupported`: `exec`, the process plugins, the
+    index search, and each tool that is not on the admission list.
+    `tool_pipeline` is refused under each budget option. A budget option with
+    `--worker-config` is refused at startup (exit `2`).
+  - Without the options, each tool is unchanged.
 - **`--capability-probe-payload` (FR-04).** A default-off `agent --print`
   option (ADR-027) that sends exactly one unretried capability probe before any
   evidence tool runs, proving the endpoint can drive the same final-answer tool

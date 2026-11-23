@@ -533,6 +533,12 @@ async fn capture_exec(
     env: &HashMap<String, String>,
     on_progress: Option<&ExecProgressCallback<'_>>,
 ) -> Response {
+    // FR-19 (WP18, ADR-031): if the cooperative budget's deadline already
+    // passed, refuse before spawning anything rather than start work we would
+    // immediately have to stop. No budget / no deadline is a no-op.
+    if let Err(failure) = session.budget_check_deadline("exec") {
+        return failure.into_response("exec");
+    }
     let mut command = build_command(cmd, args);
     command.current_dir(cwd);
     crate::managed_process::apply_environment(&mut command, &session.cfg.process, env);
@@ -541,17 +547,24 @@ async fn capture_exec(
             callback(ExecProgress::Output(text));
         }
     });
-    let output = match crate::managed_process::capture(
+    // FR-19 (WP18, ADR-031): hand the budget's remaining deadline to the
+    // managed-process path so the exec is stopped (TERM/grace/KILL, whole
+    // process group reaped) at the sooner of it and the process default. A
+    // budget-deadline stop becomes a typed `tool_timeout` below; `None` keeps
+    // legacy behavior exactly.
+    let budget_deadline = session.budget_remaining();
+    let (output, budget_fired) = match crate::managed_process::capture_budgeted(
         &mut command,
         &session.cfg.process,
         progress
             .as_ref()
             .map(|callback| callback as &crate::managed_process::ProgressCallback<'_>),
         None,
+        budget_deadline,
     )
     .await
     {
-        Ok(output) => output,
+        Ok(result) => result,
         Err(error) => {
             if let Some(callback) = on_progress {
                 callback(ExecProgress::Exit {
@@ -567,6 +580,14 @@ async fn capture_exec(
             code: output.status.code(),
             signal: exit_signal(&output.status),
         });
+    }
+    // FR-19 (WP18, ADR-031): a cooperative-budget deadline stop returns the
+    // typed `tool_timeout` with no partial exec result, distinct from the
+    // legacy process-timeout (exit 6) path below.
+    if budget_fired {
+        if let Some(failure) = session.budget_timeout_failure("exec") {
+            return failure.into_response("exec");
+        }
     }
     if output.timed_out {
         return Response::err(

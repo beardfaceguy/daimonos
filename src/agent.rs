@@ -1743,12 +1743,38 @@ async fn run_inner(
                     // final-answer tool is required to be on the list at startup
                     // and is intercepted earlier, so it is never refused here.
                     let policy_refused = !session.lock().await.policy.allows(&name);
+                    // R1 (B1, D60): the agent/chat/ACP loop is this frontend's own
+                    // dispatch boundary. Opcode tools reach `tool_facade::invoke`
+                    // directly (never `mcp::dispatch_tool_inner`), and remote
+                    // `mcp__*` tools reach the remote hook, so the input/entry
+                    // budget allow-list gate is enforced here too, before any
+                    // worker/native/local/remote dispatch. A tool not on the
+                    // allow-list (edit_file, snapshot, kgl_*, a plugin, an outbound
+                    // mcp__* tool, or any later name) is refused with the reviewed
+                    // `tool_policy_unsupported`; a bare `--tool-timeout-ms` refuses
+                    // nothing here. (A budgeted worker run is also refused at
+                    // startup, so the worker branch is unreachable under a budget;
+                    // this gate covers it defensively.)
+                    let budget_refusal = session.lock().await.budget_input_refusal(&name);
                     let (mut content, is_error, mut outcome) = if policy_refused {
                         let content = serde_json::json!({
                             "code": crate::run_policy::CODE_TOOL_NOT_ALLOWED,
                             "message": format!(
                                 "tool {name} is not on the explicit tool allowlist"
                             ),
+                            "tool": name.clone(),
+                            "retryable": false,
+                        })
+                        .to_string();
+                        let outcome = ToolOutcome {
+                            request_tokens_est: crate::analytics::estimate_tokens(request_chars),
+                            ..ToolOutcome::default()
+                        };
+                        (content, true, Some(outcome))
+                    } else if let Some(failure) = budget_refusal {
+                        let content = serde_json::json!({
+                            "code": failure.code,
+                            "message": failure.message,
                             "tool": name.clone(),
                             "retryable": false,
                         })
@@ -2147,6 +2173,19 @@ async fn run_inner(
                             tool_started.elapsed().as_millis() as u64,
                             None,
                         );
+                        // WP18 (FR-19 F5, ADR-031): a cooperative tool-budget
+                        // limit hit also writes the reserved `limit_hit` event
+                        // with the limit name, the tool, and the configured and
+                        // consumed values. R3 (B3): read the hit IN-BAND from the
+                        // session (set only by the budget code on a genuine hit)
+                        // rather than parsing the result text, which a tool could
+                        // forge by echoing the JSON shape.
+                        if let Some((limit, configured, consumed)) =
+                            session.lock().await.take_budget_hit()
+                        {
+                            let _ =
+                                audit.record_limit_hit(&limit, Some(&name), configured, consumed);
+                        }
                         if audit.poisoned() {
                             terminate_reason = "audit_write_failed";
                             terminate = true;

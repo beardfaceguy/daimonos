@@ -194,6 +194,13 @@ pub struct Config {
     /// deserialized from a config file; set once at startup from the CLI.
     #[serde(skip)]
     pub discovery_policy: crate::discovery_policy::DiscoveryPolicy,
+    /// `--tool-timeout-ms` / `--tool-input-bytes` / `--tool-max-entries`
+    /// (FR-19, WP18, ADR-031): the caller's cooperative per-call tool budgets.
+    /// Caller-owned; never deserialized from workspace/user config, so nothing
+    /// the caller did not pass explicitly can set or widen a limit. All-absent
+    /// keeps legacy behavior (no budget installed).
+    #[serde(skip)]
+    pub tool_budget: crate::tool_budget::ToolBudgetConfig,
     #[serde(default)]
     pub tools: HashMap<String, ToolConfig>,
 }

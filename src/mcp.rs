@@ -438,6 +438,27 @@ async fn dispatch_tool_inner(
     }
     session.used_tools.insert(name.to_string());
 
+    // === FR-19 F3 (WP18, ADR-031): ONE place installs the operation budget and
+    // the deadline scope for EVERY registry tool (facade ops + plugins +
+    // git_read), not one match arm per tool. A composite child inherits the
+    // parent's budget (owned == false). A process-starting plugin whose logical
+    // input cannot be metered is refused when an input/entry budget is enabled
+    // (never silently exempted). The absolute deadline is threaded into
+    // managed_process so every subprocess group is reaped AT the deadline; a
+    // call whose deadline passed returns tool_timeout, never a late success. All
+    // a no-op when no budget option is set. ===
+    let budget_owned = session.begin_tool_operation();
+    // R1 (B1, D60): the input/entry allow-list gate. Every registry tool that
+    // is not on `tool_budget::tool_input_budget_admitted` is refused here
+    // (`tool_policy_unsupported`) when an input/entry budget is set, so a
+    // process plugin, snapshot, kgl_*, edit_file, or any later-added name is
+    // never silently exempted. A bare deadline refuses nothing here.
+    if let Some(failure) = session.budget_input_refusal(name) {
+        session.end_tool_operation(budget_owned);
+        return response_to_result(failure.into_response(name));
+    }
+    let budget_remaining = session.budget_remaining();
+    let dispatched = crate::managed_process::with_budget_deadline(budget_remaining, async {
     // Registry-based dispatch: route ops-backed tools through the facade.
     if let Some(resp) = tool_facade::invoke(session, name, args).await {
         session.last_response_meta = resp.meta.clone();
@@ -794,10 +815,16 @@ async fn dispatch_tool_inner(
 
         "git_read" => {
             let command = get_str(args, "command").unwrap_or_default();
+            // FR-19 (WP18, ADR-031): git_read runs inside the single budget +
+            // deadline scope installed above, so the git child's process group
+            // is reaped AT the deadline and a passed deadline becomes a typed
+            // tool_timeout at the post-dispatch check. Here we only meter the
+            // git object content it returned (the PM counts this as logical
+            // input): a byte-ceiling hit is tool_input_limit with no partial.
             let Some(registry) = &session.tool_registry else {
                 return err_text(serde_json::json!({"error":{"kind":"unavailable","message":"tool registry unavailable"}}).to_string());
             };
-            match registry
+            let run_result = registry
                 .run(
                     "git_read",
                     &command,
@@ -806,10 +833,14 @@ async fn dispatch_tool_inner(
                     None,
                     Some(args),
                 )
-                .await
-            {
+                .await;
+            match run_result {
                 Ok(result) => {
                     let text = result.output.to_string();
+                    if let Err(failure) = session.budget_charge_bytes(text.len() as u64, "git_read")
+                    {
+                        return response_to_result(failure.into_response("git_read"));
+                    }
                     if result.exit_code == 0 {
                         ok_text(text)
                     } else {
@@ -1158,6 +1189,19 @@ async fn dispatch_tool_inner(
 
         _ => Err(CallToolError::unknown_tool(name.to_string())),
     }
+    })
+    .await;
+    // FR-19 F2/F3 (WP18, ADR-031): a call whose deadline passed is a timeout,
+    // not a late result — even when the work finished just after the deadline,
+    // and even when a deadline-stopped subprocess surfaced as a plugin error
+    // string. Reclassify to the typed tool_timeout whenever the deadline has
+    // passed; otherwise keep the original result (success or a genuine error).
+    let dispatched = match session.budget_check_deadline(name) {
+        Ok(()) => dispatched,
+        Err(failure) => response_to_result(failure.into_response(name)),
+    };
+    session.end_tool_operation(budget_owned);
+    dispatched
 }
 
 fn extract_result_text(result: &CallToolResult) -> String {
@@ -1488,6 +1532,12 @@ impl ServerHandler for DaimonosHandler {
             let observe_on = crate::kgl::observe::enabled();
             let mut observed_ops: Vec<(String, Value)> = Vec::new();
 
+            // FR-19 (WP18, ADR-031): install ONE shared operation budget for
+            // the whole batch, so every sub-op (dispatched via dispatch_tool,
+            // which re-enters ops::dispatch) inherits the same remaining
+            // allowance and absolute deadline instead of each getting a fresh
+            // top-level budget. No-op when no budget option is set.
+            let batch_budget_owned = session.begin_tool_operation();
             let mut results = Vec::with_capacity(ops.len());
             for (i, op_val) in ops.iter().enumerate() {
                 let tool = match op_val.get("tool").and_then(|v| v.as_str()) {
@@ -1527,6 +1577,9 @@ impl ServerHandler for DaimonosHandler {
                 }
             }
 
+            if batch_budget_owned {
+                session.end_tool_operation(true);
+            }
             let payload = serde_json::to_string(&results).unwrap_or_default();
             // Read the dirty flag before the observe path may drop the lock.
             let tools_changed = session.take_tools_changed();
@@ -1555,6 +1608,13 @@ impl ServerHandler for DaimonosHandler {
             return bounded_text_tool_result(&output_cfg, "batch", payload, false).await;
         }
 
+        // FR-19 (WP18): a top-level call holds the session lock from here to
+        // its result, and each call clears the budget that it installed. So no
+        // budget of an earlier call can be on the session here.
+        debug_assert!(
+            session.tool_budget.is_none(),
+            "a tool budget leaked into the next top-level call"
+        );
         let result = dispatch_tool(&mut session, &params.name, &args).await;
         // Read the dirty flag before the observe path may drop the lock.
         let tools_changed = session.take_tools_changed();
@@ -1655,7 +1715,21 @@ async fn run_execute_script(
         .to_string();
     let timeout_secs =
         crate::script::bounded_timeout_secs(args.get("timeout").and_then(Value::as_i64));
-    script::execute(&code, session, std::time::Duration::from_secs(timeout_secs)).await
+    // FR-19 F4 (WP18, ADR-031): execute_script is a composite that owns ONE
+    // shared operation budget for all its inner ops. That budget is created and
+    // held inside the script context (src/script.rs) and installed on the
+    // session only inside each inner per-op lock, then cleared on release — it
+    // is deliberately NOT installed on the shared session here, because
+    // run_execute_script releases the lock while the script runs, and leaving
+    // it on the session across that window would let a concurrent top-level MCP
+    // call inherit it (wrong deadline/allowance). No-op when no budget option
+    // is set.
+    script::execute(
+        &code,
+        session.clone(),
+        std::time::Duration::from_secs(timeout_secs),
+    )
+    .await
 }
 
 /// Convert the Send-safe script outcome only after all handler awaits finish;
@@ -1765,6 +1839,7 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
                     skip_dirs: &["target", "node_modules"],
                     // WP14 (FR-12): never descend through a link under no-follow.
                     follow_symlinks: !authority.no_follow(),
+                    max_entries: None,
                 },
             ) {
                 let mut dirs: Vec<_> = walk
@@ -3489,5 +3564,41 @@ mod tests {
                 stats.total_saved_tokens
             );
         }
+    }
+
+    /// FR-19 (WP18, review B2): a call that ends early because the session
+    /// has no tool registry leaves no budget on the session. The registry is
+    /// present in each process frontend, so only a Rust test reaches this path.
+    #[tokio::test]
+    async fn budgeted_git_read_without_a_registry_leaves_no_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("probe.txt"), "b".repeat(60)).unwrap();
+        let mut cfg = Config::default();
+        cfg.tool_budget.input_bytes = Some(100);
+        let mut session = Session::new(dir.path().to_path_buf(), Arc::new(cfg));
+        assert!(session.tool_registry.is_none());
+
+        // A 60-byte read first, so a leaked budget would hold 60 bytes.
+        let first = dispatch_tool(&mut session, "read_file", &json!({"path": "probe.txt"}))
+            .await
+            .unwrap();
+        assert_ne!(first.is_error, Some(true));
+        assert!(session.tool_budget.is_none());
+
+        let unavailable = dispatch_tool(&mut session, "git_read", &json!({"command": "log"}))
+            .await
+            .unwrap();
+        assert_eq!(unavailable.is_error, Some(true));
+        assert!(extract_result_text(&unavailable).contains("tool registry unavailable"));
+        assert!(
+            session.tool_budget.is_none(),
+            "the early return must clear the budget"
+        );
+
+        // The next call has a fresh allowance: 60 bytes fit under 100.
+        let next = dispatch_tool(&mut session, "read_file", &json!({"path": "probe.txt"}))
+            .await
+            .unwrap();
+        assert_ne!(next.is_error, Some(true), "{}", extract_result_text(&next));
     }
 }

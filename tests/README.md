@@ -196,3 +196,28 @@ The keyword classification (reference vs data vs schema-position vs unknown)
 and the duplicate-`$id`/anchor refusal are proven at the
 `src/schema_contract.rs` unit seam, including a table that routes a cycle
 through every 2020-12 schema keyword.
+
+### WP18 cooperative tool budgets (`tests/test_tool_budgets.py`)
+
+Process-level acceptance tests for FR-19 (ADR-031): the three default-off
+budget options drive a real `daimonos` MCP process (and a real `agent --print`
+process for the audit/`--output json`/worker cases). Timing tests (AC-19.1) use
+a deadline of 1000–1500 ms and assert an upper bound of several seconds while
+keeping the data small, so a slower CI runner still stops promptly without
+flaking; each bound and its reason are stated in the test docstring. The
+`exec` and `git_read` reap proofs follow the method of
+`tests/test_worker_isolation.py::test_r6_stalled_worker_is_force_reaped`
+(scanning `/proc` for a unique marker) to show no child or grandchild outlives
+the stop; the `git_read` proof installs a `$GIT_DIR`-gated fake `git` shim so
+repo discovery still uses the real git while an operation call hangs. These
+tests need a Unix host with `/proc` and a real `git`; a skip is not a pass.
+
+`tests/test_tool_budgets.py` (WP18, FR-19): process-level cooperative tool
+budget tests — scanned-byte metering for content search, native deadline checks
+(read_file/ls/both search modes), plugin deadline+reap (curl, git), the
+`tool_policy_unsupported` refusals (each tool that is not on the admission
+list, the index search, the pipeline), the entry limit that stops the `ls`
+walk, the budget that does not leak into the next call or into a concurrent
+call, the
+AC-19.1 large-tree timeout bound, and the `limit_hit` audit event (by
+kind+fields). AC-19.1 writes 10000 small files and stays under ~10 s.
