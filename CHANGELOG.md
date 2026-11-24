@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-24
+
 ### Security
 
 - **The agent frontends do not load the workspace `daimonos.toml`** (ADR-039).
