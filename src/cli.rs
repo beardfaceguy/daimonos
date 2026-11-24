@@ -369,6 +369,16 @@ impl RuntimeMode {
     pub fn is_mcp_stdio(&self) -> bool {
         matches!(self, Self::McpStdio)
     }
+
+    /// A mode that runs a model with tools: `agent`, `chat`, `acp`, and the
+    /// session daemon. These modes do not load `<workspace>/daimonos.toml`
+    /// (ADR-039).
+    pub fn is_agent_frontend(&self) -> bool {
+        matches!(
+            self,
+            Self::Agent | Self::Chat | Self::Acp | Self::SessionDaemon
+        )
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -573,6 +583,44 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-039: exactly the four modes that run a model with tools are agent
+    /// frontends. The match has no wildcard, so a new mode does not compile
+    /// until it is classified here.
+    #[test]
+    fn agent_frontends_are_exactly_the_modes_that_run_a_model() {
+        let modes = [
+            RuntimeMode::Agent,
+            RuntimeMode::Chat,
+            RuntimeMode::Acp,
+            RuntimeMode::SessionDaemon,
+            RuntimeMode::Session,
+            RuntimeMode::McpStdio,
+            RuntimeMode::McpSocket(PathBuf::from("/tmp/x.sock")),
+            RuntimeMode::McpConfig,
+            RuntimeMode::McpAuth,
+            RuntimeMode::Daemon,
+            RuntimeMode::Stats,
+            RuntimeMode::ToolContract,
+        ];
+        for mode in modes {
+            let expected = match mode {
+                RuntimeMode::Agent
+                | RuntimeMode::Chat
+                | RuntimeMode::Acp
+                | RuntimeMode::SessionDaemon => true,
+                RuntimeMode::Session
+                | RuntimeMode::McpStdio
+                | RuntimeMode::McpSocket(_)
+                | RuntimeMode::McpConfig
+                | RuntimeMode::McpAuth
+                | RuntimeMode::Daemon
+                | RuntimeMode::Stats
+                | RuntimeMode::ToolContract => false,
+            };
+            assert_eq!(mode.is_agent_frontend(), expected, "{mode:?}");
+        }
+    }
 
     #[test]
     fn ignore_config_files_is_global_and_default_off() {
