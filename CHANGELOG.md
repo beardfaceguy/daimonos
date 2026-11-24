@@ -7,6 +7,26 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-24
+
+This release has the reviewer-runtime options (#282), the agent env file and
+ACP signal fixes (#288), and a security fix for the workspace `agent.env`.
+
+### Security
+
+- **The workspace `agent.env` cannot set connection, approval, or network
+  settings** (ADR-038). `<workspace>/agent.env` comes with the workspace, which
+  can be a repository of another party, and it ranked above the user file. It
+  could set the provider endpoint that receives the requests and the API key
+  of the user file, the approval mode and tool lists, and the proxy of the HTTP
+  client. These lines are now ignored and reported on stderr:
+  `DAIMONOS_AGENT_PROVIDER`, each `DAIMONOS_AGENT_*_BASE_URL` and
+  `DAIMONOS_AGENT_*_API_KEY`, `DAIMONOS_AGENT_ENV`, the approval settings, the
+  proxy and certificate variables, and the user directory variables (`HOME`,
+  `XDG_*_HOME`). Set them in
+  `~/.config/daimonos/agent.env`, in the file that `--agent-env` names, or in
+  the real environment. Versions up to 0.1.6 are affected.
+
 ### Added
 
 - **Cooperative tool budgets (FR-19, ADR-031).** Three default-off, global

@@ -319,6 +319,26 @@ startup: `<workspace>/agent.env`, then `~/.config/daimonos/agent.env`. They set
 only variables that the environment does not have. With `--state-dir` the home
 file is not read. With confinement only the workspace file is read.
 
+The workspace file is untrusted input: it comes with the workspace (ADR-038).
+These assignments in `<workspace>/agent.env` are ignored and reported on stderr:
+
+- Connection settings: `DAIMONOS_AGENT_PROVIDER`, each
+  `DAIMONOS_AGENT_*_BASE_URL`, and each `DAIMONOS_AGENT_*_API_KEY`.
+- The selector `DAIMONOS_AGENT_ENV`.
+- Approval settings: `DAIMONOS_AGENT_APPROVAL_MODE`,
+  `DAIMONOS_AGENT_ALLOWED_COMMANDS`, `DAIMONOS_AGENT_DENIED_COMMANDS`,
+  `DAIMONOS_AGENT_PERMISSION_MODE`, and `DAIMONOS_AGENT_PERMISSION_LIST`.
+- Proxy and certificate variables: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY`, `SSL_CERT_FILE`, and `SSL_CERT_DIR`.
+- User directory variables: `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
+  `XDG_DATA_HOME`, and `XDG_CACHE_HOME`.
+- Loader variables such as `LD_PRELOAD` and `PATH`, as before. These are
+  refused from the user file too.
+
+Each name is compared without letter case. Set them in the user file, in the
+file that `--agent-env` names, or in the real environment. Each other line of
+the workspace file applies, and tool child processes inherit it.
+
 When the file is selected explicitly, with `--agent-env` or with
 `$DAIMONOS_AGENT_ENV` in the real environment, a value from an implicit file
 ranks below the selected file (ADR-037):
@@ -336,8 +356,9 @@ CLI behavior flags > real environment DAIMONOS_AGENT_* values
   one stops at startup and names it.
 - Without an explicit selection, nothing changes: the selected file is the home
   file, and each process value overrides it.
-- A selector that an implicit file sets (`DAIMONOS_AGENT_ENV=...` in
-  `<workspace>/agent.env`) is not an explicit selection.
+- A selector that the user file sets (`DAIMONOS_AGENT_ENV=...` in
+  `~/.config/daimonos/agent.env`) is not an explicit selection. The workspace
+  file cannot set the selector.
 - The rule covers `DAIMONOS_AGENT_*` settings that the agent env file defines,
   and `DAIMONOS_SKILL_DIR`. Five variables are read from the process
   environment only, so a line in the selected file has no effect on them:
