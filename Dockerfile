@@ -27,7 +27,8 @@ COPY src ./src
 
 ARG SOURCE_COMMIT
 ARG VERSION
-RUN test "${#SOURCE_COMMIT}" = 40 && ! printf '%s' "$SOURCE_COMMIT" | grep -q '[^0-9a-f]' \
+RUN case "$SOURCE_COMMIT" in *[!0-9a-f]*) exit 1 ;; esac \
+ && test "${#SOURCE_COMMIT}" = 40 \
  && test -n "$VERSION" \
  && DAIMONOS_SOURCE_COMMIT="$SOURCE_COMMIT" cargo build --release --locked -j 1 \
  && strip target/release/daimonos \

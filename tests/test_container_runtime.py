@@ -22,10 +22,10 @@ def image():
     return subprocess.check_output(["docker", "image", "inspect", "--format={{.Id}}", name], text=True).strip()
 
 
-def restricted():
+def restricted(uid=12345):
     return ["docker", "run", "--pull=never", "--rm", "-i", "--read-only", "--network", "none", "--cap-drop", "ALL",
-            "--user", "12345:12345", "--security-opt", "no-new-privileges", "--tmpfs",
-            "/state:rw,noexec,nosuid,nodev,uid=12345,gid=12345,mode=0700"]
+            "--user", f"{uid}:{uid}", "--security-opt", "no-new-privileges", "--tmpfs",
+            f"/state:rw,noexec,nosuid,nodev,uid={uid},gid={uid},mode=0700"]
 
 
 def test_image_version_matches_pinned_checkout(image):
@@ -39,9 +39,9 @@ def test_image_version_matches_pinned_checkout(image):
     assert run.stdout.splitlines()[:2] == [f"daimonos {version}", f"source_commit {rev}"]
 
 
-def worker_args(workspace, image):
-    return [*restricted(), "--mount", f"type=bind,src={workspace},dst=/review,readonly", image,
-            "--workspace", "/review", "--state-dir", "/state", "--workspace-read-only", "--ignore-config-files", "mcp"]
+def worker_args(workspace, image, mount="/review", uid=12345):
+    return [*restricted(uid), "--mount", f"type=bind,src={workspace},dst={mount},readonly", image,
+            "--workspace", mount, "--state-dir", "/state", "--workspace-read-only", "--ignore-config-files", "mcp"]
 
 
 def mcp_exchange(argv, calls):
@@ -59,13 +59,14 @@ def mcp_exchange(argv, calls):
     return replies
 
 
-def test_restricted_stdio_reads_caller_workspace(image, tmp_path):
+@pytest.mark.parametrize("mount,uid", [("/review", 12345), ("/another-location", 23456)])
+def test_restricted_stdio_reads_caller_workspace(image, tmp_path, mount, uid):
     workspace = tmp_path / "mounted"
     workspace.mkdir(mode=0o755)
     fixture = workspace / "evidence.txt"
     fixture.write_text("from caller mount")
     fixture.chmod(0o444)
-    replies = mcp_exchange(worker_args(workspace, image), [
+    replies = mcp_exchange(worker_args(workspace, image, mount, uid), [
         ("tools/list", {}),
         ("tools/call", {"name": "read_file", "arguments": {"path": fixture.name}}),
         ("tools/call", {"name": "write_file", "arguments": {"path": fixture.name, "content": "changed"}}),
@@ -109,6 +110,10 @@ def test_model_calls_restricted_container_worker(image, daimonos_binary, tmp_pat
     provider = FakeProvider([tool_reply(name, {"path": fixture.name}), text_reply("done")])
     try:
         host = Harness(daimonos_binary, tmp_path, provider.port)
+        # The shared harness uses the literal key "test", which is also in the
+        # pytest mount path. Use a distinct synthetic key, not a weaker worker guard.
+        host.agent_env.write_text(host.agent_env.read_text().replace("DAIMONOS_AGENT_API_KEY=test\n",
+                                                                    "DAIMONOS_AGENT_API_KEY=wp12-fake-noncredential\n"))
         done = host.agent("--worker-config", str(manifest), "--output", "json", "read evidence",
                           global_args=["--tool-allowlist", str(selection)])
         assert done.returncode == 0, done.stderr
