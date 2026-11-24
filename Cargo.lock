@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "daimonos"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "agent-client-protocol",
  "allocative",
