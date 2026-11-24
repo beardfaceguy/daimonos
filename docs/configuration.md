@@ -1805,6 +1805,35 @@ Opt-in (FR-04 requirements 14–17 / ADR-027). `daimonos agent --print --capabil
 - **Audited.** With `--audit-path`, the verdict is recorded as one `probe_result` event (`status` `model_supported`/`model_unsupported`, plus `reason` on failure); the credential value never appears. No live credentialed endpoint is required. The probe request's `http_status`, `retry_index`, and the profile's `wire` are recorded on that same `probe_result` event (the probe is one request to the model endpoint). Its endpoint-reported token counts are recorded on that event as `usage` (the same `{input_tokens, output_tokens}` shape as `model_request.usage`, zero counts when the endpoint reports none). A failed probe also makes the terminal `run_end` record its `exit_code` 21 / `status` `model_unsupported`, matching the process exit. For the agent loop's own requests over the controlled transport, each `model_request` event carries the observed `http_status`, `retry_index`, and `wire`.
 
 Model-facing probe wording lives in `prompts/capability_probe.md` (the system-turn framing) and `prompts/capability_probe_directive.md` (the user-turn directive template, into which only the final-tool name and the payload are interpolated as data). See `src/capability_probe.rs` and ADR-027.
+## Restricted local container (FR-10)
+
+Build from a pinned Git tree, not a dirty worktree. The build can download base images, packages, and locked Cargo dependencies. It does not publish an image. Run these commands at the repository root (Docker, Git, and Python 3.11+):
+
+```sh
+rev=$(git rev-parse HEAD)
+version=$(git show "$rev:Cargo.toml" | python3 -c 'import sys,tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])')
+git archive "$rev" Dockerfile .dockerignore Cargo.toml Cargo.lock daimonos.default.toml src prompts |
+  docker build --build-arg SOURCE_COMMIT="$rev" --build-arg VERSION="$version" -t "daimonos-local:$rev" -
+docker run --rm --pull=never --network none "daimonos-local:$rev" --version
+```
+
+The OCI labels `org.opencontainers.image.version` and `org.opencontainers.image.revision` describe the executable. The MCP `serverInfo.version` still reports the package version. The tool contract has its own version. A native build without a supplied commit reports `source_commit unknown`; it does not query the runtime workspace.
+
+Start the worker with a private, writable state mount. The UID and GID of that mount must match the process. Mount only the evidence the worker should see. Keep model credentials and the Docker socket outside the container.
+
+```sh
+docker run --rm -i --pull=never --read-only --network none --cap-drop ALL \
+  --user 12345:12345 --security-opt no-new-privileges \
+  --mount "type=bind,src=$PWD,dst=/review,readonly" \
+  --tmpfs /state:rw,noexec,nosuid,nodev,uid=12345,gid=12345,mode=0700 \
+  "daimonos-local:$rev" --workspace /review --state-dir /state \
+  --workspace-read-only --ignore-config-files mcp
+```
+
+For `--worker-config`, use `docker` as the worker command and pass the arguments above as individual array entries. The host runs the model; the container serves the same MCP stdio protocol. Do not allocate a TTY. The no-argument image command still serves MCP in `/workspace`. A different workspace requires only CLI arguments, not an entrypoint override.
+
+To verify an existing local image against the current checkout, set `DAIMONOS_TEST_IMAGE=daimonos-local:$rev` and run `python3 -m pytest tests/test_container_runtime.py tests/test_cli_modes.py`. Without the variable, pytest skips the Docker checks. A skip is not a successful container check.
+
 ## Credential-free worker execution (`--worker-config`)
 
 Opt-in (FR-05 / ADR-028). `daimonos agent --worker-config <PATH>` makes a

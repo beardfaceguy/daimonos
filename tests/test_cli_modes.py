@@ -425,3 +425,19 @@ def test_session_daemon_recovers_socket_after_sigkill(daimonos_binary, tmp_path)
 
     assert not socket_path.exists()
     assert not instance_path.exists()
+
+
+def test_version_reports_build_identity_without_starting_services(daimonos_binary, tmp_path):
+    import re
+    import tomllib
+
+    package = tomllib.loads((Path(__file__).resolve().parents[1] / "Cargo.toml").read_text())["package"]["version"]
+    run = subprocess.run([daimonos_binary, "--version"], cwd=tmp_path,
+                         env={"HOME": str(tmp_path), "PATH": "", "DAIMONOS_SOURCE_COMMIT": "runtime-override"},
+                         text=True, capture_output=True, timeout=5)
+    assert run.returncode == 0 and not run.stderr, run.stderr
+    lines = run.stdout.splitlines()
+    assert lines[0] == f"daimonos {package}"
+    assert re.fullmatch(r"source_commit (unknown|[0-9a-f]{40})", lines[1])
+    assert re.fullmatch(r"tool_contract_version [0-9]+\.[0-9]+\.[0-9]+", lines[2])
+    assert not list(tmp_path.iterdir())

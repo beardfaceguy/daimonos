@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- The local container accepts a caller-selected workspace and MCP arguments. `daimonos --version` reports its package, source revision, and independent tool-contract version.
+
 ## [0.1.8] - 2026-11-24
 
 ### Security

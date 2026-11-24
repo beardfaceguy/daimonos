@@ -217,6 +217,15 @@ fn load_tool_allowlist(path: &std::path::Path) -> Result<Vec<String>, String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.version {
+        println!(
+            "daimonos {}\nsource_commit {}\ntool_contract_version {}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("DAIMONOS_SOURCE_COMMIT").unwrap_or("unknown"),
+            tool_contract::CONTRACT_VERSION
+        );
+        return Ok(());
+    }
     let mut runtime_mode = cli.runtime_mode();
 
     // ADR-021: until WP02 relocates frontend state, never accept a partial guarantee.

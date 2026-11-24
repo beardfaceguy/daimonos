@@ -1,14 +1,10 @@
-target/
-.git/
-.github/
-.cursor/
-docs/
-tests/
-benchmarks/
-distro/
-mcpb/
-*.md
-claude_api_key.env
-daimonos.toml
-.idea/
-.vscode/
+# Send only production build inputs. In particular, do not send local state,
+# credentials, .git, target, or untracked config files to the Docker daemon.
+**
+!Cargo.toml
+!Cargo.lock
+!daimonos.default.toml
+!src/
+!src/**
+!prompts/
+!prompts/**

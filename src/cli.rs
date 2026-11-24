@@ -384,6 +384,9 @@ impl RuntimeMode {
 #[derive(Debug, Parser)]
 #[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
 pub struct Cli {
+    /// Print the package version, build revision, and independent tool-contract version.
+    #[arg(long, global = true)]
+    pub version: bool,
     /// Unix socket path used by `daemon` and the legacy default mode (default: /tmp/daimonos.sock).
     #[arg(short, long)]
     pub socket: Option<PathBuf>,
