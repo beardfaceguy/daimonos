@@ -107,14 +107,7 @@ pub async fn connect_or_spawn(
 
     let executable = std::env::current_exe()
         .map_err(|error| anyhow::anyhow!("resolve daimonos binary: {error}"))?;
-    let mut command = tokio::process::Command::new(&executable);
-    command
-        .args(daemon_args(options))
-        .env(BOOTSTRAP_FINGERPRINT_ENV, bootstrap_fingerprint(options))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(false);
+    let mut command = daemon_command(&executable, options, &crate::env_file::implicit_keys());
     // SAFETY: this closure runs after Command's fork and before exec. setsid,
     // fork, and _exit are async-signal-safe; do not add allocation, logging, or
     // any other non-async-signal-safe operation here. The grandchild returns to
@@ -197,6 +190,32 @@ fn should_bootstrap(error: &std::io::Error) -> bool {
         error.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
     )
+}
+
+/// The command that starts the session daemon, without its `pre_exec` step.
+///
+/// The daemon does not inherit the variables that this process set from an
+/// implicit `agent.env` file. It has the same workspace and state options, so
+/// it loads the same files again and knows that these values are implicit.
+/// Inherited, they would count as values of the real environment and rank
+/// above the `--agent-env` file (ADR-037).
+fn daemon_command(
+    executable: &Path,
+    options: &BootstrapOptions<'_>,
+    implicit_keys: &std::collections::BTreeSet<String>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(daemon_args(options))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(false);
+    for key in implicit_keys {
+        command.env_remove(key);
+    }
+    command.env(BOOTSTRAP_FINGERPRINT_ENV, bootstrap_fingerprint(options));
+    command
 }
 
 fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
@@ -425,6 +444,36 @@ fn instance_metadata(socket_path: &Path) -> std::io::Result<Option<serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-037: the daemon loads the implicit `agent.env` files itself. It
+    /// does not inherit their values as values of the real environment.
+    #[test]
+    fn daemon_command_does_not_pass_on_implicit_agent_env_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let socket = directory.path().join("daemon.sock");
+        let agent_env = directory.path().join("agent.env");
+        let selected = options(directory.path(), &config, &socket, &agent_env);
+        let implicit = ["DAIMONOS_AGENT_MODEL", "DAIMONOS_AGENT_BASE_URL"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let command = daemon_command(Path::new("/bin/daimonos"), &selected, &implicit);
+        let envs: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
+            .collect();
+        // `None` is a removal from the inherited environment.
+        assert_eq!(envs[std::ffi::OsStr::new("DAIMONOS_AGENT_MODEL")], None);
+        assert_eq!(envs[std::ffi::OsStr::new("DAIMONOS_AGENT_BASE_URL")], None);
+        assert!(envs[std::ffi::OsStr::new(BOOTSTRAP_FINGERPRINT_ENV)].is_some());
+        assert_eq!(envs.len(), 3);
+
+        let none = daemon_command(Path::new("/bin/daimonos"), &selected, &Default::default());
+        assert_eq!(none.as_std().get_envs().count(), 1);
+    }
 
     fn options<'a>(
         workspace: &'a Path,
