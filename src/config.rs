@@ -126,6 +126,9 @@ pub struct ReviewerConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
+    /// ADR-032: assigned before producer initialization. Not configurable by the workspace.
+    #[serde(skip)]
+    pub(crate) network: crate::offline_tools::NetworkAuthority,
     /// Caller-owned state authority. Never deserialized from workspace config.
     #[serde(skip)]
     pub(crate) state_authority: Option<Arc<crate::state_root::StateAuthority>>,

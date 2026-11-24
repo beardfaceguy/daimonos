@@ -124,6 +124,24 @@ Local analytics collection and remote telemetry export have different controls.
 | N20 | `src/tool_output.rs::reformat_text` | Optional output-reformat model call, separate from the main agent request | Refuse under offline-tools before any call. Controlled mode must mediate this request or refuse it without a legacy fallback. | WP07, WP20 / I |
 | N21 | `src/agent.rs::AgentSession::compact` | Automatic summary model call with its own retry loop | Gate before sending. Controlled request accounting and retry rules cover every HTTP attempt. Offline mode permits no auxiliary request. | WP07, WP20 / I |
 
+### WP20: offline dispositions and evidence
+
+| IDs | Offline disposition |
+|---|---|
+| N01–N06, N21 | Refuse agent, chat, ACP, and session-daemon modes before loading configuration. The worker constructs no provider, catalog, retry, or summary client. |
+| N07 | Disable OTLP before logging initialization. The disabled runtime has no exporter to flush. |
+| N08 | Skip the analytics store and local collection. The separate model process can retain its run audit. |
+| N09–N12, N14, N17 | No bridge, OAuth, IP gateway, or delegated server startup. Native MCP serves stdio or a Unix listener. `tool-contract` only exports the catalog. |
+| N13, N15, N16, N18 | Skip plugin registration before probes. Refuse external programs, remote tools, configured tools, and composite calls before dispatch. |
+| N19 | Refuse `git_read`, even for a missing object in a promisor repository. Do not start Git. No subprocess isolation mechanism is claimed. |
+| N20 | Disable the provider-backed formatter. Also suppress KGL observation, autoindex and startup hints, and the resource sampler. |
+
+`tests/test_offline_tools.py` checks the local operations, selection errors, direct refusals and shutdown.
+`tests/test_worker_isolation.py::test_offline_evidence_worker_preserves_model_side_audit` checks an offline worker with a separate, audited model process.
+On Linux, set `DAIMONOS_TEST_STRACE` to the absolute path of `strace` and run `pytest tests/test_offline_tools.py`.
+The syscall check requires `unshare -Urn` and permission to trace descendants. A skip is not acceptance evidence.
+A child process provides positive controls for failed TCP and UDP/53 attempts. The worker traces cover every offered tool. AF_UNIX is not IP networking.
+
 N15 includes the git write/raw plugin, Cargo, npm, gh, curl, Docker, pytest plugins, and shellcheck wrappers.
 Their external programs are not certified safe merely because a particular subcommand sounds read-only.
 Batch, pipeline, and Starlark calls inherit the same admissions and cannot bypass the ceiling.

@@ -342,11 +342,11 @@ Do not include an unbounded path listing, filesystem error dump, or secret value
 
 ## Offline and capability admission
 
-WP20 owns `src/offline_tools.rs` (new): `NetworkAuthority` and `ProducerAdmission`.
+WP20 uses `src/offline_tools.rs::NetworkAuthority` for process and tool admission (ADR-032). The admitted names are in `LOCAL_TOOLS`.
 Offline admission occurs before providers, discovery, OTLP, OAuth, MCP IP transports, remote tools, gateways, or child producers initialize.
 Model profiles requiring IP networking are incompatible with the same offline process.
 Native stdio and Unix IPC are not outbound IP grants. Arbitrary stdio children still require proven isolation or refusal.
-`--analytics-off` disables local event collection and store creation. The session daemon must match the requested setting. See `src/main.rs` and `src/session_bootstrap.rs`. OTLP export and local audit remain separate. This WP20 slice does not implement the offline network ceiling.
+`--analytics-off` disables local event collection and store creation. The session daemon must match the requested setting. See `src/main.rs` and `src/session_bootstrap.rs`. OTLP export and local audit remain separate. The offline worker disables collection and remote producers. A separate model process retains the run audit.
 Document every N01–N21 disposition and update that inventory with any new producer.
 
 The first supported confined backend is proposed as Linux/openat2 using existing libc.

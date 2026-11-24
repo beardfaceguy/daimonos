@@ -145,6 +145,14 @@ impl ToolFailure {
         response
     }
 
+    pub fn offline_tool_forbidden() -> Self {
+        Self::refusal(
+            "offline_tool_forbidden",
+            "tool has no verified offline adapter",
+            None,
+        )
+    }
+
     pub fn path_outside_root(argument: &Path) -> Self {
         // Echo only the caller's argument, never the resolved outside location.
         Self::refusal(

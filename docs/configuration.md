@@ -1386,6 +1386,20 @@ Content capture is not currently configurable: export is unconditionally
 metadata-only. A future redacted content mode will add an explicit opt-in only
 when its privacy tests and limits ship with it.
 
+### Offline evidence workers (ADR-032)
+
+Start the tool process with `daimonos --workspace REPO --offline-tools mcp`.
+For local IPC, add `--socket PATH` after `mcp`. `tool-contract` also accepts the profile.
+Use a separate process for the model. Keep the run audit on that side.
+
+The worker admits `ls`, `read_file`, `search` (content and filenames), and `workspace_info`.
+A caller allowlist can narrow that set. Selecting an incompatible tool or runtime mode stops startup with `offline_profile_incompatible` (exit 2).
+A direct call to an unsupported tool returns `offline_tool_forbidden`. This includes `git_read`, subprocess tools and composite calls.
+
+Offline mode disables analytics collection, OTLP export, KGL producers, model-assisted output formatting, and plugin startup probes.
+It does not grant filesystem confinement or promise a read-only workspace. Use the filesystem flags for those controls.
+Retain a no-network container or namespace for defense in depth. See the [network producer inventory](contexts/reviewer-runtime/INVENTORIES.md) for the scope and acceptance check.
+
 ### `[analytics]` — Token & Latency Tracking
 
 Daimonos records every MCP tool call (request/response token estimates,

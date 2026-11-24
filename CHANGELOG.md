@@ -9,6 +9,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- `--offline-tools` serves four local evidence tools over MCP stdio or a Unix socket. It refuses network-capable producers and subprocess tools.
 - `--analytics-off` disables local analytics collection for a run and its session daemon. It leaves an explicitly requested local audit active.
 
 ## [0.1.8] - 2026-11-24

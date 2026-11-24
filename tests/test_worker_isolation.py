@@ -930,3 +930,23 @@ def test_r4_native_allowlist_name_without_worker_is_unchanged(
     completed = _run(daimonos_binary, tmp_path, [DONE], allowlist=["read_file"])
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "done" in completed.stdout
+
+
+def test_offline_evidence_worker_preserves_model_side_audit(daimonos_binary, tmp_path):
+    manifest = tmp_path / "workers.json"
+    home = tmp_path / "worker-home"
+    home.mkdir()
+    manifest.write_text(json.dumps({"workers": {"toolside": {
+        "command": str(daimonos_binary), "args": ["-w", str(tmp_path / "ws"), "--ignore-config-files",
+                                              "--offline-tools", "mcp"], "env": {"HOME": str(home)},
+    }}}))
+    audit = tmp_path / "state" / "audit.jsonl"
+    name = "mcp__toolside__ls"
+    completed = _run(daimonos_binary, tmp_path, [{"calls": [{"id": "c1", "name": name}]}, DONE],
+                     worker_config=manifest, allowlist=[name], audit_path=audit)
+    assert completed.returncode == 0, completed.stderr
+    events = [json.loads(s) for s in audit.read_text().splitlines()]
+    assert events[0]["kind"] == "run_start" and events[-1]["kind"] == "run_end"
+    assert any(e.get("kind") == "tool_call" and e.get("route") == "worker" for e in events)
+    assert events[-1]["status"] == "ok"
+    assert not list(home.rglob("analytics.db*"))

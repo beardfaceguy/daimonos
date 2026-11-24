@@ -162,6 +162,7 @@ fn should_exit_for_idle(idle_secs: u64, timeout_secs: u64, in_flight: usize) -> 
 }
 
 pub struct DaimonosHandler {
+    network: crate::offline_tools::NetworkAuthority,
     session: Arc<Mutex<Session>>,
     /// Request liveness shared with the idle watchdog.
     activity: Arc<ActivityTracker>,
@@ -174,6 +175,7 @@ pub struct DaimonosHandler {
 impl DaimonosHandler {
     pub fn new(session: Session, activity: Arc<ActivityTracker>, startup_logs: bool) -> Self {
         Self {
+            network: session.cfg.network,
             session: Arc::new(Mutex::new(session)),
             activity,
             startup_logs,
@@ -1488,6 +1490,11 @@ impl ServerHandler for DaimonosHandler {
         let _activity = self.begin_request();
         let args: Value = serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
 
+        // ADR-032: check before special/composite routes, not just registry dispatch.
+        if let Err(failure) = self.network.admit_tool(&params.name) {
+            return response_to_result(failure.into_response(&params.name));
+        }
+
         // execute_script needs Arc<Mutex<Session>> — handle it before locking.
         if params.name == "execute_script" {
             // Keep the (Send) script result across the lock/notify awaits and
@@ -1622,7 +1629,7 @@ impl ServerHandler for DaimonosHandler {
         // file ops as observed reads/mutates edges from the session. Best-effort:
         // never affects the tool result. The session lock is released before the
         // sync SQLite write so observe can't serialize concurrent requests.
-        if crate::kgl::observe::enabled() {
+        if !session.cfg.network.offline() && crate::kgl::observe::enabled() {
             if let Ok(r) = &result {
                 if !r.is_error.unwrap_or(false) {
                     let now = chrono::Utc::now().to_rfc3339();
@@ -1869,7 +1876,12 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
         return parts.join("\n");
     }
 
-    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled(), cfg).await {
+    if let Some(hint) = kgl_instructions_hint(
+        !cfg.network.offline() && crate::kgl::autoindex::enabled(),
+        cfg,
+    )
+    .await
+    {
         parts.push(hint.trim_end().to_string());
     }
 
@@ -2249,6 +2261,7 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     let instructions = build_instructions(&session.workspace, &session.cfg).await;
+    let network = session.cfg.network;
     let session = Arc::new(Mutex::new(session));
     let mut client_supports_roots = false;
     let mut pending_roots_request: Option<Value> = None;
@@ -2325,7 +2338,9 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
                     .unwrap_or("")
                     .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let result = if name == "execute_script" {
+                let result = if let Err(failure) = network.admit_tool(&name) {
+                    response_to_result(failure.into_response(&name))
+                } else if name == "execute_script" {
                     // Keep the Send-safe script outcome across the lock await;
                     // construct CallToolResult only afterwards.
                     let script_result = run_execute_script(Arc::clone(&session), &args).await;
