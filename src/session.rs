@@ -471,7 +471,11 @@ impl Session {
 
     /// Check if a file's content matches what the model has already seen.
     /// Returns Some(entry) if the file is cached and unchanged.
-    pub fn check_read_cache(&self, path: &PathBuf, content: &str) -> Option<&ReadCacheEntry> {
+    pub fn check_read_cache(
+        &self,
+        path: &std::path::Path,
+        content: &str,
+    ) -> Option<&ReadCacheEntry> {
         let entry = self.read_cache.get(path)?;
         if entry.hash == Self::content_hash(content) {
             Some(entry)

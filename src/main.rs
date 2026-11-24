@@ -18,6 +18,7 @@ mod coordination;
 mod discovery_policy;
 mod env_file;
 mod evidence;
+mod file_digest;
 mod frontend_state;
 mod headless_frontend;
 mod index;
@@ -553,6 +554,24 @@ async fn main() -> anyhow::Result<()> {
     }
     cfg.discovery_policy = discovery_policy::DiscoveryPolicy::from_ignore_flag(explicit_only);
     cfg.agent.skills.explicit_only = explicit_only;
+    cfg.read_sha256 = cli.read_sha256;
+    if cli.read_sha256 {
+        // Model-assisted formatting can paraphrase a hex digest. Evidence results must
+        // use deterministic bounds. Reject impossible Git JSON caps before serving.
+        cfg.tool_output
+            .reformat
+            .tools
+            .retain(|t| t != "read_file" && t != "git_read");
+        let minimum = plugins::git_read::digest_limit_response(&"0".repeat(64))
+            .to_string()
+            .len();
+        if cfg.git_read.max_output_bytes < minimum {
+            exit_for_state_failure(state_root::RunFailure::configuration_invalid(
+                "digest_metadata_cap",
+                format!("--read-sha256 requires git_read.max_output_bytes >= {minimum}"),
+            ));
+        }
+    }
     if let Some(authority) = state_authority {
         if let Err(error) = cfg.apply_state_authority(authority, &workspace) {
             eprintln!(

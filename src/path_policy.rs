@@ -145,6 +145,13 @@ impl ToolFailure {
         response
     }
 
+    /// The opened evidence changed while read_file computed its digest (ADR-031).
+    pub fn file_changed(argument: &Path) -> Self {
+        let mut failure = Self::refusal("file_changed", "file changed during read", Some(argument));
+        failure.retryable = true;
+        failure
+    }
+
     pub fn path_outside_root(argument: &Path) -> Self {
         // Echo only the caller's argument, never the resolved outside location.
         Self::refusal(

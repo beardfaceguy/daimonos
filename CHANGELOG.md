@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `--read-sha256` includes complete stored-byte digests on filesystem and pinned Git reads, including paged and bounded results.
+
 ## [0.1.8] - 2026-11-24
 
 ### Security

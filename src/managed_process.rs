@@ -18,29 +18,17 @@ use tokio::sync::Mutex;
 
 pub type ProgressCallback<'a> = dyn Fn(String) + Send + Sync + 'a;
 
-tokio::task_local! {
-    /// Cooperative tool-budget deadline (remaining time) in force for the
-    /// current operation, set by the dispatch seam via [`with_budget_deadline`].
-    /// Subprocesses that [`run`] spawns inside the scope inherit it so the OS
-    /// process group is reaped AT the deadline, never merely waited on
-    /// (FR-19, WP18, ADR-031). Context: src/tool_budget.rs.
-    static BUDGET_DEADLINE: Option<Duration>;
-}
+// Share the actual absolute deadline and byte counter across Git discovery and blob reads.
+tokio::task_local! { static OPERATION_BUDGET: Option<Arc<crate::tool_budget::ToolBudget>>; }
 
-/// Run `fut` with the cooperative tool-budget deadline in scope. A `None`
-/// deadline (no `--tool-timeout-ms`, or no deadline left to inherit) leaves the
-/// legacy behavior of [`run`] unchanged. The deadline bounds but never extends
-/// the process default timeout (FR-19, WP18, ADR-031).
-pub async fn with_budget_deadline<F: std::future::Future>(
-    deadline: Option<Duration>,
+pub async fn with_tool_budget<F: std::future::Future>(
+    budget: Option<Arc<crate::tool_budget::ToolBudget>>,
     fut: F,
 ) -> F::Output {
-    BUDGET_DEADLINE.scope(deadline, fut).await
+    OPERATION_BUDGET.scope(budget, fut).await
 }
-
-/// The cooperative deadline in scope, or `None` outside a budgeted operation.
-fn scoped_budget_deadline() -> Option<Duration> {
-    BUDGET_DEADLINE.try_with(|d| *d).unwrap_or(None)
+pub fn current_tool_budget() -> Option<Arc<crate::tool_budget::ToolBudget>> {
+    OPERATION_BUDGET.try_with(Clone::clone).ok().flatten()
 }
 
 /// Captured process output. Each stream is bounded while it is read.
@@ -49,6 +37,9 @@ pub struct ManagedOutput {
     pub stdout: String,
     pub stderr: String,
     pub stdout_truncated: bool,
+    /// Raw stdout digest. Only requested for pinned blob evidence.
+    pub stdout_sha256: Option<String>,
+    pub stdout_bytes: u64,
     pub stderr_truncated: bool,
     pub timed_out: bool,
 }
@@ -490,18 +481,43 @@ pub async fn run(
     cfg: &ProcessConfig,
     stdin_data: Option<&[u8]>,
 ) -> io::Result<ManagedOutput> {
+    run_inner(program, args, cwd, overlays, cfg, stdin_data, false).await
+}
+
+/// Capture with the same process-group and environment policy as `run`, but
+/// also hash every raw stdout chunk before any lossy text decoding (ADR-031).
+pub async fn run_with_stdout_digest(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    overlays: &HashMap<String, String>,
+    cfg: &ProcessConfig,
+) -> io::Result<ManagedOutput> {
+    run_inner(program, args, cwd, overlays, cfg, None, true).await
+}
+
+async fn run_inner(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    overlays: &HashMap<String, String>,
+    cfg: &ProcessConfig,
+    stdin_data: Option<&[u8]>,
+    digest_stdout: bool,
+) -> io::Result<ManagedOutput> {
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd);
     apply_environment(&mut command, cfg, overlays);
     // FR-19 (WP18, ADR-031): a cooperative tool-budget deadline in scope caps
     // this subprocess and reaps its process group at the deadline. `None`
     // preserves the legacy process-default behavior exactly.
-    let (output, budget_fired) = capture_budgeted(
+    let (output, budget_fired) = capture_inner(
         &mut command,
         cfg,
         None,
         stdin_data,
-        scoped_budget_deadline(),
+        current_tool_budget().and_then(|b| b.remaining()),
+        digest_stdout,
     )
     .await?;
     if output.timed_out {
@@ -527,7 +543,7 @@ pub async fn capture(
     progress: Option<&ProgressCallback<'_>>,
     stdin_data: Option<&[u8]>,
 ) -> io::Result<ManagedOutput> {
-    capture_inner(command, cfg, progress, stdin_data, None)
+    capture_inner(command, cfg, progress, stdin_data, None, false)
         .await
         .map(|(output, _)| output)
 }
@@ -544,7 +560,7 @@ pub async fn capture_budgeted(
     stdin_data: Option<&[u8]>,
     budget_deadline: Option<Duration>,
 ) -> io::Result<(ManagedOutput, bool)> {
-    capture_inner(command, cfg, progress, stdin_data, budget_deadline).await
+    capture_inner(command, cfg, progress, stdin_data, budget_deadline, false).await
 }
 
 async fn capture_inner(
@@ -553,6 +569,7 @@ async fn capture_inner(
     progress: Option<&ProgressCallback<'_>>,
     stdin_data: Option<&[u8]>,
     budget_deadline: Option<Duration>,
+    digest_stdout: bool,
 ) -> io::Result<(ManagedOutput, bool)> {
     command
         .stdin(if stdin_data.is_some() {
@@ -617,13 +634,15 @@ async fn capture_inner(
             stdout,
             cfg.exec_stream_chunk_bytes,
             cfg.output_memory_bytes,
-            progress
+            progress,
+            digest_stdout
         ),
         read_bounded(
             stderr,
             cfg.exec_stream_chunk_bytes,
             cfg.output_memory_bytes,
-            progress
+            progress,
+            false
         ),
         wait,
         write_stdin
@@ -636,8 +655,12 @@ async fn capture_inner(
         ManagedOutput {
             status,
             stdout: stdout.render(),
+            stdout_bytes: stdout.total,
             stderr: stderr.render(),
             stdout_truncated: stdout.truncated(),
+            stdout_sha256: stdout
+                .hash
+                .map(|h| format!("{:x}", sha2::Digest::finalize(h))),
             stderr_truncated: stderr.truncated(),
             timed_out,
         },
@@ -646,6 +669,7 @@ async fn capture_inner(
 }
 
 struct BoundedStream {
+    hash: Option<sha2::Sha256>,
     head: Vec<u8>,
     tail: VecDeque<u8>,
     total: u64,
@@ -655,6 +679,7 @@ struct BoundedStream {
 impl BoundedStream {
     fn new(limit: usize) -> Self {
         Self {
+            hash: None,
             head: Vec::with_capacity(limit / 2),
             tail: VecDeque::with_capacity(limit.saturating_sub(limit / 2)),
             total: 0,
@@ -704,8 +729,12 @@ async fn read_bounded<R: AsyncRead + Unpin>(
     chunk_bytes: usize,
     limit: usize,
     progress: Option<&ProgressCallback<'_>>,
+    digest: bool,
 ) -> io::Result<BoundedStream> {
     let mut retained = BoundedStream::new(limit);
+    if digest {
+        retained.hash = Some(sha2::Digest::new());
+    }
     let mut pending_utf8 = Vec::new();
     let mut chunk = vec![0; chunk_bytes];
     loop {
@@ -713,6 +742,9 @@ async fn read_bounded<R: AsyncRead + Unpin>(
         if read == 0 {
             emit_progress(progress, decode_stream_utf8(&mut pending_utf8, true));
             return Ok(retained);
+        }
+        if let Some(hash) = &mut retained.hash {
+            sha2::Digest::update(hash, &chunk[..read]);
         }
         retained.push(&chunk[..read]);
         if progress.is_some() {

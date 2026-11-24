@@ -509,6 +509,9 @@ pub struct Cli {
     /// is absent. Context: docs/adr/030-self-contained-full-schemas.md.
     #[arg(long, global = true, default_value_t = false)]
     pub full_tool_schemas: bool,
+    /// Include the SHA-256 of the complete stored bytes in file reads (ADR-031).
+    #[arg(long, global = true)]
+    pub read_sha256: bool,
 
     /// Refuse every implicit configuration source (environment files, config,
     /// instructions, skills, registrations, ignore files); honour only explicit

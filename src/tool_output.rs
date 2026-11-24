@@ -648,15 +648,69 @@ pub async fn bound_text(cfg: &ToolOutputConfig, tool_name: &str, content: String
         };
     }
 
+    // A long marker or other metadata can crowd the digest out of a generic preview.
+    // Keep the source hash intact even if there is no room for the saved-file path.
+    let evidence = if matches!(tool_name, "read_file" | "git_read") {
+        serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|v| {
+                let (hash, nested) = if let Some(hash) = v.pointer("/metadata/sha256") {
+                    (hash, true)
+                } else {
+                    (v.get("sha256")?, false)
+                };
+                let hash = hash.as_str()?;
+                (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| (hash.to_owned(), nested))
+            })
+    } else {
+        None
+    };
+    let preserve = |mut bounded: BoundText| {
+        if let Some((hash, nested)) = &evidence {
+            let pointer = if *nested {
+                "/metadata/sha256"
+            } else {
+                "/sha256"
+            };
+            let intact = serde_json::from_str::<serde_json::Value>(&bounded.content)
+                .ok()
+                .is_some_and(|v| {
+                    v.pointer(pointer).and_then(|h| h.as_str()) == Some(hash.as_str())
+                });
+            if !intact || bounded.content.len() > cfg.max_bytes {
+                let mut fallback = serde_json::json!({"truncated":true});
+                if *nested {
+                    fallback["metadata"] = serde_json::json!({"sha256":hash});
+                } else {
+                    fallback["sha256"] = serde_json::json!(hash);
+                }
+                if let Some(path) = &bounded.output_path {
+                    fallback["full_output_path"] = serde_json::json!(path);
+                } else {
+                    fallback["note"] = serde_json::json!(NO_SPILL_MARKER);
+                }
+                if fallback.to_string().len() > cfg.max_bytes {
+                    fallback.as_object_mut().unwrap().remove("full_output_path");
+                }
+                bounded.content = fallback.to_string();
+                bounded.visible_chars = bounded.content.chars().count();
+            }
+        }
+        bounded
+    };
     // No-spill: bound in place, never open or write the full copy (INVENTORIES
     // W12). This is the producer-level prevention ADR-021 requires, not just
     // removal of the final pointer.
     if !cfg.save_full_output {
-        return no_spill_bound(cfg, content, original_chars);
+        return preserve(no_spill_bound(cfg, content, original_chars));
     }
 
     let Ok(path) = store_full(cfg, tool_name, &content).await else {
         // Storage failure must never turn a successful tool call into a failure.
+        if evidence.is_some() {
+            return preserve(no_spill_bound(cfg, content, original_chars));
+        }
         return BoundText {
             visible_chars: original_chars,
             content,
@@ -671,6 +725,9 @@ pub async fn bound_text(cfg: &ToolOutputConfig, tool_name: &str, content: String
                 structured_preview(value, &path, &marker, cfg.max_lines, cfg.max_bytes)
             else {
                 let _ = tokio::fs::remove_file(path).await;
+                if evidence.is_some() {
+                    return preserve(no_spill_bound(cfg, content, original_chars));
+                }
                 return BoundText {
                     visible_chars: original_chars,
                     content,
@@ -682,12 +739,12 @@ pub async fn bound_text(cfg: &ToolOutputConfig, tool_name: &str, content: String
         }
         Err(_) => preview(&content, &marker, cfg.max_lines, cfg.max_bytes),
     };
-    BoundText {
+    preserve(BoundText {
         visible_chars: visible.chars().count(),
         content: visible,
         output_path: Some(path),
         original_chars,
-    }
+    })
 }
 
 #[derive(Clone)]

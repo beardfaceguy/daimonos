@@ -61,6 +61,7 @@ pub struct BootstrapOptions<'a> {
     /// Part of the launch identity so a frontend requesting it cannot silently
     /// attach to a daemon launched without it.
     pub full_tool_schemas: bool,
+    pub read_sha256: bool,
     /// FR-19 (WP18, ADR-031): the caller's cooperative tool-budget options.
     /// Part of the daemon's immutable launch identity exactly like
     /// `workspace_read_only`: forwarded in `daemon_args`, hashed into
@@ -286,6 +287,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
         args.push(OsString::from("--agent-env"));
         args.push(path.as_os_str().to_owned());
     }
+    if options.read_sha256 {
+        args.push(OsString::from("--read-sha256"));
+    }
     if options.full_tool_schemas {
         args.push(OsString::from("--full-tool-schemas"));
     }
@@ -358,6 +362,9 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
         digest.update(provider.as_bytes());
     }
     digest.update([0_u8]);
+    if options.read_sha256 {
+        digest.update(b"read-sha256\0");
+    }
     if options.full_tool_schemas {
         digest.update(b"full-tool-schemas\0");
     }
@@ -375,6 +382,7 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.tool_allowlist.is_none()
         && options.confine_identity.is_none()
         && !options.ignore_config_files
+        && !options.read_sha256
         && !options.no_follow
         && !options.tool_budget.any_enabled()
     {
@@ -502,6 +510,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             retry_interval: Duration::from_millis(1),
             full_tool_schemas: false,
+            read_sha256: false,
         }
     }
 
@@ -678,6 +687,22 @@ mod tests {
             LaunchIdentity::NotRequested,
             "explicit-only mode must request a pinned daemon identity"
         );
+    }
+
+    #[test]
+    fn read_digest_changes_daemon_identity_and_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.agent_env = None;
+        opts.provider = None;
+        let plain = bootstrap_fingerprint(&opts);
+        assert!(!daemon_args(&opts).contains(&OsString::from("--read-sha256")));
+        opts.read_sha256 = true;
+        assert_ne!(plain, bootstrap_fingerprint(&opts));
+        assert!(daemon_args(&opts).contains(&OsString::from("--read-sha256")));
+        assert_eq!(launch_identity(&opts).unwrap(), LaunchIdentity::Unavailable);
     }
 
     #[test]
