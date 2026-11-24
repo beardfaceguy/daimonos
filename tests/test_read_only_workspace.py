@@ -1040,7 +1040,9 @@ def test_g2_agent_print_refuses_checkpoint_at_startup(daimonos_binary, tmp_path)
     (tmp_path / "tmp").mkdir()
     env.update(_isolated_env(tmp_path))
     completed = subprocess.run(
+        # ADR-039: an agent frontend loads the workspace file only by name.
         [daimonos_binary, "--workspace", str(workspace), "--workspace-read-only",
+         "--config", str(workspace / "daimonos.toml"),
          "agent", "--print", "--agent-env", str(agent_env), "hello"],
         capture_output=True, text=True, timeout=60, env=env,
     )

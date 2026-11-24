@@ -2454,26 +2454,33 @@ fn default_project_markers() -> Vec<String> {
     .collect()
 }
 
+/// The implicit configuration files that a run can load. No option names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImplicitConfigFiles {
+    /// `<workspace>/daimonos.toml`. It comes with the workspace, so the agent
+    /// frontends do not load it (ADR-039).
+    pub workspace: bool,
+    /// `~/.config/daimonos/config.toml`. A state-owned run does not read it
+    /// (ADR-021).
+    pub user: bool,
+}
+
 /// Load config from the first file found in search order:
 /// 1. Explicit path (--config flag)
-/// 2. <workspace>/daimonos.toml
-/// 3. ~/.config/daimonos/config.toml
+/// 2. <workspace>/daimonos.toml, when `implicit.workspace`
+/// 3. ~/.config/daimonos/config.toml, when `implicit.user`
 /// 4. Built-in defaults
 ///
 /// When `quiet_diagnostic_stderr` is true, suppress informational messages for
 /// successful config discovery (`loaded from …`, `using built-in defaults`).
 /// Parse/read failures are always printed — those are real errors.
-pub fn load(explicit: Option<&Path>, workspace: &Path, quiet_diagnostic_stderr: bool) -> Config {
-    load_with_user_config(explicit, workspace, quiet_diagnostic_stderr, true)
-}
-
-pub(crate) fn load_with_user_config(
+pub(crate) fn load(
     explicit: Option<&Path>,
     workspace: &Path,
     quiet_diagnostic_stderr: bool,
-    include_user: bool,
+    implicit: ImplicitConfigFiles,
 ) -> Config {
-    for candidate in search_candidates_with_user_config(explicit, workspace, include_user) {
+    for candidate in search_candidates(explicit, workspace, implicit) {
         let candidate = &candidate;
         if candidate.is_file() {
             match std::fs::read_to_string(candidate) {
@@ -2507,6 +2514,7 @@ pub(crate) fn load_confined(
     workspace: &Path,
     quiet_diagnostic_stderr: bool,
     authority: &crate::path_policy::FilesystemAuthority,
+    include_workspace: bool,
 ) -> Result<Config, String> {
     use std::io::Read;
     let parse = |path: &Path, content: &str| match toml::from_str::<Config>(content) {
@@ -2540,11 +2548,13 @@ pub(crate) fn load_confined(
         return Ok(cfg);
     }
     let workspace_path = workspace.join("daimonos.toml");
-    if let Ok(authorized) = authority.open_read(&workspace_path) {
-        let mut content = String::new();
-        if authorized.into_file().read_to_string(&mut content).is_ok() {
-            if let Some(cfg) = parse(&workspace_path, &content) {
-                return Ok(cfg);
+    if include_workspace {
+        if let Ok(authorized) = authority.open_read(&workspace_path) {
+            let mut content = String::new();
+            if authorized.into_file().read_to_string(&mut content).is_ok() {
+                if let Some(cfg) = parse(&workspace_path, &content) {
+                    return Ok(cfg);
+                }
             }
         }
     }
@@ -2594,19 +2604,16 @@ pub(crate) fn load_explicit_only(
 /// `$XDG_CONFIG_HOME`/`~/.config` `daimonos/config.toml`. Candidates that can't
 /// be formed (no `$HOME`/`$XDG_CONFIG_HOME`) are omitted. This is the single
 /// source of truth shared by `load` and the `--print-config-path` CLI flag.
-pub fn search_candidates(explicit: Option<&Path>, workspace: &Path) -> Vec<std::path::PathBuf> {
-    search_candidates_with_user_config(explicit, workspace, true)
-}
-
-pub(crate) fn search_candidates_with_user_config(
+pub(crate) fn search_candidates(
     explicit: Option<&Path>,
     workspace: &Path,
-    include_user: bool,
+    implicit: ImplicitConfigFiles,
 ) -> Vec<std::path::PathBuf> {
     [
         explicit.map(|p| p.to_path_buf()),
-        Some(workspace.join("daimonos.toml")),
-        include_user
+        implicit.workspace.then(|| workspace.join("daimonos.toml")),
+        implicit
+            .user
             .then(dirs_next)
             .flatten()
             .map(|d| d.join("daimonos").join("config.toml")),
@@ -3451,6 +3458,11 @@ mod tests {
         assert!(!skip.contains("toml"));
     }
 
+    const ALL_IMPLICIT: ImplicitConfigFiles = ImplicitConfigFiles {
+        workspace: true,
+        user: true,
+    };
+
     #[test]
     fn load_from_explicit_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -3464,7 +3476,7 @@ default_grep_max = 42
         )
         .unwrap();
 
-        let cfg = load(Some(&cfg_path), dir.path(), false);
+        let cfg = load(Some(&cfg_path), dir.path(), false, ALL_IMPLICIT);
         assert_eq!(cfg.search.default_grep_max, 42);
         assert_eq!(cfg.search.default_find_max, 20);
     }
@@ -3481,31 +3493,70 @@ poll_tail_lines = 50
         )
         .unwrap();
 
-        let cfg = load(None, dir.path(), false);
+        let cfg = load(None, dir.path(), false, ALL_IMPLICIT);
+        assert_eq!(cfg.process.poll_tail_lines, 50);
+
+        // ADR-039: without the workspace candidate the file is not loaded.
+        // The user file is off too, so the result does not depend on the
+        // home directory of the host.
+        let none = ImplicitConfigFiles {
+            workspace: false,
+            user: false,
+        };
+        let cfg = load(None, dir.path(), true, none);
+        assert_eq!(
+            cfg.process.poll_tail_lines,
+            Config::default().process.poll_tail_lines
+        );
+        // The same file applies when the caller names it.
+        let named = dir.path().join("daimonos.toml");
+        let cfg = load(Some(&named), dir.path(), true, none);
         assert_eq!(cfg.process.poll_tail_lines, 50);
     }
 
     #[test]
     fn load_falls_back_to_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = load(None, dir.path(), false);
+        let cfg = load(None, dir.path(), false, ALL_IMPLICIT);
         assert_eq!(cfg.index.max_depth, 20);
     }
 
     #[test]
     fn search_candidates_order_and_explicit() {
         let ws = std::path::Path::new("/tmp/ws");
+        let all = ImplicitConfigFiles {
+            workspace: true,
+            user: true,
+        };
         // Without --config: workspace file comes first, home config after.
-        let without = search_candidates(None, ws);
+        let without = search_candidates(None, ws, all);
         assert_eq!(without.first().unwrap(), &ws.join("daimonos.toml"));
         assert!(without
             .iter()
             .all(|c| c != std::path::Path::new("/explicit/cfg.toml")));
         // With --config: the explicit path is first in the search order.
         let explicit = std::path::Path::new("/explicit/cfg.toml");
-        let with = search_candidates(Some(explicit), ws);
+        let with = search_candidates(Some(explicit), ws, all);
         assert_eq!(with.first().unwrap(), explicit);
         assert_eq!(with[1], ws.join("daimonos.toml"));
+
+        // ADR-039: an agent frontend has no workspace candidate. A file that
+        // --config names is a candidate, also when it is the workspace file.
+        let agent = ImplicitConfigFiles {
+            workspace: false,
+            user: true,
+        };
+        let workspace_file = ws.join("daimonos.toml");
+        assert!(!search_candidates(None, ws, agent).contains(&workspace_file));
+        assert_eq!(
+            search_candidates(Some(&workspace_file), ws, agent).first(),
+            Some(&workspace_file)
+        );
+        let none = ImplicitConfigFiles {
+            workspace: false,
+            user: false,
+        };
+        assert!(search_candidates(None, ws, none).is_empty());
     }
 
     #[test]
@@ -3543,7 +3594,7 @@ source_pattern = "*.rs"
             explicit_only.tools
         );
         // Opt-out regression: the default loader DOES register the same plugin.
-        let loaded = load(None, ws, true);
+        let loaded = load(None, ws, true, ALL_IMPLICIT);
         assert!(
             loaded.tools.contains_key("hostiletool"),
             "default discovery must honour a workspace [tools.*] registration"

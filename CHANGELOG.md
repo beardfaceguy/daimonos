@@ -7,6 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- **The agent frontends do not load the workspace `daimonos.toml`** (ADR-039).
+  `agent`, `chat`, `acp`, and the session daemon took their configuration from
+  `<workspace>/daimonos.toml` when it existed, before the user file. That file
+  comes with the workspace, which can be a repository of another party, and
+  the configuration names what an agent run starts and where its data goes.
+  These modes now load the file that `--config` names, else
+  `~/.config/daimonos/config.toml`, else the defaults. Startup prints one line
+  when a workspace file exists and is not loaded. To use the workspace file,
+  pass `--config <workspace>/daimonos.toml`. The MCP server modes are
+  unchanged. Versions up to 0.1.7 are affected.
+
 ## [0.1.7] - 2026-11-24
 
 This release has the reviewer-runtime options (#282), the agent env file and

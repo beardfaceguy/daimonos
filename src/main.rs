@@ -369,14 +369,21 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // ADR-039: <workspace>/daimonos.toml comes with the workspace. The agent
+    // frontends load it only when --config names it.
+    let load_workspace_config = !runtime_mode.is_agent_frontend();
+
     // --print-config-path: report discovery order and which file wins, then
     // exit — before any config load / index / plugin setup.
     if cli.print_config_path {
-        let candidates = if state_authority.is_some() || filesystem_authority.is_some() {
-            config::search_candidates_with_user_config(cli.config.as_deref(), &workspace, false)
-        } else {
-            config::search_candidates(cli.config.as_deref(), &workspace)
-        };
+        let candidates = config::search_candidates(
+            cli.config.as_deref(),
+            &workspace,
+            config::ImplicitConfigFiles {
+                workspace: load_workspace_config,
+                user: state_authority.is_none() && filesystem_authority.is_none(),
+            },
+        );
         println!("config: search order (first existing file wins):");
         let mut used: Option<&std::path::Path> = None;
         for (i, c) in candidates.iter().enumerate() {
@@ -504,6 +511,7 @@ async fn main() -> anyhow::Result<()> {
             &workspace,
             quiet_cfg_stderr,
             authority,
+            load_workspace_config,
         ) {
             Ok(cfg) => cfg,
             Err(message) => {
@@ -516,11 +524,33 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         }
-    } else if state_authority.is_some() {
-        config::load_with_user_config(cli.config.as_deref(), &workspace, quiet_cfg_stderr, false)
     } else {
-        config::load(cli.config.as_deref(), &workspace, quiet_cfg_stderr)
+        config::load(
+            cli.config.as_deref(),
+            &workspace,
+            quiet_cfg_stderr,
+            config::ImplicitConfigFiles {
+                workspace: load_workspace_config,
+                user: state_authority.is_none(),
+            },
+        )
     };
+    // ADR-039: tell the user about a workspace file that was not loaded. In
+    // explicit-only mode the discovery report above already names it.
+    let workspace_config = workspace.join("daimonos.toml");
+    // The same check that the loader of this path uses to find the file. Under
+    // confinement a file outside the authority is not reported.
+    let workspace_config_found = match &filesystem_authority {
+        Some(authority) => authority.open_read(&workspace_config).is_ok(),
+        None => workspace_config.is_file(),
+    };
+    if !load_workspace_config && !explicit_only && cli.config.is_none() && workspace_config_found {
+        eprintln!(
+            "config: {} was not loaded: an agent frontend does not load a workspace \
+             daimonos.toml. Name it with --config to use it.",
+            workspace_config.display()
+        );
+    }
     cfg.discovery_policy = discovery_policy::DiscoveryPolicy::from_ignore_flag(explicit_only);
     cfg.agent.skills.explicit_only = explicit_only;
     if let Some(authority) = state_authority {

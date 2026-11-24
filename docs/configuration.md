@@ -8,9 +8,22 @@ behavior. All settings have sensible defaults — configuration is optional.
 Daimonos searches for config in this order:
 
 1. Path passed via `--config` / `-c` flag
-2. `daimonos.toml` in the workspace root
+2. `daimonos.toml` in the workspace root (not for the agent frontends, see below)
 3. `~/.config/daimonos/config.toml`
 4. Built-in defaults (equivalent to `daimonos.default.toml` in the repo)
+
+The first file that exists is used. The files are not merged.
+
+The agent frontends (`agent`, `chat`, `acp`, and the session daemon) do not
+load `daimonos.toml` from the workspace root (ADR-039). The file comes with the
+workspace, which can be a repository of another party. To use it, name it:
+
+```bash
+daimonos --config ./daimonos.toml agent "task"
+```
+
+When a workspace file exists and is not loaded, startup prints one line on
+stderr. The MCP server modes load the workspace file as before.
 
 To start with a custom config, copy the reference file:
 
@@ -18,7 +31,8 @@ To start with a custom config, copy the reference file:
 cp daimonos.default.toml ~/.config/daimonos/config.toml
 ```
 
-Or place it in your project:
+Or place it in your project. The MCP server modes find it there. The agent
+frontends need `--config`:
 
 ```bash
 cp daimonos.default.toml /path/to/project/daimonos.toml
