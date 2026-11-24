@@ -36,6 +36,7 @@ class FakeProvider:
     def __init__(self, replies):
         self.replies = list(replies)
         self.requests = []
+        self.authorizations = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -63,6 +64,7 @@ class FakeProvider:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 owner.requests.append(body)
+                owner.authorizations.append(self.headers.get("Authorization"))
                 reply = owner.replies.pop(0) if owner.replies else http_error(500, "fake provider has no reply")
                 gate = reply.get("hold")
                 if gate is not None:

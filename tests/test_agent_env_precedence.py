@@ -98,19 +98,21 @@ def test_a_file_from_the_real_selector_variable_wins_over_the_home_agent_env(
 
 def test_a_file_that_an_implicit_file_selects_is_not_an_explicit_file(
         daimonos_binary, tmp_path, fake_provider):
-    # Unchanged behavior: an implicit file can name the agent env file. That is
-    # not an explicit selection, so a setting of the implicit file still
-    # overrides the file that it names.
+    # The user agent.env can name the agent env file. That is not an explicit
+    # selection, so a setting of the user file still overrides the file that it
+    # names. (The workspace agent.env cannot name a file: ADR-038.)
     provider = fake_provider([text_reply("REPLY")])
     harness = Harness(daimonos_binary, tmp_path, provider.port)
-    (harness.workspace / "agent.env").write_text(
-        f"DAIMONOS_AGENT_ENV={harness.agent_env}\nDAIMONOS_AGENT_MODEL=workspace/model\n")
+    directory = harness.home / ".config" / "daimonos"
+    directory.mkdir(parents=True)
+    (directory / "agent.env").write_text(
+        f"DAIMONOS_AGENT_ENV={harness.agent_env}\nDAIMONOS_AGENT_MODEL=user/model\n")
 
     argv = [harness.binary, "--workspace", str(harness.workspace), "--config", str(harness.config),
             "agent", "--output", "json", "task"]
     done = run(harness, argv)
     assert done.returncode == 0, done.stderr
-    assert only_json_document(done.stdout)["model"] == "workspace/model"
+    assert only_json_document(done.stdout)["model"] == "user/model"
 
 
 def test_the_real_environment_wins_over_the_explicit_agent_env(daimonos_binary, tmp_path, fake_provider):
