@@ -553,6 +553,9 @@ async fn main() -> anyhow::Result<()> {
     }
     cfg.discovery_policy = discovery_policy::DiscoveryPolicy::from_ignore_flag(explicit_only);
     cfg.agent.skills.explicit_only = explicit_only;
+    if cli.analytics_off {
+        cfg.analytics.enabled = false;
+    }
     if let Some(authority) = state_authority {
         if let Err(error) = cfg.apply_state_authority(authority, &workspace) {
             eprintln!(
@@ -1338,6 +1341,7 @@ async fn main() -> anyhow::Result<()> {
                 token_log,
                 explicit_config_path,
                 explicit_agent_instructions,
+                cli.analytics_off,
             )
             .await
         }

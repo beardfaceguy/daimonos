@@ -1390,7 +1390,9 @@ when its privacy tests and limits ship with it.
 
 Daimonos records every MCP tool call (request/response token estimates,
 execution time, redirect/filter/dedup signals) to a SQLite database for
-cross-session reporting. Disable to opt out entirely.
+cross-session reporting. Pass `--analytics-off` to disable collection for one run,
+even if the configuration enables it. The flag does not disable OTLP export or
+a requested local audit. It does not block network access.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

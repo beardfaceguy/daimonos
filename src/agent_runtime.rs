@@ -309,6 +309,7 @@ pub async fn run_agent(
     token_log: Option<PathBuf>,
     explicit_config_path: Option<PathBuf>,
     explicit_agent_instructions: Option<PathBuf>,
+    analytics_off: bool,
 ) -> anyhow::Result<()> {
     enforce_full_schema_contract(&cfg, workspace);
     let AgentArgs {
@@ -473,6 +474,7 @@ pub async fn run_agent(
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
                 ignore_config_files: cfg.discovery_policy.is_explicit_only(),
+                analytics_off,
                 // WP14: carry the independent no-follow option to the daemon.
                 no_follow: cfg
                     .filesystem_authority

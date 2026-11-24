@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `--analytics-off` disables local analytics collection for a run and its session daemon. It leaves an explicitly requested local audit active.
+
 ## [0.1.8] - 2026-11-24
 
 ### Security

@@ -346,7 +346,7 @@ WP20 owns `src/offline_tools.rs` (new): `NetworkAuthority` and `ProducerAdmissio
 Offline admission occurs before providers, discovery, OTLP, OAuth, MCP IP transports, remote tools, gateways, or child producers initialize.
 Model profiles requiring IP networking are incompatible with the same offline process.
 Native stdio and Unix IPC are not outbound IP grants. Arbitrary stdio children still require proven isolation or refusal.
-Analytics-off prevents local event collection as well as store initialization. OTLP-off remains a separate producer control.
+`--analytics-off` disables local event collection and store creation. The session daemon must match the requested setting. See `src/main.rs` and `src/session_bootstrap.rs`. OTLP export and local audit remain separate. This WP20 slice does not implement the offline network ceiling.
 Document every N01–N21 disposition and update that inventory with any new producer.
 
 The first supported confined backend is proposed as Linux/openat2 using existing libc.
