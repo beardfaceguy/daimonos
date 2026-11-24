@@ -1,0 +1,152 @@
+diff --git a/src/ops/mod.rs b/src/ops/mod.rs
+index 235e8b9..6399c9d 100644
+--- a/src/ops/mod.rs
++++ b/src/ops/mod.rs
+@@ -361,3 +361,80 @@ fn session_info(session: &Session) -> Response {
+ 
+     Response::ok(info)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::config::Config;
++    use std::sync::Arc;
++
++    fn files_search(pattern: &str) -> Request {
++        Request::Single(Op {
++            c: protocol::op::FIND,
++            p: Some(pattern.to_string()),
++            ..Op::default()
++        })
++    }
++
++    /// A session with an index over 20 small files and a 1 ms tool deadline.
++    fn indexed_session(dir: &std::path::Path) -> Session {
++        for i in 0..20 {
++            std::fs::write(dir.join(format!("wp18f_{i}.rs")), "x").unwrap();
++        }
++        let mut cfg = Config::default();
++        cfg.tool_budget.timeout_ms = Some(1);
++        let cfg = Arc::new(cfg);
++        let mut session = Session::new(dir.to_path_buf(), Arc::clone(&cfg));
++        session.index = Some(Arc::new(crate::index::WorkspaceIndex::new(
++            dir.to_path_buf(),
++            &cfg.index,
++            false,
++        )));
++        session
++    }
++
++    /// FR-19 (WP18): a top-level files-mode search whose deadline passed is a
++    /// timeout with no result. The check is in the search itself: this test
++    /// calls `ops::dispatch`, below the general check of the MCP dispatch.
++    ///
++    /// The budget is installed first and the test then waits, so the deadline
++    /// has passed for certain. A deadline that is only short (1 ms) is not
++    /// enough: the index search can end before it.
++    #[tokio::test]
++    async fn a_files_search_after_the_deadline_is_a_timeout() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut session = indexed_session(dir.path());
++
++        let budget = session.tool_budget_config.start().expect("a budget");
++        session.set_operation_budget(Some(Arc::clone(&budget)));
++        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++        assert!(budget.check_deadline().is_err(), "the deadline passed");
++
++        let response = dispatch(&mut session, files_search("wp18f")).await;
++        assert!(!response.ok, "{response:?}");
++        let failure = response.d.clone().expect("a typed failure");
++        assert_eq!(failure["code"], "tool_timeout", "{failure}");
++        assert_eq!(failure["tool"], "search", "{failure}");
++        assert!(failure.get("results").is_none(), "{failure}");
++        assert!(!format!("{response:?}").contains("wp18f_"), "{response:?}");
++        // The call did not install this budget, so it does not clear it.
++        assert!(session.tool_budget.is_some());
++    }
++
++    /// Control: the same search without an installed budget gets a new one and
++    /// can succeed. With a long deadline it returns the files.
++    #[tokio::test]
++    async fn a_files_search_with_time_left_returns_its_results() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut session = indexed_session(dir.path());
++        session.tool_budget_config.timeout_ms = Some(60_000);
++
++        let response = dispatch(&mut session, files_search("wp18f")).await;
++        assert!(response.ok, "{response:?}");
++        assert!(
++            format!("{response:?}").contains("wp18f_0.rs"),
++            "{response:?}"
++        );
++        assert!(session.tool_budget.is_none(), "the call cleared its budget");
++    }
++}
+diff --git a/tests/test_tool_budgets.py b/tests/test_tool_budgets.py
+index 1975f5f..3fcd324 100644
+--- a/tests/test_tool_budgets.py
++++ b/tests/test_tool_budgets.py
+@@ -776,18 +776,55 @@ def test_timeout_content_search_returns_timeout(daimonos_factory, tmp_path):
+     assert "matches" not in data, "no late matches on a deadline hit"
+ 
+ 
++def _child_failure(child):
++    """The parsed failure object of a failed batch child."""
++    assert child["ok"] is False, child
++    return json.loads(child["error"])
++
++
+ def test_timeout_file_search_returns_timeout(daimonos_factory, tmp_path):
+-    """F2 (M2): the index (files-mode) search checks the deadline before the
+-    result is built, so a 1 ms deadline returns ``tool_timeout``."""
++    """F2 (M2): a files-mode (index) search that runs after the deadline
++    returns ``tool_timeout`` and no result.
++
++    The deadline must have passed for certain when the search runs. A 1 ms
++    deadline does not give that: the index search can end in less than 1 ms on
++    an idle host, and it then succeeds, which is correct. So the search is the
++    second child of a batch. The children share one deadline of 300 ms. The
++    first child sleeps and is stopped at that deadline, so the search starts
++    after it.
++
++    The Rust test ``ops::tests::a_files_search_after_the_deadline_is_a_timeout``
++    covers a top-level search and the check inside the search itself.
++    """
+     ws = tmp_path / "ws"
+     ws.mkdir()
+     for i in range(20):
+         (ws / f"wp18f_{i}.rs").write_text("x")
+-    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
+-    result = client.call_tool("search", {"pattern": "wp18f", "mode": "files"})
+-    assert result.get("isError") is True, result
+-    data = json.loads(_text(result))
+-    assert data["code"] == "tool_timeout", data
++    search = {"tool": "search", "arguments": {"pattern": "wp18f", "mode": "files"}}
++
++    # Control: with time left, the same search in a batch succeeds. The deadline
++    # is long, so a slow runner does not fail the control.
++    relaxed = daimonos_factory(ws, args=["--tool-timeout-ms", "60000"])
++    alone = json.loads(_text(relaxed.call_tool("batch", {"ops": [search]})))
++    assert [child["ok"] for child in alone] == [True], alone
++    assert "wp18f_0.rs" in json.dumps(alone[0])
++
++    client = daimonos_factory(ws, args=["--tool-timeout-ms", "300"])
++    result = client.call_tool("batch", {"ops": [
++        {"tool": "exec", "arguments": {"command": "sleep", "args": ["30"]}},
++        search,
++    ]})
++    children = json.loads(_text(result))
++    assert [child["tool"] for child in children] == ["exec", "search"], children
++    # Precondition: the sleep was stopped by the deadline, not by another error.
++    # So the deadline passed before the search started.
++    stopped = _child_failure(children[0])
++    assert stopped["code"] == "tool_timeout", stopped
++    late = _child_failure(children[1])
++    assert late["code"] == "tool_timeout", late
++    assert late.get("tool") == "search", late
++    assert "results" not in late, "no late result on a deadline hit"
++    assert "wp18f_" not in children[1]["error"]
+ 
+ 
+ def test_ac_19_1_large_tree_search_times_out_within_bound(daimonos_factory, tmp_path):

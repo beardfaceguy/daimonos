@@ -1,0 +1,47 @@
+diff --git a/tests/test_tool_budgets.py b/tests/test_tool_budgets.py
+index 1975f5f..56978f5 100644
+--- a/tests/test_tool_budgets.py
++++ b/tests/test_tool_budgets.py
+@@ -778,16 +778,36 @@ def test_timeout_content_search_returns_timeout(daimonos_factory, tmp_path):
+ 
+ def test_timeout_file_search_returns_timeout(daimonos_factory, tmp_path):
+     """F2 (M2): the index (files-mode) search checks the deadline before the
+-    result is built, so a 1 ms deadline returns ``tool_timeout``."""
++    result is built.
++
++    The deadline must have passed for certain when the search runs. A 1 ms
++    deadline does not give that: the index search can end in less than 1 ms on
++    an idle host, and it then succeeds, which is correct. So the search is the
++    second child of a batch. The children share one deadline of 300 ms. The
++    first child sleeps and is stopped at that deadline, so the search starts
++    after it.
++    """
+     ws = tmp_path / "ws"
+     ws.mkdir()
+     for i in range(20):
+         (ws / f"wp18f_{i}.rs").write_text("x")
+-    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
+-    result = client.call_tool("search", {"pattern": "wp18f", "mode": "files"})
+-    assert result.get("isError") is True, result
+-    data = json.loads(_text(result))
+-    assert data["code"] == "tool_timeout", data
++    client = daimonos_factory(ws, args=["--tool-timeout-ms", "300"])
++    search = {"tool": "search", "arguments": {"pattern": "wp18f", "mode": "files"}}
++
++    # Control: with time left, the same search succeeds.
++    alone = json.loads(_text(client.call_tool("batch", {"ops": [search]})))
++    assert [child["ok"] for child in alone] == [True], alone
++    assert "wp18f_0.rs" in json.dumps(alone[0])
++
++    result = client.call_tool("batch", {"ops": [
++        {"tool": "exec", "arguments": {"command": "sleep", "args": ["30"]}},
++        search,
++    ]})
++    children = json.loads(_text(result))
++    assert [child["ok"] for child in children] == [False, False], children
++    late = json.dumps(children[1])
++    assert "tool_timeout" in late, late
++    assert "wp18f_0.rs" not in late, "no late result on a deadline hit"
+ 
+ 
+ def test_ac_19_1_large_tree_search_times_out_within_bound(daimonos_factory, tmp_path):
