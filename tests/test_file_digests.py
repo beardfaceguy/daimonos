@@ -86,7 +86,8 @@ def test_pinned_digest_budget_counts_blob_not_response(daimonos_factory, tmp_pat
             assert result["isError"] and value["code"] == "tool_input_limit" and "sha256" not in value
 
 
-def test_digest_survives_output_caps_on_both_tools(daimonos_factory, tmp_path):
+@pytest.mark.parametrize("spill_args", [[], ["--no-output-spill"]], ids=["spill", "no-spill"])
+def test_digest_survives_output_caps_on_both_tools(daimonos_factory, tmp_path, spill_args):
     from test_git_read import git, repository
     repo, _ = repository(tmp_path)
     path = repo / "large"
@@ -96,7 +97,7 @@ def test_digest_survives_output_caps_on_both_tools(daimonos_factory, tmp_path):
     rev = git(repo, "rev-parse", "HEAD")
     config = tmp_path / "caps.toml"
     config.write_text("[git_read]\nmax_file_bytes=128\nmax_patch_bytes=128\nmax_output_bytes=512\n[tool_output]\nmax_bytes=256\n")
-    client = daimonos_factory(tmp_path, args=["--read-sha256", "--no-output-spill", "--config", str(config)])
+    client = daimonos_factory(tmp_path, args=["--read-sha256", *spill_args, "--config", str(config)], env={"HOME": str(tmp_path)})
     for tool, args in [("read_file", {"path": "source/large"}),
                        ("git_read", {"command": "show_file", "repo": "source", "rev": rev, "path": "large"})]:
         result = client.call_tool(tool, args)
@@ -213,3 +214,29 @@ def test_digest_at_evidence_cutoff_after_branch_advances(daimonos_factory, tmp_p
     page = payload(client, "git_read", args)
     assert page["commits"] == [cutoff] and page["sha256"] == expected and page["content"] == "first line\n"
     assert client.call_tool("git_read", {**args, "rev": "main"})["isError"]
+
+
+def test_unconfined_digest_refuses_fifo_without_retry(daimonos_factory, tmp_path):
+    import os
+    os.mkfifo(tmp_path / "pipe")
+    client = daimonos_factory(tmp_path, args=["--read-sha256"])
+    error = client.call_tool("read_file", {"path": "pipe"})
+    assert error["isError"]
+    refusal = json.loads(error["content"][0]["text"])
+    assert refusal["code"] == "unsupported_file_type" and refusal["retryable"] is False
+    assert "sha256" not in refusal
+
+
+def test_git_replace_refs_do_not_substitute_blob_evidence(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+    repo, commit = repository(tmp_path)
+    path = repo / "file.txt"
+    expected = digest(path)
+    original = git(repo, "rev-parse", "HEAD:file.txt")
+    path.write_bytes(b"replacement bytes\n")
+    alternate = git(repo, "hash-object", "-w", "file.txt")
+    git(repo, "replace", original, alternate)
+    assert git(repo, "cat-file", "blob", original) == "replacement bytes"
+    client = daimonos_factory(tmp_path, args=["--read-sha256"])
+    page = payload(client, "git_read", {"command": "show_file", "repo": "source", "rev": commit, "path": "file.txt"})
+    assert page["sha256"] == expected and page["content"] == "first line\nsecond line\n"

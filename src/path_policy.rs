@@ -152,6 +152,14 @@ impl ToolFailure {
         failure
     }
 
+    pub fn unsupported_file_type(argument: &Path) -> Self {
+        Self::refusal(
+            CODE_UNSUPPORTED_FILE_TYPE,
+            "unsupported file type for this read",
+            Some(argument),
+        )
+    }
+
     pub fn offline_tool_forbidden() -> Self {
         Self::refusal(
             "offline_tool_forbidden",
@@ -1291,11 +1299,7 @@ fn finalize_node(
     let is_reg = mode == libc::S_IFREG;
     let is_dir = mode == libc::S_IFDIR;
     if !is_reg && !is_dir {
-        return Err(ToolFailure::refusal(
-            CODE_UNSUPPORTED_FILE_TYPE,
-            "unsupported special file (device, FIFO, or socket) cannot be read",
-            Some(argument),
-        ));
+        return Err(ToolFailure::unsupported_file_type(argument));
     }
     sys::reopen(node.as_raw_fd(), final_flags).map_err(|e| map_open_err(argument, e))
 }

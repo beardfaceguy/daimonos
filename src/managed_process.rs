@@ -658,8 +658,10 @@ async fn capture_inner(
             stdout_bytes: stdout.total,
             stderr: stderr.render(),
             stdout_truncated: stdout.truncated(),
+            // Never publish the hash of a failed or partially drained command as evidence.
             stdout_sha256: stdout
                 .hash
+                .filter(|_| !timed_out && status.success())
                 .map(|h| format!("{:x}", sha2::Digest::finalize(h))),
             stderr_truncated: stderr.truncated(),
             timed_out,
@@ -862,6 +864,23 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn unsuccessful_capture_has_no_digest() {
+        let cfg = Config::default().process;
+        for (script, deadline) in [
+            ("printf partial; exit 3", None),
+            ("printf partial; sleep 5", Some(Duration::from_millis(100))),
+        ] {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            let (out, _) = capture_inner(&mut cmd, &cfg, None, None, deadline, true)
+                .await
+                .unwrap();
+            assert!(out.timed_out || !out.status.success());
+            assert!(out.stdout_sha256.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn capture_bounds_output_while_reading() {

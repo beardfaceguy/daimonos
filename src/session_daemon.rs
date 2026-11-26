@@ -2378,7 +2378,7 @@ impl SessionDaemon {
         max_frame_bytes: usize,
         limits: ProtocolLimits,
     ) -> Result<(), TransportError> {
-        let (listener, _socket_guard, owner_uid) = bind_local_socket(&socket_path)?;
+        let (listener, _socket_guard, owner_uid) = bind_local_socket(&socket_path, false)?;
         let (stream, _) = listener.accept().await?;
         verify_peer_owner(&stream, owner_uid)?;
         let transport = UnixSocketTransport::new(stream, "local", max_frame_bytes)?;
@@ -2388,11 +2388,13 @@ impl SessionDaemon {
     pub async fn serve_unix(
         self: Arc<Self>,
         socket_path: PathBuf,
+        selected_evidence_profile: bool,
         max_frame_bytes: usize,
         limits: ProtocolLimits,
         accept_error_backoff: std::time::Duration,
     ) -> Result<(), TransportError> {
-        let (listener, _socket_guard, owner_uid) = bind_local_socket(&socket_path)?;
+        let (listener, _socket_guard, owner_uid) =
+            bind_local_socket(&socket_path, selected_evidence_profile)?;
         let connection_limit = self
             .max_sessions
             .saturating_mul(self.max_clients_per_session)
@@ -2575,6 +2577,7 @@ fn remove_matching_regular_file((path, device, inode): &(PathBuf, u64, u64)) {
 
 fn bind_local_socket(
     socket_path: &Path,
+    selected_evidence_profile: bool,
 ) -> std::io::Result<(tokio::net::UnixListener, SocketPathGuard, u32)> {
     let parent = socket_path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -2652,7 +2655,7 @@ fn bind_local_socket(
     }
     // Publish identity before bind: once connect(2) can succeed, launchers are
     // guaranteed to observe the complete atomically-renamed metadata file.
-    let instance_file = write_instance_metadata(socket_path)?;
+    let instance_file = write_instance_metadata(socket_path, selected_evidence_profile)?;
     let listener = match tokio::net::UnixListener::bind(socket_path) {
         Ok(listener) => listener,
         Err(error) => {
@@ -2691,7 +2694,10 @@ pub(crate) fn instance_metadata_path(socket_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn write_instance_metadata(socket_path: &Path) -> std::io::Result<(PathBuf, u64, u64)> {
+fn write_instance_metadata(
+    socket_path: &Path,
+    selected_evidence_profile: bool,
+) -> std::io::Result<(PathBuf, u64, u64)> {
     let path = instance_metadata_path(socket_path);
     let mut temporary = path.as_os_str().to_os_string();
     temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
@@ -2710,6 +2716,7 @@ fn write_instance_metadata(socket_path: &Path) -> std::io::Result<(PathBuf, u64,
         "version": env!("CARGO_PKG_VERSION"),
         "socket": socket_path,
         "started_unix_ms": started_unix_ms,
+        "selected_evidence_profile": selected_evidence_profile,
         "bootstrap_fingerprint": std::env::var(
             crate::session_bootstrap::BOOTSTRAP_FINGERPRINT_ENV
         ).ok(),
@@ -7138,7 +7145,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        let error = match bind_local_socket(&directory.path().join("session.sock")) {
+        let error = match bind_local_socket(&directory.path().join("session.sock"), false) {
             Ok(_) => panic!("unsafe parent permissions must be rejected"),
             Err(error) => error,
         };
@@ -7152,9 +7159,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket_path = directory.path().join("session.sock");
-        let (listener, guard, _) = bind_local_socket(&socket_path).unwrap();
+        let (listener, guard, _) = bind_local_socket(&socket_path, false).unwrap();
 
-        let error = match bind_local_socket(&socket_path) {
+        let error = match bind_local_socket(&socket_path, false) {
             Ok(_) => panic!("second daemon must not replace the live socket"),
             Err(error) => error,
         };
@@ -7162,7 +7169,7 @@ mod tests {
 
         drop(listener);
         drop(guard);
-        assert!(bind_local_socket(&socket_path).is_ok());
+        assert!(bind_local_socket(&socket_path, false).is_ok());
     }
 
     #[tokio::test]
@@ -7174,7 +7181,7 @@ mod tests {
         drop(stale);
         assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_err());
 
-        let (listener, guard, _) = bind_local_socket(&socket_path).unwrap();
+        let (listener, guard, _) = bind_local_socket(&socket_path, false).unwrap();
         assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_ok());
         drop(listener);
         drop(guard);
@@ -7207,6 +7214,7 @@ mod tests {
         let daemon = Arc::new(SessionDaemon::new(1, 1, 8, 32));
         let server = tokio::spawn(Arc::clone(&daemon).serve_unix(
             socket_path.clone(),
+            false,
             4_096,
             protocol_limits(),
             std::time::Duration::from_millis(1),

@@ -1405,7 +1405,9 @@ def test_git_read_page_reserves_whole_blob_without_digest(daimonos_factory, tmp_
     git(repo, "commit", "-m", "large blob")
     args = {"command": "show_file", "repo": "source", "rev": git(repo, "rev-parse", "HEAD"),
             "path": path.name, "limit": 1}
-    size = path.stat().st_size
+    size = int(git(repo, "cat-file", "-s", f"{args['rev']}:{path.name}"))
+    path.write_text("worktree diverged")
+    assert path.stat().st_size != size
     for cap in (1024, size - 1, size):
         client = daimonos_factory(tmp_path, args=["--tool-input-bytes", str(cap)])
         result = client.call_tool("git_read", args)
@@ -1443,3 +1445,14 @@ def test_git_read_checks_input_allowance_before_display_cap(daimonos_factory, tm
     data = json.loads(_text(result))
     assert result.get("isError") and data.get("code") == "tool_input_limit", data
     assert data["configured"] == size - 1 and data["consumed"] == size
+
+
+def test_repeated_git_pages_consume_one_full_reservation_per_call(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+    repo, rev = repository(tmp_path)
+    size = int(git(repo, "cat-file", "-s", f"{rev}:file.txt"))
+    op = {"tool": "git_read", "arguments": {"command": "show_file", "repo": "source", "rev": rev, "path": "file.txt", "limit": 1}}
+    client = daimonos_factory(tmp_path, args=["--tool-input-bytes", str(size)])
+    results = json.loads(_text(client.call_tool("batch", {"ops": [op, op]})))
+    assert results[0]["ok"] and _child_failure(results[1])["consumed"] == 2 * size
+    assert not client.call_tool("git_read", op["arguments"]).get("isError")

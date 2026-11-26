@@ -126,6 +126,8 @@ Local analytics collection and remote telemetry export have different controls.
 
 ### WP20: offline dispositions and evidence
 
+The authority is `Config::network` (caller-only, `#[serde(skip)]`). Startup sites in `main` set `observability.enabled`, `tool_output.reformat.enabled`, and `analytics.enabled` before validation or provisioning. They skip `session::enhance_process_path`, KGL startup indexing, and the resource sampler. `provisioning::build_tool_services` does not register or probe plugins. `DaimonosHandler::call_tool` and `run_mcp_socket_connection` check the copied authority before special routes; the catalog uses the same caller-narrowed policy. KGL per-call observation and instruction hints also test the authority. `tests/test_offline_tools.py` exercises all offered tools and audits syscalls with failed network positive controls. Register a new producer here before adding it to the offline profile.
+
 | IDs | Offline disposition |
 |---|---|
 | N01–N06, N21 | Refuse agent, chat, ACP, and session-daemon modes before loading configuration. The worker constructs no provider, catalog, retry, or summary client. |

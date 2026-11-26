@@ -649,6 +649,7 @@ async fn main() -> anyhow::Result<()> {
     cfg.workspace_read_only = cli.workspace_read_only;
     if cfg.workspace_read_only
         && cfg.state_authority.is_none()
+        // Offline mode disables both KGL producers at their start sites. ADR-032.
         && !network.offline()
         && (kgl::autoindex::enabled() || kgl::observe::enabled())
     {
@@ -1408,7 +1409,14 @@ async fn main() -> anyhow::Result<()> {
             agent_runtime::run_acp(args, &workspace, Arc::clone(&cfg), token_log).await
         }
         Some(Command::SessionDaemon(args)) => {
-            agent_runtime::run_session_daemon(args, &workspace, Arc::clone(&cfg), token_log).await
+            agent_runtime::run_session_daemon(
+                args,
+                &workspace,
+                Arc::clone(&cfg),
+                token_log,
+                cli.analytics_off,
+            )
+            .await
         }
         Some(Command::Session(args)) => session_interchange::run(args, &cfg),
         Some(Command::McpConfig(args)) => mcp_config_cmd::run(args),

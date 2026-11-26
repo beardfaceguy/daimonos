@@ -10,6 +10,7 @@ pub enum ReadError {
     Io(io::Error),
     Limit(BudgetHit),
     Changed,
+    NotRegular,
 }
 
 impl From<io::Error> for ReadError {
@@ -38,7 +39,7 @@ fn stamp(meta: &Metadata) -> (u64, i64, i64, i64, i64) {
 pub fn read(mut file: File, budget: Option<&ToolBudget>) -> Result<(Vec<u8>, String), ReadError> {
     let before = file.metadata()?;
     if !before.is_file() {
-        return Err(io::Error::other("read digest requires a regular file").into());
+        return Err(ReadError::NotRegular);
     }
     if let Some(b) = budget {
         b.check_deadline()?;

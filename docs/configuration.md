@@ -1843,6 +1843,8 @@ git archive "$rev" Dockerfile .dockerignore Cargo.toml Cargo.lock daimonos.defau
 docker run --rm --pull=never --network none "daimonos-local:$rev" --version
 ```
 
+After CLI syntax validation, `--version` prints identity and exits without starting even a selected subcommand. Invalid syntax still returns exit 2.
+
 The OCI labels `org.opencontainers.image.version` and `org.opencontainers.image.revision` describe the executable. The MCP `serverInfo.version` still reports the package version. The tool contract has its own version. A native build without a supplied commit reports `source_commit unknown`; it does not query the runtime workspace.
 
 Start the worker with a private, writable state mount. The UID and GID of that mount must match the process. Mount only the evidence the worker should see. Keep model credentials and the Docker socket outside the container.
@@ -2007,7 +2009,7 @@ The default-off options `--tool-timeout-ms`, `--tool-input-bytes`, and
 - **Input bytes.** `search` in content mode charges the bytes that it scans and
   stops during the scan. `read_file` checks the file size before the read and
   charges the whole file, also when `offset` and `limit` select a part.
-  `git_read show_file` resolves the commit and blob, obtains the stored size, and reserves that many bytes before reading the blob. This applies with or without `--read-sha256`. A failed reservation reports the attempted cumulative size and returns no content or digest. It takes precedence over display caps. The counter measures logical blob content, not physical I/O or Git metadata lookups.
+  `git_read show_file` resolves the commit and blob, obtains the stored size, and reserves that many bytes before reading the blob. This applies with or without `--read-sha256`. A failed reservation reports the attempted cumulative size and returns no content or digest. It takes precedence over display caps. The counter measures logical blob content, not physical I/O or Git metadata lookups. Each `show_file` call reserves the full size, even for another page of the same object. A later binary refusal, display cap, or read failure does not refund the reservation. A new top-level call starts a new budget.
 - **Entries.** `ls` charges each directory entry during the walk and stops at
   the limit.
 - **Refused under an input or entry limit.** With `--tool-input-bytes` or

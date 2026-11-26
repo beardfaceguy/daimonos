@@ -380,7 +380,7 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
 }
 
 fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIdentity> {
-    if options.config_path.is_none()
+    let bare = options.config_path.is_none()
         && options.provider.is_none()
         && options.agent_env.is_none()
         && options.state_dir.is_none()
@@ -394,13 +394,15 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && !options.analytics_off
         && !options.no_follow
         && !options.tool_budget.any_enabled()
-    {
+        && !options.full_tool_schemas;
+    let metadata = instance_metadata(options.socket_path)?;
+    let value = metadata.as_ref();
+    let selected = value.and_then(|v| v["selected_evidence_profile"].as_bool()) == Some(true);
+    if bare && !selected {
+        // Keep bare attachment semantics for other profiles and older/manual daemons.
         return Ok(LaunchIdentity::NotRequested);
     }
-    let Some(value) = instance_metadata(options.socket_path)? else {
-        return Ok(LaunchIdentity::Unavailable);
-    };
-    let Some(fingerprint) = value["bootstrap_fingerprint"].as_str() else {
+    let Some(fingerprint) = value.and_then(|v| v["bootstrap_fingerprint"].as_str()) else {
         return Ok(LaunchIdentity::Unavailable);
     };
     Ok(if fingerprint == bootstrap_fingerprint(options) {
@@ -697,6 +699,38 @@ mod tests {
             LaunchIdentity::NotRequested,
             "explicit-only mode must request a pinned daemon identity"
         );
+    }
+
+    #[test]
+    fn bare_client_compares_a_bootstrapped_daemons_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.provider = None;
+        opts.agent_env = None;
+        let path = crate::session_daemon::instance_metadata_path(&socket);
+        std::fs::write(&path, br#"{"pid":1,"selected_evidence_profile":true}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(launch_identity(&opts).unwrap(), LaunchIdentity::Unavailable);
+        for (digest, analytics, expected) in [
+            (true, false, LaunchIdentity::Mismatched),
+            (false, true, LaunchIdentity::Mismatched),
+            (false, false, LaunchIdentity::NotRequested),
+        ] {
+            opts.read_sha256 = digest;
+            opts.analytics_off = analytics;
+            std::fs::write(
+                &path,
+                serde_json::json!({"pid":1,"bootstrap_fingerprint":bootstrap_fingerprint(&opts),"selected_evidence_profile":digest || analytics})
+                    .to_string(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            opts.read_sha256 = false;
+            opts.analytics_off = false;
+            assert_eq!(launch_identity(&opts).unwrap(), expected);
+        }
     }
 
     #[test]

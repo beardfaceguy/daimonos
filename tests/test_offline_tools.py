@@ -166,6 +166,14 @@ def test_offline_contract_matches_the_served_selection(daimonos_binary, daimonos
 # AC-18.1 must count attempts, not just successful connections. Normal CI can
 # run the behavioral tests without ptrace. Set DAIMONOS_TEST_STRACE to opt in:
 # a missing observer, unsupported namespace, or missing control then fails.
+def assert_offline_trace(events, executable):
+    # No IP sockets, outbound connects (including resolver proxies), async network
+    # submission, or replacement/child program, even if the syscall failed.
+    assert not re.search(r'AF_INET6?|\bconnect\(|io_uring_setup\(', events), events
+    assert len(re.findall(r'\bexecve(?:at)?\(', events)) == 1, events
+    assert f'execve("{executable}",' in events, events
+
+
 def test_offline_lifecycle_under_network_observer(daimonos_binary, tmp_path):
     import sys
 
@@ -195,6 +203,17 @@ def test_offline_lifecycle_under_network_observer(daimonos_binary, tmp_path):
     _, positive = trace("positive", [sys.executable, "-c", probe])
     assert re.search(r'connect\(.*AF_INET.*= -1', positive), positive
     assert re.search(r'sendto\(.*htons\(53\).* = -1', positive), positive
+
+    # Verify IPv6 decoding too when the kernel supports an IPv6 socket.
+    import socket
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM):
+            pass
+    except OSError:
+        pass
+    else:
+        _, ipv6 = trace("positive6", [sys.executable, "-c", "import socket; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).sendto(b'probe',('::1',53))"])
+        assert re.search(r"sendto\(.*AF_INET6.*htons\(53\)", ipv6), ipv6
 
     (ws / "evidence.txt").write_text("local evidence")
     # A promisor repo with an absent object: even a plausible git_read request
@@ -246,11 +265,7 @@ def test_offline_lifecycle_under_network_observer(daimonos_binary, tmp_path):
     rejected, refusal_activity = trace("model", [*args, "agent", "task"])
     assert rejected.returncode == 2 and json.loads(rejected.stderr)["error"]["reason"] == "offline_profile_incompatible"
     for events in [activity, contract_activity, refusal_activity]:
-        # No IP socket, resolver proxy (including Unix-domain connect), asynchronous
-        # network submission, or program execution other than the traced binary.
-        assert not re.search(r'AF_INET6?|\bconnect\(|io_uring_setup\(', events), events
-        launches = re.findall(r'\bexecve(?:at)?\(', events)
-        assert len(launches) == 1 and str(daimonos_binary) in events, events
+        assert_offline_trace(events, daimonos_binary)
 
 
 def test_offline_unix_socket_sessions_inherit_admission(daimonos_binary, tmp_path):
@@ -295,5 +310,4 @@ def test_offline_unix_socket_sessions_inherit_admission(daimonos_binary, tmp_pat
                 time.sleep(0.01)
             events = log.read_text()
             assert "AF_UNIX" in events and "accept" in events
-            assert not re.search(r"AF_INET6?|\bconnect\(|io_uring_setup\(", events), events
-            assert len(re.findall(r"\bexecve(?:at)?\(", events)) == 1, events
+            assert_offline_trace(events, daimonos_binary)

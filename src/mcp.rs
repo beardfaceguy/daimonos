@@ -826,23 +826,16 @@ async fn dispatch_tool_inner(
                     Some("git_read"), "only show_file supports Git input budgets",
                 ).into_response("git_read"));
             }
-            let run_result = registry
-                .run(
-                    "git_read",
-                    &command,
-                    &session.workspace,
-                    &session.env,
-                    None,
-                    Some(args),
-                )
-                .await;
+            let (run_result, hit) = crate::plugins::git_read::with_call_hit(registry.run(
+                "git_read", &command, &session.workspace, &session.env, None, Some(args)
+            )).await;
+            if let Some(hit) = hit {
+                session.note_budget_hit(&hit);
+                return response_to_result(hit.into_failure(Some("git_read")).into_response("git_read"));
+            }
             match run_result {
                 Ok(result) => {
                     let text = result.output.to_string();
-                    if let Some(hit) = session.tool_budget().and_then(|b| b.take_plugin_hit()) {
-                        session.note_budget_hit(&hit);
-                        return response_to_result(hit.into_failure(Some("git_read")).into_response("git_read"));
-                    }
                     if result.exit_code == 0 {
                         ok_text(text)
                     } else {

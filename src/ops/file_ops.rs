@@ -115,6 +115,10 @@ async fn read_with_digest(session: &mut Session, op: &Op) -> Response {
             session.note_budget_hit(&hit);
             return hit.into_failure(Some(raw)).into_response("read_file");
         }
+        Ok(Err(ReadError::NotRegular)) => {
+            return crate::path_policy::ToolFailure::unsupported_file_type(Path::new(raw))
+                .into_response("read_file")
+        }
         Ok(Err(ReadError::Changed)) => {
             return crate::path_policy::ToolFailure::file_changed(Path::new(raw))
                 .into_response("read_file");

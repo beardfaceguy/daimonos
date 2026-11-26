@@ -1388,6 +1388,7 @@ pub async fn run_session_daemon(
     workspace: &Path,
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
+    analytics_off: bool,
 ) -> anyhow::Result<()> {
     enforce_full_schema_contract(&cfg, workspace);
     let SessionDaemonArgs {
@@ -1596,6 +1597,7 @@ pub async fn run_session_daemon(
     );
     let serve = Arc::clone(&daemon).serve_unix(
         socket_path,
+        cfg.read_sha256 || analytics_off,
         cfg.session.max_frame_bytes,
         cfg.session.protocol_limits(),
         std::time::Duration::from_millis(cfg.session.accept_error_backoff_ms),

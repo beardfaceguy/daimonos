@@ -78,6 +78,40 @@ def test_restricted_stdio_reads_caller_workspace(image, tmp_path, mount, uid):
     assert list(workspace.iterdir()) == [fixture] and fixture.read_text() == "from caller mount"
 
 
+def test_offline_unix_socket_in_restricted_image(image, tmp_path):
+    from test_mcp_socket import McpSocketClient
+    import time
+    import uuid
+
+    host_socket = tmp_path / "ipc"
+    host_socket.mkdir()
+    host_socket.chmod(0o700)  # owner-only directory under the private state root
+    cid = "wp12-" + uuid.uuid4().hex
+    # Use the invoking UID for the owner-only socket so the host test client can connect.
+    uid = os.geteuid()
+    if uid == 0:
+        pytest.skip("the host client must use a non-root UID for the owner-only Unix socket")
+    argv = [*restricted(uid), "--name", cid, "--mount", f"type=bind,src={host_socket},dst=/state/ipc", image,
+            "--workspace", "/workspace", "--state-dir", "/state", "--offline-tools", "mcp", "--socket", "/state/ipc/tool.sock"]
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as server:
+        try:
+            deadline = time.monotonic() + 20
+            while not (host_socket / "tool.sock").is_socket():
+                assert server.poll() is None, server.stderr.read()
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+            client = McpSocketClient(str(host_socket / "tool.sock"))
+            try:
+                client.handshake()
+                assert {t["name"] for t in client.list_tools()} == {"ls", "search", "workspace_info", "read_file"}
+                assert not client.call_tool("ls").get("isError")
+            finally:
+                client.close()
+        finally:
+            subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=15)
+            server.wait(timeout=15)
+
+
 def test_default_invocation_still_serves_stdio(image):
     assert mcp_exchange(["docker", "run", "--pull=never", "--rm", "-i", "--network", "none", image],
                         [])[1]["serverInfo"]["name"] == "daimonos"
@@ -114,12 +148,19 @@ def test_model_calls_restricted_container_worker(image, daimonos_binary, tmp_pat
         # pytest mount path. Use a distinct synthetic key, not a weaker worker guard.
         host.agent_env.write_text(host.agent_env.read_text().replace("DAIMONOS_AGENT_API_KEY=test\n",
                                                                     "DAIMONOS_AGENT_API_KEY=wp12-fake-noncredential\n"))
+        state = tmp_path / "model-state"
+        state.mkdir(mode=0o700)
+        audit = state / "audit.jsonl"
+        host.config.write_text("[analytics]\nenabled=false\n")
+        assert not list(host.workspace.iterdir()) and workspace.parent == host.workspace.parent
         done = host.agent("--worker-config", str(manifest), "--output", "json", "read evidence",
-                          global_args=["--tool-allowlist", str(selection)])
+                          global_args=["--tool-allowlist", str(selection), "--state-dir", str(state), "--audit-path", str(audit)])
         assert done.returncode == 0, done.stderr
         assert json.loads(done.stdout)["final_text"] == "done"
         messages = [m for m in provider.requests[-1]["messages"] if m.get("role") == "tool"]
         assert len(messages) == 1 and "wp12 isolated worker evidence" in messages[0]["content"], messages
+        calls = [event for line in audit.read_text().splitlines() if (event := json.loads(line))["kind"] == "tool_call"]
+        assert [e["route"] for e in calls] == ["worker"] and not list(host.workspace.iterdir())
     finally:
         provider.close()
 

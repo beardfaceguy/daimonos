@@ -32,6 +32,20 @@ const OPERATIONS: &[&str] = &[
     "worktree_status",
 ];
 
+// A batch shares byte counters, but a refusal belongs to just one registry future.
+tokio::task_local! { static CALL_HIT: std::cell::Cell<Option<crate::tool_budget::BudgetHit>>; }
+
+pub async fn with_call_hit<F: std::future::Future>(
+    f: F,
+) -> (F::Output, Option<crate::tool_budget::BudgetHit>) {
+    CALL_HIT
+        .scope(std::cell::Cell::new(None), async {
+            let result = f.await;
+            (result, CALL_HIT.with(std::cell::Cell::take))
+        })
+        .await
+}
+
 pub struct GitReadPlugin {
     descriptor: ToolDescriptor,
     limits: GitReadConfig,
@@ -321,7 +335,7 @@ impl GitReadPlugin {
                 // and JSON rendering do not change its logical input size (ADR-031).
                 if let Some(budget) = crate::managed_process::current_tool_budget() {
                     if let Err(hit) = budget.charge_input(size as u64) {
-                        budget.record_plugin_hit(&hit);
+                        let _ = CALL_HIT.try_with(|cell| cell.set(Some(hit)));
                         return Err(Failure::new(
                             "tool_input_limit",
                             "blob exceeds input budget",
