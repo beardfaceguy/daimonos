@@ -496,3 +496,18 @@ def test_tool_contract_creates_no_state_analytics_or_log(daimonos_binary, tmp_pa
             f"tool-contract created files under {scope} "
             f"(includes the resolved state directory): {new_files}"
         )
+
+
+@pytest.mark.parametrize("names", [[], ["read_file", "search"], ["get_tool_schema"]])
+def test_explicit_allowlist_dump_matches_serving_without_offline_mode(daimonos_binary, daimonos_factory, tmp_path, names):
+    selection = tmp_path / "allow.json"
+    selection.write_text(json.dumps(names))
+    flags = ["--tool-allowlist", str(selection), "--full-tool-schemas"]
+    client = daimonos_factory(tmp_path, args=flags)
+    served = [(t["name"], t["description"], t["inputSchema"]) for t in client.list_tools()]
+    assert {name for name, _, _ in served} == set(names)
+    argv = [daimonos_binary, "-w", str(tmp_path), *flags, "tool-contract"]
+    raw = subprocess.check_output(argv)
+    assert raw == subprocess.check_output(argv)
+    exported = json.loads(raw)["tools"]
+    assert [(t["name"], t["description"], t["input_schema"]) for t in exported] == served

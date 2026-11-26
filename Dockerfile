@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 #
 # Daimonos — agent-optimized MCP server.
 #
@@ -7,39 +6,54 @@
 # image is NOT the recommended way to deploy daimonos — for editor
 # integration, use the native binary from GitHub Releases.
 #
-# Build:   docker build -t daimonos .
+# Build a pinned local image (no registry push). See docs/configuration.md.
+# Supply VERSION from Cargo.toml and SOURCE_COMMIT from the archived source.
 # Run:     docker run --rm -i -v "$PWD":/workspace daimonos
 #
 # The container reads MCP requests from stdin and writes responses to
-# stdout, so `-i` is required. Mount your project at /workspace.
+# stdout, so `-i` is required. With no arguments the workspace is /workspace.
 #
-# Glama releases: add a build step `ENV DAIMONOS_MCP_FULL_SCHEMAS=1` so
-# list_tools exposes full JSON Schemas for Terse-tier tools (TDQS scoring).
+# Set DAIMONOS_MCP_FULL_SCHEMAS=1 at runtime to list full schemas.
 
 # ---- build stage ----
-FROM rust:1-bookworm AS build
+FROM rust:1.96.0-bookworm AS build
 WORKDIR /src
 
 # Copy only the files cargo needs to resolve and build, so unrelated
 # changes (docs, tests, distro/, etc.) don't invalidate the cache.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock daimonos.default.toml ./
+COPY prompts ./prompts
 COPY src ./src
 
-RUN cargo build --release --locked \
- && strip target/release/daimonos
+ARG SOURCE_COMMIT
+ARG VERSION
+RUN case "$SOURCE_COMMIT" in *[!0-9a-f]*) exit 1 ;; esac \
+ && test "${#SOURCE_COMMIT}" = 40 \
+ && test -n "$VERSION" \
+ && DAIMONOS_SOURCE_COMMIT="$SOURCE_COMMIT" cargo build --release --locked -j 1 \
+ && strip target/release/daimonos \
+ && target/release/daimonos --version | grep -Fx "daimonos $VERSION" \
+ && target/release/daimonos --version | grep -Fx "source_commit $SOURCE_COMMIT"
 
 # ---- runtime stage ----
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
+ARG SOURCE_COMMIT
+ARG VERSION
+LABEL org.opencontainers.image.revision="$SOURCE_COMMIT" \
+      org.opencontainers.image.version="$VERSION"
 
 # git is needed for daimonos's git tool plugin to auto-register.
 # ca-certificates is needed for any HTTPS calls the agent may make.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && install -d -m 0700 -o 65532 -g 65532 /home/daimonos
 
 COPY --from=build /src/target/release/daimonos /usr/local/bin/daimonos
 
+RUN install -d -m 0755 -o 65532 -g 65532 /workspace
 WORKDIR /workspace
-# Intentionally runs as the invoking user (workspace owner) — USER directive
-# would break volume-mounted workspace file ownership at runtime.
-ENTRYPOINT ["daimonos", "--mcp", "-w", "/workspace"] # nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
+ENV HOME=/home/daimonos
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/daimonos"]
+CMD ["mcp"]

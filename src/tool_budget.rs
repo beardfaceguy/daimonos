@@ -38,8 +38,7 @@ use crate::path_policy::ToolFailure;
 /// entries walked); `search` (content mode charges scanned bytes in the
 /// blocking worker — the index/files mode is refused separately in `ops::find`
 /// because cached-index content is not a scannable byte count); `git_read`
-/// (metered by the bytes of git object content it returns — D61 approximation,
-/// recorded in docs/configuration.md).
+/// (only `show_file` is admitted by dispatch; it reserves the pinned blob size).
 ///
 /// Admitted because they read NO workspace or external content to meter:
 /// `write_file`, `append_file` (write output only; they scan no input);
@@ -194,8 +193,7 @@ impl ToolBudget {
         .into_failure(argument)
     }
 
-    /// Error if the absolute deadline has passed. Checked at bounded work
-    /// boundaries by native/index readers.
+    /// Refuse once the shared absolute deadline has passed.
     pub fn check_deadline(&self) -> Result<(), BudgetHit> {
         if let Some(d) = self.deadline {
             if Instant::now() >= d {

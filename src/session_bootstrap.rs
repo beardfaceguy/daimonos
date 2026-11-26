@@ -30,6 +30,8 @@ pub struct BootstrapOptions<'a> {
     /// daemon launch identity so a daemon started with the mode is never reused
     /// by a frontend that did not request it, and vice versa.
     pub ignore_config_files: bool,
+    /// Forward the caller's collection policy and refuse reuse of a collecting daemon.
+    pub analytics_off: bool,
     /// Independent no-follow option (WP14). Part of the daemon's launch
     /// identity so a pinned session daemon enforces the same link policy.
     pub no_follow: bool,
@@ -61,6 +63,7 @@ pub struct BootstrapOptions<'a> {
     /// Part of the launch identity so a frontend requesting it cannot silently
     /// attach to a daemon launched without it.
     pub full_tool_schemas: bool,
+    pub read_sha256: bool,
     /// FR-19 (WP18, ADR-031): the caller's cooperative tool-budget options.
     /// Part of the daemon's immutable launch identity exactly like
     /// `workspace_read_only`: forwarded in `daemon_args`, hashed into
@@ -235,6 +238,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
         args.push(OsString::from("--agent-instructions"));
         args.push(path.as_os_str().to_owned());
     }
+    if options.analytics_off {
+        args.push(OsString::from("--analytics-off"));
+    }
     if options.debug_tokens {
         args.push(OsString::from("--debug-tokens"));
     }
@@ -285,6 +291,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
     if let Some(path) = options.agent_env {
         args.push(OsString::from("--agent-env"));
         args.push(path.as_os_str().to_owned());
+    }
+    if options.read_sha256 {
+        args.push(OsString::from("--read-sha256"));
     }
     if options.full_tool_schemas {
         args.push(OsString::from("--full-tool-schemas"));
@@ -358,6 +367,12 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
         digest.update(provider.as_bytes());
     }
     digest.update([0_u8]);
+    if options.read_sha256 {
+        digest.update(b"read-sha256\0");
+    }
+    if options.analytics_off {
+        digest.update(b"analytics-off\0");
+    }
     if options.full_tool_schemas {
         digest.update(b"full-tool-schemas\0");
     }
@@ -365,7 +380,7 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
 }
 
 fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIdentity> {
-    if options.config_path.is_none()
+    let bare = options.config_path.is_none()
         && options.provider.is_none()
         && options.agent_env.is_none()
         && options.state_dir.is_none()
@@ -375,15 +390,19 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.tool_allowlist.is_none()
         && options.confine_identity.is_none()
         && !options.ignore_config_files
+        && !options.read_sha256
+        && !options.analytics_off
         && !options.no_follow
         && !options.tool_budget.any_enabled()
-    {
+        && !options.full_tool_schemas;
+    let metadata = instance_metadata(options.socket_path)?;
+    let value = metadata.as_ref();
+    let selected = value.and_then(|v| v["selected_evidence_profile"].as_bool()) == Some(true);
+    if bare && !selected {
+        // Keep bare attachment semantics for other profiles and older/manual daemons.
         return Ok(LaunchIdentity::NotRequested);
     }
-    let Some(value) = instance_metadata(options.socket_path)? else {
-        return Ok(LaunchIdentity::Unavailable);
-    };
-    let Some(fingerprint) = value["bootstrap_fingerprint"].as_str() else {
+    let Some(fingerprint) = value.and_then(|v| v["bootstrap_fingerprint"].as_str()) else {
         return Ok(LaunchIdentity::Unavailable);
     };
     Ok(if fingerprint == bootstrap_fingerprint(options) {
@@ -491,6 +510,7 @@ mod tests {
             confine_reference: None,
             confine_identity: None,
             ignore_config_files: false,
+            analytics_off: false,
             no_follow: false,
             debug_tokens: false,
             workspace_read_only: false,
@@ -502,6 +522,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             retry_interval: Duration::from_millis(1),
             full_tool_schemas: false,
+            read_sha256: false,
         }
     }
 
@@ -681,6 +702,90 @@ mod tests {
     }
 
     #[test]
+    fn bare_client_compares_a_bootstrapped_daemons_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.provider = None;
+        opts.agent_env = None;
+        let path = crate::session_daemon::instance_metadata_path(&socket);
+        std::fs::write(&path, br#"{"pid":1,"selected_evidence_profile":true}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(launch_identity(&opts).unwrap(), LaunchIdentity::Unavailable);
+        for (digest, analytics, expected) in [
+            (true, false, LaunchIdentity::Mismatched),
+            (false, true, LaunchIdentity::Mismatched),
+            (false, false, LaunchIdentity::NotRequested),
+        ] {
+            opts.read_sha256 = digest;
+            opts.analytics_off = analytics;
+            std::fs::write(
+                &path,
+                serde_json::json!({"pid":1,"bootstrap_fingerprint":bootstrap_fingerprint(&opts),"selected_evidence_profile":digest || analytics})
+                    .to_string(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            opts.read_sha256 = false;
+            opts.analytics_off = false;
+            assert_eq!(launch_identity(&opts).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn selected_client_rejects_plain_and_unfingerprinted_daemons() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.provider = None;
+        opts.agent_env = None;
+        let plain = bootstrap_fingerprint(&opts);
+        let metadata = crate::session_daemon::instance_metadata_path(&socket);
+        for (digest, analytics) in [(true, false), (false, true)] {
+            opts.read_sha256 = digest;
+            opts.analytics_off = analytics;
+            for (record, expected) in [
+                (
+                    serde_json::json!({"selected_evidence_profile":false,"bootstrap_fingerprint":plain}),
+                    LaunchIdentity::Mismatched,
+                ),
+                (
+                    serde_json::json!({"bootstrap_fingerprint":plain}),
+                    LaunchIdentity::Mismatched,
+                ),
+                (serde_json::json!({"pid":1}), LaunchIdentity::Unavailable),
+                (
+                    serde_json::json!({"selected_evidence_profile":true,"bootstrap_fingerprint":bootstrap_fingerprint(&opts)}),
+                    LaunchIdentity::Matched,
+                ),
+            ] {
+                std::fs::write(&metadata, record.to_string()).unwrap();
+                std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                assert_eq!(launch_identity(&opts).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn read_digest_changes_daemon_identity_and_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.agent_env = None;
+        opts.provider = None;
+        let plain = bootstrap_fingerprint(&opts);
+        assert!(!daemon_args(&opts).contains(&OsString::from("--read-sha256")));
+        opts.read_sha256 = true;
+        assert_ne!(plain, bootstrap_fingerprint(&opts));
+        assert!(daemon_args(&opts).contains(&OsString::from("--read-sha256")));
+        assert_eq!(launch_identity(&opts).unwrap(), LaunchIdentity::Unavailable);
+    }
+
+    #[test]
     fn daemon_args_include_full_tool_schemas_when_requested() {
         let mut opts = options(
             Path::new("/workspace"),
@@ -719,6 +824,28 @@ mod tests {
             bootstrap_fingerprint(&first),
             bootstrap_fingerprint(&second)
         );
+    }
+
+    // ADR-032: a client that disables analytics must not reuse a collecting daemon.
+    #[test]
+    fn analytics_off_is_forwarded_and_requires_a_matching_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.provider = None;
+        opts.agent_env = None;
+        let plain = bootstrap_fingerprint(&opts);
+        assert!(!daemon_args(&opts).contains(&OsString::from("--analytics-off")));
+        assert_eq!(
+            launch_identity(&opts).unwrap(),
+            LaunchIdentity::NotRequested
+        );
+
+        opts.analytics_off = true;
+        assert!(daemon_args(&opts).contains(&OsString::from("--analytics-off")));
+        assert_ne!(bootstrap_fingerprint(&opts), plain);
+        assert_eq!(launch_identity(&opts).unwrap(), LaunchIdentity::Unavailable);
     }
 
     #[test]

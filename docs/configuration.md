@@ -1386,11 +1386,27 @@ Content capture is not currently configurable: export is unconditionally
 metadata-only. A future redacted content mode will add an explicit opt-in only
 when its privacy tests and limits ship with it.
 
+### Offline evidence workers (ADR-032)
+
+Start the tool process with `daimonos --workspace REPO --offline-tools mcp`.
+For local IPC, add `--socket PATH` after `mcp`. `tool-contract` also accepts the profile.
+Use a separate process for the model. Keep the run audit on that side.
+
+The worker admits `ls`, `read_file`, `search` (content and filenames), and `workspace_info`.
+A caller allowlist can narrow that set. Selecting an incompatible tool or runtime mode stops startup with `offline_profile_incompatible` (exit 2).
+A direct call to an unsupported tool returns `offline_tool_forbidden`. This includes `git_read`, subprocess tools and composite calls.
+
+Offline mode disables analytics collection, OTLP export, KGL producers, model-assisted output formatting, and plugin startup probes.
+It does not grant filesystem confinement or promise a read-only workspace. Use the filesystem flags for those controls.
+Retain a no-network container or namespace for defense in depth. See the [network producer inventory](contexts/reviewer-runtime/INVENTORIES.md) for the scope and acceptance check.
+
 ### `[analytics]` — Token & Latency Tracking
 
 Daimonos records every MCP tool call (request/response token estimates,
 execution time, redirect/filter/dedup signals) to a SQLite database for
-cross-session reporting. Disable to opt out entirely.
+cross-session reporting. Pass `--analytics-off` to disable collection for one run,
+even if the configuration enables it. The flag does not disable OTLP export or
+a requested local audit. It does not block network access.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -1657,6 +1673,16 @@ This captures Daimonos's outgoing schema, not OpenRouter's downstream transforme
 request. It cannot recover older requests, prove downstream behavior, or correlate
 raw model responses; the UUID is local, not a provider request ID.
 
+## File evidence digests
+
+Pass `--read-sha256` to add a lowercase SHA-256 digest to `read_file` and `git_read` with `command: show_file`. The digest covers all stored bytes, including original line endings. The offset, line limit, output cap, and unchanged-file cache do not change its meaning.
+
+A text result carries `sha256`. A binary `read_file` result carries `binary`, `size`, and `sha256` without content. A Git binary or output-limit refusal can carry `metadata.sha256`. The Git digest identifies the pinned blob bytes, not the current worktree or the Git object header. Strict-pinning rules still apply.
+
+Supply `--tool-input-bytes` and `--tool-timeout-ms` to bound this work. A one-line page can require a full file read. A budget failure returns no digest. When `read_file` detects a change on the opened handle, it returns `file_changed`; retry the read. This check is not a filesystem snapshot. Large filesystem reads still buffer the file; use a byte limit for untrusted sizes.
+
+Digest mode bypasses model-assisted reformatting for these two tools. A Git output cap too small for the complete metadata error stops startup with `digest_metadata_cap`. Without `--read-sha256`, the existing read shapes and Git cap behavior stay unchanged.
+
 ## Read-only git (`git_read`)
 
 `git_read.strict_pinning` is false by default. Enable it to require explicit
@@ -1805,6 +1831,37 @@ Opt-in (FR-04 requirements 14–17 / ADR-027). `daimonos agent --print --capabil
 - **Audited.** With `--audit-path`, the verdict is recorded as one `probe_result` event (`status` `model_supported`/`model_unsupported`, plus `reason` on failure); the credential value never appears. No live credentialed endpoint is required. The probe request's `http_status`, `retry_index`, and the profile's `wire` are recorded on that same `probe_result` event (the probe is one request to the model endpoint). Its endpoint-reported token counts are recorded on that event as `usage` (the same `{input_tokens, output_tokens}` shape as `model_request.usage`, zero counts when the endpoint reports none). A failed probe also makes the terminal `run_end` record its `exit_code` 21 / `status` `model_unsupported`, matching the process exit. For the agent loop's own requests over the controlled transport, each `model_request` event carries the observed `http_status`, `retry_index`, and `wire`.
 
 Model-facing probe wording lives in `prompts/capability_probe.md` (the system-turn framing) and `prompts/capability_probe_directive.md` (the user-turn directive template, into which only the final-tool name and the payload are interpolated as data). See `src/capability_probe.rs` and ADR-027.
+## Restricted local container (FR-10)
+
+Build from a pinned Git tree, not a dirty worktree. The build can download base images, packages, and locked Cargo dependencies. It does not publish an image. Run these commands at the repository root (Docker, Git, and Python 3.11+):
+
+```sh
+rev=$(git rev-parse HEAD)
+version=$(git show "$rev:Cargo.toml" | python3 -c 'import sys,tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])')
+git archive "$rev" Dockerfile .dockerignore Cargo.toml Cargo.lock daimonos.default.toml src prompts |
+  docker build --build-arg SOURCE_COMMIT="$rev" --build-arg VERSION="$version" -t "daimonos-local:$rev" -
+docker run --rm --pull=never --network none "daimonos-local:$rev" --version
+```
+
+After CLI syntax validation, `--version` prints identity and exits without starting even a selected subcommand. Invalid syntax still returns exit 2.
+
+The OCI labels `org.opencontainers.image.version` and `org.opencontainers.image.revision` describe the executable. The MCP `serverInfo.version` still reports the package version. The tool contract has its own version. A native build without a supplied commit reports `source_commit unknown`; it does not query the runtime workspace.
+
+Start the worker with a private, writable state mount. The UID and GID of that mount must match the process. Mount only the evidence the worker should see. Keep model credentials and the Docker socket outside the container.
+
+```sh
+docker run --rm -i --pull=never --read-only --network none --cap-drop ALL \
+  --user 12345:12345 --security-opt no-new-privileges \
+  --mount "type=bind,src=$PWD,dst=/review,readonly" \
+  --tmpfs /state:rw,noexec,nosuid,nodev,uid=12345,gid=12345,mode=0700 \
+  "daimonos-local:$rev" --workspace /review --state-dir /state \
+  --workspace-read-only --ignore-config-files mcp
+```
+
+For `--worker-config`, use `docker` as the worker command and pass the arguments above as individual array entries. The host runs the model; the container serves the same MCP stdio protocol. Do not allocate a TTY. The no-argument image command still serves MCP in `/workspace`. A different workspace requires only CLI arguments, not an entrypoint override.
+
+To verify an existing local image against the current checkout, set `DAIMONOS_TEST_IMAGE=daimonos-local:$rev` and run `python3 -m pytest tests/test_container_runtime.py tests/test_cli_modes.py`. Without the variable, pytest skips the Docker checks. A skip is not a successful container check.
+
 ## Credential-free worker execution (`--worker-config`)
 
 Opt-in (FR-05 / ADR-028). `daimonos agent --worker-config <PATH>` makes a
@@ -1892,8 +1949,8 @@ top-level tool call may consume. They are caller-owned (never read from
 - **`--tool-timeout-ms N`** — an absolute deadline, in milliseconds, for the
   call. A hit returns the reviewed `tool_timeout` code with no partial result.
 - **`--tool-input-bytes N`** — a logical input-byte ceiling for the call. It
-  counts the file content that a tool reads or scans, and the git content that
-  `git_read` returns. It never counts the displayed or truncated output bytes.
+  counts the file content that a tool reads or scans. For `git_read show_file`,
+  it counts the complete pinned blob once per read, not the page or the JSON response.
   A hit returns `tool_input_limit`.
 - **`--tool-max-entries N`** *(proposed)* — a directory-entry ceiling for the
   call (e.g. `ls` walking). A hit returns `tool_input_limit` naming
@@ -1952,8 +2009,7 @@ The default-off options `--tool-timeout-ms`, `--tool-input-bytes`, and
 - **Input bytes.** `search` in content mode charges the bytes that it scans and
   stops during the scan. `read_file` checks the file size before the read and
   charges the whole file, also when `offset` and `limit` select a part.
-  `git_read` charges the bytes of the content that it returns, after git ended.
-  That is an approximation of the git content read: it does not stop git early.
+  `git_read show_file` resolves the commit and blob, obtains the stored size, and reserves that many bytes before reading the blob. This applies with or without `--read-sha256`. A failed reservation reports the attempted cumulative size and returns no content or digest. It takes precedence over display caps. The counter measures logical blob content, not physical I/O or Git metadata lookups. Each `show_file` call reserves the full size, even for another page of the same object. A later binary refusal, display cap, or read failure does not refund the reservation. A new top-level call starts a new budget.
 - **Entries.** `ls` charges each directory entry during the walk and stops at
   the limit.
 - **Refused under an input or entry limit.** With `--tool-input-bytes` or
@@ -1965,6 +2021,7 @@ The default-off options `--tool-timeout-ms`, `--tool-input-bytes`, and
   in files mode (the index does not report the content that it reads). With
   `--confine-paths`, the offered tools `read_file`, `ls`, and `search` in
   content mode stay available.
+  Only `show_file` supports Git reads under an input or entry limit. The other `git_read` commands return `tool_policy_unsupported` before repository discovery. A deadline alone does not restrict the choice of Git command. The generic native `tool_run` opcode has no input meter and refuses delegation under an input or entry limit; use the named `git_read` tool for a metered read.
 - **Refused under each budget option.** `tool_pipeline`, and a run with
   `--worker-config` (at startup).
 

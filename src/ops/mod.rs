@@ -421,6 +421,31 @@ mod tests {
         assert!(session.tool_budget.is_some());
     }
 
+    // Check the native listing below the MCP dispatch guard. Use an existing
+    // entry to exercise the actual walk after a verified expired deadline.
+    #[tokio::test]
+    async fn native_ls_refuses_an_expired_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = indexed_session(dir.path());
+        let budget = session.tool_budget_config.start().unwrap();
+        session.set_operation_budget(Some(Arc::clone(&budget)));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(budget.check_deadline().is_err());
+        let response = dispatch(
+            &mut session,
+            Request::Single(Op {
+                c: protocol::op::LS,
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert!(!response.ok);
+        let data = response.d.expect("typed failure");
+        assert_eq!(data["code"], "tool_timeout");
+        assert_eq!(data["tool"], "ls");
+        assert!(data.get("entries").is_none());
+    }
+
     /// Control: the same search without an installed budget gets a new one and
     /// can succeed. With a long deadline it returns the files.
     #[tokio::test]

@@ -162,6 +162,7 @@ fn should_exit_for_idle(idle_secs: u64, timeout_secs: u64, in_flight: usize) -> 
 }
 
 pub struct DaimonosHandler {
+    network: crate::offline_tools::NetworkAuthority,
     session: Arc<Mutex<Session>>,
     /// Request liveness shared with the idle watchdog.
     activity: Arc<ActivityTracker>,
@@ -174,6 +175,7 @@ pub struct DaimonosHandler {
 impl DaimonosHandler {
     pub fn new(session: Session, activity: Arc<ActivityTracker>, startup_logs: bool) -> Self {
         Self {
+            network: session.cfg.network,
             session: Arc::new(Mutex::new(session)),
             activity,
             startup_logs,
@@ -457,8 +459,7 @@ async fn dispatch_tool_inner(
         session.end_tool_operation(budget_owned);
         return response_to_result(failure.into_response(name));
     }
-    let budget_remaining = session.budget_remaining();
-    let dispatched = crate::managed_process::with_budget_deadline(budget_remaining, async {
+    let dispatched = crate::managed_process::with_tool_budget(session.tool_budget(), async {
     // Registry-based dispatch: route ops-backed tools through the facade.
     if let Some(resp) = tool_facade::invoke(session, name, args).await {
         session.last_response_meta = resp.meta.clone();
@@ -815,32 +816,26 @@ async fn dispatch_tool_inner(
 
         "git_read" => {
             let command = get_str(args, "command").unwrap_or_default();
-            // FR-19 (WP18, ADR-031): git_read runs inside the single budget +
-            // deadline scope installed above, so the git child's process group
-            // is reaped AT the deadline and a passed deadline becomes a typed
-            // tool_timeout at the post-dispatch check. Here we only meter the
-            // git object content it returned (the PM counts this as logical
-            // input): a byte-ceiling hit is tool_input_limit with no partial.
             let Some(registry) = &session.tool_registry else {
                 return err_text(serde_json::json!({"error":{"kind":"unavailable","message":"tool registry unavailable"}}).to_string());
             };
-            let run_result = registry
-                .run(
-                    "git_read",
-                    &command,
-                    &session.workspace,
-                    &session.env,
-                    None,
-                    Some(args),
-                )
-                .await;
+            // ADR-031: only show_file can meter its logical input. Do not open
+            // the repository for another operation when an input limit is active.
+            if command != "show_file" && session.budget_has_input_limits() {
+                return response_to_result(crate::path_policy::ToolFailure::tool_budget_policy_unsupported(
+                    Some("git_read"), "only show_file supports Git input budgets",
+                ).into_response("git_read"));
+            }
+            let (run_result, hit) = crate::plugins::git_read::with_call_hit(registry.run(
+                "git_read", &command, &session.workspace, &session.env, None, Some(args)
+            )).await;
+            if let Some(hit) = hit {
+                session.note_budget_hit(&hit);
+                return response_to_result(hit.into_failure(Some("git_read")).into_response("git_read"));
+            }
             match run_result {
                 Ok(result) => {
                     let text = result.output.to_string();
-                    if let Err(failure) = session.budget_charge_bytes(text.len() as u64, "git_read")
-                    {
-                        return response_to_result(failure.into_response("git_read"));
-                    }
                     if result.exit_code == 0 {
                         ok_text(text)
                     } else {
@@ -1459,13 +1454,7 @@ impl ServerHandler for DaimonosHandler {
             // (even normally-lazy/on-demand tools) and nothing else — so served,
             // discovered, and executable names agree (ADR-023). With no explicit
             // list, the legacy lazy exposure set applies unchanged.
-            .filter(|t| {
-                if session.policy.is_active() {
-                    session.policy.allows(&t.name)
-                } else {
-                    session.exposed_tools.contains(&t.name)
-                }
-            })
+            .filter(|t| session.policy.visible(&t.name, &session.exposed_tools))
             .filter(|t| passes_session_context_check(&session, &t.name))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
@@ -1487,6 +1476,11 @@ impl ServerHandler for DaimonosHandler {
         // Held for the whole call: a long or hung tool must not read as idle.
         let _activity = self.begin_request();
         let args: Value = serde_json::to_value(&params.arguments).unwrap_or(Value::Null);
+
+        // ADR-032: check before special/composite routes, not just registry dispatch.
+        if let Err(failure) = self.network.admit_tool(&params.name) {
+            return response_to_result(failure.into_response(&params.name));
+        }
 
         // execute_script needs Arc<Mutex<Session>> — handle it before locking.
         if params.name == "execute_script" {
@@ -1622,7 +1616,7 @@ impl ServerHandler for DaimonosHandler {
         // file ops as observed reads/mutates edges from the session. Best-effort:
         // never affects the tool result. The session lock is released before the
         // sync SQLite write so observe can't serialize concurrent requests.
-        if crate::kgl::observe::enabled() {
+        if !session.cfg.network.offline() && crate::kgl::observe::enabled() {
             if let Ok(r) = &result {
                 if !r.is_error.unwrap_or(false) {
                     let now = chrono::Utc::now().to_rfc3339();
@@ -1869,7 +1863,12 @@ async fn build_instructions(workspace: &std::path::Path, cfg: &crate::config::Co
         return parts.join("\n");
     }
 
-    if let Some(hint) = kgl_instructions_hint(crate::kgl::autoindex::enabled(), cfg).await {
+    if let Some(hint) = kgl_instructions_hint(
+        !cfg.network.offline() && crate::kgl::autoindex::enabled(),
+        cfg,
+    )
+    .await
+    {
         parts.push(hint.trim_end().to_string());
     }
 
@@ -2177,13 +2176,7 @@ fn socket_list_tools_json(session: &Session) -> Vec<Value> {
         // FR-02 (WP06, listing inventory): the session-daemon socket listing is
         // filtered by the explicit allowlist too (mirrors the MCP tools/list
         // path), so an allowlisted daemon serves exactly the allowlisted tools.
-        .filter(|t| {
-            if session.policy.is_active() {
-                session.policy.allows(&t.name)
-            } else {
-                session.exposed_tools.contains(&t.name)
-            }
-        })
+        .filter(|t| session.policy.visible(&t.name, &session.exposed_tools))
         .filter(|t| passes_session_context_check(session, &t.name))
         .map(|t| {
             let already_used = session.used_tools.contains(&t.name);
@@ -2249,6 +2242,7 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     let instructions = build_instructions(&session.workspace, &session.cfg).await;
+    let network = session.cfg.network;
     let session = Arc::new(Mutex::new(session));
     let mut client_supports_roots = false;
     let mut pending_roots_request: Option<Value> = None;
@@ -2325,7 +2319,9 @@ pub async fn serve_one_mcp(stream: tokio::net::UnixStream, session: Session) -> 
                     .unwrap_or("")
                     .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let result = if name == "execute_script" {
+                let result = if let Err(failure) = network.admit_tool(&name) {
+                    response_to_result(failure.into_response(&name))
+                } else if name == "execute_script" {
                     // Keep the Send-safe script outcome across the lock await;
                     // construct CallToolResult only afterwards.
                     let script_result = run_execute_script(Arc::clone(&session), &args).await;

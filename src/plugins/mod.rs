@@ -47,6 +47,7 @@ fn builtin_cli_plugins() -> Vec<BuiltinPlugin> {
             // ADR-017: reject large responses before the shared boundary can spill them.
             Arc::new(
                 git_read::GitReadPlugin::new(cfg.git_read.clone())
+                    .with_read_sha256(cfg.read_sha256)
                     .with_response_cap(cfg.tool_output.max_bytes),
             )
         }),

@@ -1316,3 +1316,34 @@ async fn frozen_status_refuses_fifo_metadata_without_waiting_for_a_writer() {
     );
     assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn scoped_git_hit_is_delivered_once_even_on_error() {
+    use crate::tool_budget::{BudgetHit, ToolBudgetConfig};
+    let fixture = Fixture::new();
+    let args = json!({"command":"show_file","repo":"source","path":"old.txt","rev":fixture.first});
+    let budget = ToolBudgetConfig {
+        input_bytes: Some(1),
+        ..Default::default()
+    }
+    .start();
+    let (res, hit) = with_call_hit(crate::managed_process::with_tool_budget(
+        budget.clone(),
+        fixture.call(args.clone()),
+    ))
+    .await;
+    assert_ne!(res.exit_code, 0);
+    assert!(matches!(hit, Some(BudgetHit::Input { limit: 1, .. })));
+    let (_, next) = with_call_hit(async { Err::<(), _>("registry error") }).await;
+    assert!(next.is_none());
+    // Future callers cannot silently discard the typed refusal outside dispatch.
+    let missing = crate::managed_process::with_tool_budget(budget, fixture.call(args)).await;
+    assert_eq!(missing.output["error"]["kind"], "git_budget_scope_missing");
+    let (error, hit) = with_call_hit(async {
+        CALL_HIT.with(|cell| cell.set(Some(BudgetHit::Timeout { configured_ms: 9 })));
+        Err::<(), _>("failed registry future")
+    })
+    .await;
+    assert!(error.is_err() && matches!(hit, Some(BudgetHit::Timeout { configured_ms: 9 })));
+    assert!(with_call_hit(async {}).await.1.is_none());
+}

@@ -297,6 +297,21 @@ impl ReadRepo {
         arguments: &[&str],
         env: &HashMap<String, String>,
     ) -> Result<ManagedOutput, Failure> {
+        self.capture(arguments, env, false).await
+    }
+    pub async fn blob_with_digest(&self, object: &str) -> Result<ManagedOutput, Failure> {
+        let out = self
+            .capture(&["cat-file", "blob", object], &self.env, true)
+            .await?;
+        self.check(&out)?;
+        Ok(out)
+    }
+    async fn capture(
+        &self,
+        arguments: &[&str],
+        env: &HashMap<String, String>,
+        digest_blob: bool,
+    ) -> Result<ManagedOutput, Failure> {
         let mut argv: Vec<String> = [
             "--no-pager",
             "--no-lazy-fetch",
@@ -323,6 +338,17 @@ impl ReadRepo {
             argv.extend(["-c".to_string(), setting.clone()]);
         }
         argv.extend(arguments.iter().map(|s| (*s).into()));
+        if digest_blob {
+            return managed_process::run_with_stdout_digest(
+                "git",
+                &argv,
+                &self.path,
+                env,
+                &self.process,
+            )
+            .await
+            .map_err(Into::into);
+        }
         managed_process::run("git", &argv, &self.path, env, &self.process, None)
             .await
             .map_err(Into::into)

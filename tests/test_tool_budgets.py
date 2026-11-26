@@ -747,17 +747,18 @@ def test_timeout_read_file_returns_timeout(daimonos_factory, tmp_path):
 
 
 def test_timeout_ls_returns_timeout(daimonos_factory, tmp_path):
-    """F2 (M2): the ls walk checks the deadline before building its result."""
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    for i in range(20):
-        (ws / f"f{i}.txt").write_text("x")
-    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
-    result = client.call_tool("ls", {"path": "."})
-    assert result.get("isError") is True, result
-    data = json.loads(_text(result))
-    assert data["code"] == "tool_timeout", data
-    assert "entries" not in data, "no late listing on a deadline hit"
+    """A small directory may finish in 1 ms. Establish expiry, not a minimum walk duration."""
+    (tmp_path / "visible.txt").write_text("x")
+    client = daimonos_factory(tmp_path, args=["--tool-timeout-ms", "300"])
+    result = client.call_tool("batch", {"ops": [
+        {"tool": "exec", "arguments": {"command": "sleep", "args": ["30"]}},
+        {"tool": "ls", "arguments": {"path": "."}},
+    ]})
+    sleep, listing = json.loads(_text(result))
+    assert _child_failure(sleep)["code"] == "tool_timeout"
+    data = _child_failure(listing)
+    assert data["tool"] == "ls" and data["code"] == "tool_timeout", data
+    assert "entries" not in data and "visible.txt" not in listing["error"]
 
 
 def test_timeout_content_search_returns_timeout(daimonos_factory, tmp_path):
@@ -828,32 +829,44 @@ def test_timeout_file_search_returns_timeout(daimonos_factory, tmp_path):
 
 
 def test_ac_19_1_large_tree_search_times_out_within_bound(daimonos_factory, tmp_path):
-    """AC-19.1 / F2: a content search on a large tree (10000 files x ~1 KB =
-    ~10 MB; a full walk+scan of this many files clearly exceeds the limit on any
-    host in this environment, where opening 10000 files alone costs well over
-    100 ms) with a 100 ms limit returns ``tool_timeout`` within a stated upper
-    bound (8 s, far below the time a full scan would take), proving the deadline
-    STOPPED the work rather than the scan finishing on its own. The control with
-    no option returns success. Kept under ~10 s including setup.
+    """AC-19.1: require a real one-second search deadline, even on a warm cache.
+
+    Hard links vary the logical scan size without allocating gigabytes on disk.
+    An early success is valid only with the complete result. Increase the work
+    in that case, never the deadline. A run that never times out fails the test.
     """
     ws = tmp_path / "ws"
     ws.mkdir()
-    blob = "lorem ipsum dolor sit amet " * 38  # ~1 KB, no match
-    for i in range(10000):
-        (ws / f"f{i:05}.txt").write_text(blob)
+    marker = ws / "marker.txt"
+    marker.write_text("needle\n")
+    source = tmp_path / "shared-content.txt"
+    source.touch()
+    for i in range(1024):
+        (ws / f"f{i:04}.txt").hardlink_to(source)
 
-    client = daimonos_factory(ws, args=["--tool-timeout-ms", "100"])
-    start = time.monotonic()
-    result = client.call_tool("search", {"pattern": "needle", "mode": "content"})
-    elapsed = time.monotonic() - start
-    assert elapsed < 8, f"budget did not stop the search promptly: {elapsed:.1f}s"
-    assert result.get("isError") is True, result
-    assert json.loads(_text(result))["code"] == "tool_timeout", _text(result)
-
+    query = {"pattern": "needle", "mode": "content"}
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1000"])
     control = daimonos_factory(ws)
-    r2 = control.call_tool("search", {"pattern": "needle", "mode": "content"})
-    assert r2.get("isError") is not True, _text(r2)
-    assert "tool_timeout" not in _text(r2), _text(r2)
+    block = b"no match here. \n" * 4096  # 64 KiB per block
+    for blocks in (1, 16, 256):  # 64 MiB, 1 GiB, 16 GiB of logical content
+        source.write_bytes(block * blocks)
+        start = time.monotonic()
+        result = client.call_tool("search", query)
+        elapsed = time.monotonic() - start
+        assert elapsed < 8, f"budget did not stop the search promptly: {elapsed:.1f}s"
+        data = json.loads(_text(result))
+        if result.get("isError"):
+            assert data["code"] == "tool_timeout" and "matches" not in data, data
+            break
+        assert [m["f"] for m in data["matches"]] == [marker.name], data
+    else:
+        raise AssertionError("the workload did not exercise the search deadline")
+
+    # Identical tree and query, without the deadline: complete the scan and
+    # return exactly the known match. No file-size or elapsed-time inference.
+    result = control.call_tool("search", query)
+    assert not result.get("isError"), result
+    assert [m["f"] for m in json.loads(_text(result))["matches"]] == [marker.name]
 
 
 # --- F3: plugin/managed-process tools (M3 curl, M4 git) ---
@@ -1025,7 +1038,7 @@ def test_budget_hit_writes_limit_hit_audit_event(daimonos_binary, tmp_path):
 # --- R1 (B1): allow-list inversion of the input/entry admission gate ---
 #
 # Under --tool-input-bytes / --tool-max-entries a tool is admitted only if it
-# meters its logical input (read_file, ls, content search, git_read) or reads
+# meters its logical input (read_file, ls, content search, git_read show_file) or reads
 # no workspace/external content (write_file, append_file, the session/meta/mail
 # tools, and the composite dispatchers). EVERY other name is refused with the
 # reviewed ``tool_policy_unsupported`` code (integrator D60) naming the budget
@@ -1380,3 +1393,79 @@ def test_a_call_during_a_budgeted_script_does_not_share_its_budget(daimonos_fact
     other = replies[9002]
     assert _code(other) is None, _text(other)
     assert "o" * 60 in _text(other)
+
+
+def test_git_read_page_reserves_whole_blob_without_digest(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+
+    repo, _ = repository(tmp_path)
+    path = repo / "large.txt"
+    path.write_bytes(b"small first line\n" + b"x" * 32768)
+    git(repo, "add", path.name)
+    git(repo, "commit", "-m", "large blob")
+    args = {"command": "show_file", "repo": "source", "rev": git(repo, "rev-parse", "HEAD"),
+            "path": path.name, "limit": 1}
+    size = int(git(repo, "cat-file", "-s", f"{args['rev']}:{path.name}"))
+    path.write_text("worktree diverged")
+    assert path.stat().st_size != size
+    for cap in (1024, size - 1, size):
+        client = daimonos_factory(tmp_path, args=["--tool-input-bytes", str(cap)])
+        result = client.call_tool("git_read", args)
+        data = json.loads(_text(result))
+        if cap < size:
+            assert result.get("isError") and data["code"] == "tool_input_limit", data
+            assert data["configured"] == cap and data["consumed"] == size, data
+            assert "content" not in data and "sha256" not in data
+        else:
+            assert not result.get("isError") and data["content"] == "small first line\n", data
+            assert "sha256" not in data
+
+
+def test_git_read_refuses_unmetered_commands_before_opening_repo(daimonos_factory, tmp_path):
+    # An absent repository cannot mask the policy error: the refusal must precede discovery.
+    others = {"resolve", "list_tree", "grep", "log", "show_commit", "diff", "blame", "refs", "ancestry", "worktree_status"}
+    for option in ("--tool-input-bytes", "--tool-max-entries"):
+        client = daimonos_factory(tmp_path, args=[option, "1024"])
+        for command in others:
+            result = client.call_tool("git_read", {"command": command, "repo": "does-not-exist"})
+            data = json.loads(_text(result))
+            assert result.get("isError") and data.get("code") == "tool_policy_unsupported", (command, data)
+            assert data["tool"] == "git_read" and option in data["message"]
+
+
+def test_git_read_checks_input_allowance_before_display_cap(daimonos_factory, tmp_path):
+    from test_git_read import repository
+
+    repo, commit = repository(tmp_path)
+    size = (repo / "file.txt").stat().st_size
+    config = tmp_path / "display.toml"
+    config.write_text("[git_read]\nmax_file_bytes=2\n")
+    client = daimonos_factory(tmp_path, args=["--config", str(config), "--tool-input-bytes", str(size - 1)])
+    result = client.call_tool("git_read", {"command": "show_file", "repo": "source", "rev": commit, "path": "file.txt"})
+    data = json.loads(_text(result))
+    assert result.get("isError") and data.get("code") == "tool_input_limit", data
+    assert data["configured"] == size - 1 and data["consumed"] == size
+
+
+def test_repeated_git_pages_consume_one_full_reservation_per_call(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+    repo, rev = repository(tmp_path)
+    size = int(git(repo, "cat-file", "-s", f"{rev}:file.txt"))
+    op = {"tool": "git_read", "arguments": {"command": "show_file", "repo": "source", "rev": rev, "path": "file.txt", "limit": 1}}
+    client = daimonos_factory(tmp_path, args=["--tool-input-bytes", str(size)])
+    results = json.loads(_text(client.call_tool("batch", {"ops": [op, op]})))
+    assert results[0]["ok"] and _child_failure(results[1])["consumed"] == 2 * size
+    assert not client.call_tool("git_read", op["arguments"]).get("isError")
+
+
+def test_failed_git_display_does_not_refund_logical_input(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+    repo, rev = repository(tmp_path)
+    size = int(git(repo, "cat-file", "-s", f"{rev}:file.txt"))
+    config = tmp_path / "display.toml"
+    config.write_text("[git_read]\nmax_file_bytes=2\n")
+    op = {"tool": "git_read", "arguments": {"command": "show_file", "repo": "source", "rev": rev, "path": "file.txt"}}
+    client = daimonos_factory(tmp_path, args=["--tool-input-bytes", str(size), "--config", str(config)])
+    first, second = json.loads(_text(client.call_tool("batch", {"ops": [op, op]})))
+    assert not first["ok"] and "output_limit" in first["error"]
+    assert _child_failure(second)["code"] == "tool_input_limit" and _child_failure(second)["consumed"] == size * 2

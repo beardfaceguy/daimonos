@@ -291,7 +291,7 @@ _Status (WP18, implemented; state after the code review of 2026-11-23):_
 - **Codes.** A deadline hit returns `tool_timeout`. A byte or entry hit returns `tool_input_limit` and names the limit, the configured value, and the consumed value. An entry hit has no code of its own (D56). A tool that cannot enforce a requested input or entry budget is refused with the reviewed code `tool_policy_unsupported` (D60). WP18 adds no refusal code.
 - **Admission under an input or entry budget.** `tool_budget::tool_input_budget_admitted` is an explicit list. A tool is admitted only when it meters its input (`read_file`, `ls`, `search` in content mode, `git_read`) or reads no workspace or external content (write-only tools, composites, session state, tool-catalog introspection, agent mail, reservations, plan state). Each other tool name is refused, also an outbound MCP tool, a tool from configuration, and a name that a later package adds. `search` in files mode (the index) is refused: the index does not report the content that it reads.
 - **Deadline.** One scope in `mcp::dispatch_tool_inner` covers each registry tool. Native readers check the deadline at work boundaries. A subprocess of `exec`, `git_read`, or a plugin is terminated with its process group through `ManagedChild::terminate`. `tool_pipeline` is refused under each budget option. A run with `--worker-config` and a budget option is refused at startup (`run_configuration_invalid`, reason `tool_budget_worker_unenforceable`).
-- **Metering.** `search` in content mode charges the bytes that it scans and stops during the scan. `ls` charges each entry during the walk and stops at the limit. `read_file` checks the file size before the read and charges the content. `git_read` charges the bytes of the content that it returns, after the subprocess ended: this is an approximation of the git content read (D61).
+- **Metering.** `search` in content mode charges the bytes that it scans and stops during the scan. `ls` charges each entry during the walk and stops at the limit. `read_file` checks the file size before the read and charges the content. `git_read show_file` reserves the full pinned blob size before reading it, with or without a digest. This supersedes D61’s response-size approximation. Other Git commands refuse an input or entry budget before repository discovery. The generic native `tool_run` path also refuses input or entry budgets. Deadline-only behavior stays unchanged.
 - **Composites.** `batch` and `execute_script` share one budget with their children. `execute_script` holds the budget in its script context and sets it on the session only inside each locked inner operation.
 - **Audit.** A limit hit writes the reserved `limit_hit` event. The budget code records the hit on the session, and the run loop reads that record. It does not parse the result text of a tool.
 - **Names.** `ToolBudget` with `check_deadline()`, `charge_input(bytes)`, `charge_entries(n)`, and `remaining()`. The reserved names `BudgetReceipt` and `LimitFailure` are not used: `path_policy::ToolFailure` carries a failure (D61).
@@ -299,12 +299,14 @@ _Status (WP18, implemented; state after the code review of 2026-11-23):_
 These fields are policy/error metadata, not a rewrite of every existing tool's successful payload.
 Audit records the named limit and the refusal. Error text is bounded and does not contain raw evidence.
 
-WP19 owns `src/file_digest.rs` (new) and the existing pinned-git runner.
+The final integration uses `ToolPolicy::visible` for fresh MCP stdio and socket listings and the session-free contract export. An explicit empty selection exports no tools. With no selection the initial exposure tiers remain unchanged. This correction does not add a field to the export envelope.
+
+WP19 uses `src/file_digest.rs::read` for the opened filesystem handle and `src/plugins/git_read/runner.rs::ReadRepo::blob_with_digest` for the pinned Git object (ADR-031). `tests/test_file_digests.py` compares results with `sha256sum` and checks deterministic shared-budget refusals.
 It adds `sha256` to the existing read payload or binary metadata when enabled.
 Use all stored bytes from the authorized file handle or pinned git blob, not normalized text, a page, or decoded lossy output.
 A complete digest may accompany truncated text. A partial digest never appears.
 If limits prevent completion, return `tool_input_limit` or `tool_timeout` with no `sha256` value.
-`git_read` operations that cannot expose/count a complete blob stream refuse input-budget mode until supported.
+For `show_file`, the byte budget applies to the immutable blob, even for a one-line page. Digest mode also verifies the number of bytes received. Neither JSON output nor a requested hash adds a second charge.
 Do not weaken existing binary withholding or strict full-commit pinning to provide a hash.
 
 ## Errors and exit reservations
@@ -342,11 +344,11 @@ Do not include an unbounded path listing, filesystem error dump, or secret value
 
 ## Offline and capability admission
 
-WP20 owns `src/offline_tools.rs` (new): `NetworkAuthority` and `ProducerAdmission`.
+WP20 uses `src/offline_tools.rs::NetworkAuthority` for process and tool admission (ADR-032). The admitted names are in `LOCAL_TOOLS`.
 Offline admission occurs before providers, discovery, OTLP, OAuth, MCP IP transports, remote tools, gateways, or child producers initialize.
 Model profiles requiring IP networking are incompatible with the same offline process.
 Native stdio and Unix IPC are not outbound IP grants. Arbitrary stdio children still require proven isolation or refusal.
-Analytics-off prevents local event collection as well as store initialization. OTLP-off remains a separate producer control.
+`--analytics-off` disables local event collection and store creation. The session daemon must match the requested setting. See `src/main.rs` and `src/session_bootstrap.rs`. OTLP export and local audit remain separate. The offline worker disables collection and remote producers. A separate model process retains the run audit.
 Document every N01–N21 disposition and update that inventory with any new producer.
 
 The first supported confined backend is proposed as Linux/openat2 using existing libc.
@@ -393,9 +395,7 @@ Implementation status (WP17 r3, `dbunk/wp17-full-schemas`): the recursion detect
 
 Implementation status (WP17 r4, `dbunk/wp17-full-schemas`): the `src/schema_contract.rs` detector now walks the document with TYPED traversal for both the identifier index and the cycle search (integrator decision D46). A reference keyword (`$ref`/`$dynamicRef`) is followed only in a schema position; `const`/`enum`/`default`/`examples` hold data and are never descended or indexed (fixes the false refusal of a schema whose data merely looks like a `$ref`); a single-schema, array-of-schemas, or name->schema-map keyword is descended by its 2020-12 shape; and every other (unknown) keyword is walked conservatively (fail closed, so a cycle under it is still refused). The static index never replaces an entry: a second `$id` resolving to one URI, or a second anchor with one base URI and name, at a different location is refused `schema_unusable` and named (new error `SchemaContractError::DuplicateIdentifier`) — this closes the false accept where a decoy `$id`/anchor in data masked a real recursive resource. A property or definition whose NAME equals a data keyword is still a schema position and still refused when recursive (the name inside a name->schema map is never a keyword). No new dependency, no public run-reason/exit-code change (`DuplicateIdentifier` maps to the existing `schema_unusable`), and no change to the WP05 validator, `AGENTS.md`, or the forwarded-MCP path. Proven by `tests/test_full_schemas.py` r4 both-wire process cases and the `src/schema_contract.rs` V1–V4 unit tests (including a cycle-through-every-2020-12-schema-keyword table).
 
-WP15 also reserves global `--version` output with package version, source commit, and tool-contract version.
-Use build metadata for the source commit, not a runtime git lookup. The local image labels must match that metadata.
-Any required new build metadata file is marked `(new)` in its implementation task before editing.
+WP12 adds global `--version` in `src/main.rs::main`. It reports the package version, compile-time source commit, and independent `tool_contract::CONTRACT_VERSION` without starting services. The Dockerfile verifies the package and revision against the values used for the OCI labels. See `docs/configuration.md` for the pinned local build and `tests/test_container_runtime.py` for the restricted runtime gate.
 
 ## G0 review and readiness
 

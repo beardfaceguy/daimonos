@@ -101,6 +101,14 @@ impl ToolPolicy {
         }
     }
 
+    /// Serving and export share the same visibility rule. Explicit lists replace
+    /// progressive exposure but do not bypass the separate context checks.
+    pub fn visible(&self, name: &str, exposed: &std::collections::HashSet<String>) -> bool {
+        self.allowlist
+            .as_ref()
+            .map_or_else(|| exposed.contains(name), |names| names.contains(name))
+    }
+
     /// Admit (or refuse) a tool by exported name at a dispatch boundary. The
     /// refusal carries the reviewed `tool_not_allowed` code and names the tool
     /// without exposing any denied payload (ADR-023).

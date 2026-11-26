@@ -384,6 +384,9 @@ impl RuntimeMode {
 #[derive(Debug, Parser)]
 #[command(name = "daimonos", about = "Daimonos — agent-optimized OS layer")]
 pub struct Cli {
+    /// Print the package version, build revision, and independent tool-contract version.
+    #[arg(long, global = true)]
+    pub version: bool,
     /// Unix socket path used by `daemon` and the legacy default mode (default: /tmp/daimonos.sock).
     #[arg(short, long)]
     pub socket: Option<PathBuf>,
@@ -502,6 +505,13 @@ pub struct Cli {
     #[arg(long = "tool-max-entries", global = true, value_name = "N")]
     pub tool_max_entries: Option<u64>,
 
+    /// Disable local analytics collection and storage for this process (ADR-032).
+    #[arg(long, global = true)]
+    pub analytics_off: bool,
+    /// Run local evidence tools without network producers (ADR-032).
+    #[arg(long, global = true)]
+    pub offline_tools: bool,
+
     /// Serve and export full, self-contained JSON Schema draft 2020-12 tool
     /// schemas instead of the default stripped placeholders (WP17, FR-15).
     /// Equivalent to `[mcp] full_tool_schemas = true`; the config/env seam still
@@ -509,6 +519,9 @@ pub struct Cli {
     /// is absent. Context: docs/adr/030-self-contained-full-schemas.md.
     #[arg(long, global = true, default_value_t = false)]
     pub full_tool_schemas: bool,
+    /// Include the SHA-256 of the complete stored bytes in file reads (ADR-031).
+    #[arg(long, global = true)]
+    pub read_sha256: bool,
 
     /// Refuse every implicit configuration source (environment files, config,
     /// instructions, skills, registrations, ignore files); honour only explicit

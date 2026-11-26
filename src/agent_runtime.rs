@@ -309,6 +309,7 @@ pub async fn run_agent(
     token_log: Option<PathBuf>,
     explicit_config_path: Option<PathBuf>,
     explicit_agent_instructions: Option<PathBuf>,
+    analytics_off: bool,
 ) -> anyhow::Result<()> {
     enforce_full_schema_contract(&cfg, workspace);
     let AgentArgs {
@@ -473,6 +474,7 @@ pub async fn run_agent(
                 confine_reference: confine_reference.as_deref(),
                 confine_identity: confine_identity.as_deref(),
                 ignore_config_files: cfg.discovery_policy.is_explicit_only(),
+                analytics_off,
                 // WP14: carry the independent no-follow option to the daemon.
                 no_follow: cfg
                     .filesystem_authority
@@ -499,6 +501,7 @@ pub async fn run_agent(
                 // WP17 (FR-15): carry the full-schema mode into the daemon launch
                 // identity so an attach cannot silently downgrade it.
                 full_tool_schemas: crate::config::effective_full_tool_schemas(&cfg),
+                read_sha256: cfg.read_sha256,
             },
         )
         .await?;
@@ -1385,6 +1388,7 @@ pub async fn run_session_daemon(
     workspace: &Path,
     cfg: Arc<config::Config>,
     token_log: Option<PathBuf>,
+    analytics_off: bool,
 ) -> anyhow::Result<()> {
     enforce_full_schema_contract(&cfg, workspace);
     let SessionDaemonArgs {
@@ -1593,6 +1597,7 @@ pub async fn run_session_daemon(
     );
     let serve = Arc::clone(&daemon).serve_unix(
         socket_path,
+        cfg.read_sha256 || analytics_off,
         cfg.session.max_frame_bytes,
         cfg.session.protocol_limits(),
         std::time::Duration::from_millis(cfg.session.accept_error_backoff_ms),

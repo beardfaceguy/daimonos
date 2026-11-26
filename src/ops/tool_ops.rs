@@ -23,6 +23,11 @@ pub async fn tool_run(session: &Session, op: &Op) -> Response {
         return failure.into_response(tool_id);
     }
 
+    // The generic native opcode has no input meter. Keep the same refusal as
+    // named dispatch, before its delegated plugin can open a repository.
+    if let Some(failure) = session.budget_input_refusal("tool_run") {
+        return failure.into_response("tool_run");
+    }
     let command = match &op.s {
         Some(c) => c.as_str(),
         None => return Response::err(3, "tool_run requires command in 's'"),
@@ -223,6 +228,26 @@ mod tests {
         let mut session = Session::new(dir.path().to_path_buf(), config);
         session.tool_registry = Some(Arc::new(ToolRegistry::new()));
         (dir, session)
+    }
+
+    #[tokio::test]
+    async fn native_tool_run_cannot_delegate_an_unmetered_git_read() {
+        let (_dir, mut session) = test_session_with_registry();
+        session.tool_budget_config.input_bytes = Some(32);
+        let response = crate::ops::dispatch(
+            &mut session,
+            crate::protocol::Request::Single(Op {
+                c: crate::protocol::op::TOOL_RUN,
+                p: Some("git_read".into()),
+                s: Some("log".into()),
+                ..Op::default()
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.d.expect("typed budget refusal")["code"],
+            "tool_policy_unsupported"
+        );
     }
 
     #[tokio::test]

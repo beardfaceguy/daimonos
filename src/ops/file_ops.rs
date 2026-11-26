@@ -6,6 +6,9 @@ use std::path::Path;
 pub const SKIP_INDEX_OBSERVATION: &str = "skip_index_observation";
 
 pub async fn read(session: &mut Session, op: &Op) -> Response {
+    if session.cfg.read_sha256 {
+        return read_with_digest(session, op).await;
+    }
     if session.authority.is_some() {
         return read_confined(session, op).await;
     }
@@ -55,25 +58,86 @@ pub async fn read(session: &mut Session, op: &Op) -> Response {
         return failure.into_response("read_file");
     }
 
+    text_response(session, &path, op, &content)
+}
+
+fn text_response(session: &mut Session, path: &Path, op: &Op, content: &str) -> Response {
     let total_lines = content.lines().count();
     let offset = op.n.unwrap_or(0).max(0) as usize;
     let limit = op.n2.unwrap_or(0);
-    let is_full_read = offset == 0 && limit <= 0;
-
-    // Dedup: if the model already read this exact content, return a compact response
-    if is_full_read {
-        if let Some(_entry) = session.check_read_cache(&path, &content) {
-            return Response::ok(json!({
-                "unchanged": true,
-                "lines": total_lines,
-            }))
-            .read_dedup()
-            .with_unfiltered_chars(content.len());
+    if offset == 0 && limit <= 0 {
+        if session.check_read_cache(path, content).is_some() {
+            return Response::ok(json!({"unchanged": true, "lines": total_lines}))
+                .read_dedup()
+                .with_unfiltered_chars(content.len());
         }
-        session.update_read_cache(path, &content);
+        session.update_read_cache(path.to_path_buf(), content);
     }
+    slice_read_response(content, total_lines, offset, limit)
+}
 
-    slice_read_response(&content, total_lines, offset, limit)
+async fn read_with_digest(session: &mut Session, op: &Op) -> Response {
+    use crate::file_digest::ReadError;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(raw) = &op.p else {
+        return Response::err(3, "read requires path in 'p'");
+    };
+    let requested = session.resolve_path(raw);
+    let (file, key) = if let Some(authority) = &session.authority {
+        match authority.open_read_policy(&requested) {
+            Ok(handle) => {
+                let key = handle.relative_path().to_owned();
+                (handle.into_file(), key)
+            }
+            Err(error) => return error.with_argument(raw).into_response("read_file"),
+        }
+    } else {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&requested)
+        {
+            Ok(file) => (file, requested),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Response::err(1, "file not found")
+            }
+            Err(error) => return Response::err(4, &format!("io: {error}")),
+        }
+    };
+    let budget = session.tool_budget();
+    let (bytes, digest) = match tokio::task::spawn_blocking(move || {
+        crate::file_digest::read(file, budget.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(ReadError::Limit(hit))) => {
+            session.note_budget_hit(&hit);
+            return hit.into_failure(Some(raw)).into_response("read_file");
+        }
+        Ok(Err(ReadError::NotRegular)) => {
+            return crate::path_policy::ToolFailure::unsupported_file_type(Path::new(raw))
+                .into_response("read_file")
+        }
+        Ok(Err(ReadError::Changed)) => {
+            return crate::path_policy::ToolFailure::file_changed(Path::new(raw))
+                .into_response("read_file");
+        }
+        Ok(Err(ReadError::Io(error))) => return Response::err(4, &format!("io: {error}")),
+        Err(error) => return Response::err(4, &format!("read: {error}")),
+    };
+    let size = bytes.len();
+    let mut response = match std::str::from_utf8(&bytes) {
+        Ok(text) if !bytes.contains(&0) => text_response(session, &key, op, text),
+        _ => Response::ok(json!({"binary":true, "size":size})),
+    };
+    if let Some(data) = response.d.as_mut() {
+        data["sha256"] = json!(digest);
+    }
+    if let Err(failure) = session.budget_check_deadline(raw) {
+        return failure.into_response("read_file");
+    }
+    response
 }
 
 /// Format read results identically for legacy and confined reads.
@@ -150,19 +214,7 @@ async fn read_confined(session: &mut Session, op: &Op) -> Response {
     {
         return failure.into_response("read_file");
     }
-    let total_lines = content.lines().count();
-    let offset = op.n.unwrap_or(0).max(0) as usize;
-    let limit = op.n2.unwrap_or(0);
-    let is_full_read = offset == 0 && limit <= 0;
-    if is_full_read {
-        if session.check_read_cache(&cache_key, &content).is_some() {
-            return Response::ok(json!({"unchanged": true, "lines": total_lines}))
-                .read_dedup()
-                .with_unfiltered_chars(content.len());
-        }
-        session.update_read_cache(cache_key, &content);
-    }
-    slice_read_response(&content, total_lines, offset, limit)
+    text_response(session, &cache_key, op, &content)
 }
 
 pub async fn write(session: &mut Session, op: &Op) -> Response {
