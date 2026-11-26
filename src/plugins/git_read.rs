@@ -36,9 +36,14 @@ pub struct GitReadPlugin {
     descriptor: ToolDescriptor,
     limits: GitReadConfig,
     response_cap: usize,
+    read_sha256: bool,
 }
 
 impl GitReadPlugin {
+    pub fn with_read_sha256(mut self, enabled: bool) -> Self {
+        self.read_sha256 = enabled;
+        self
+    }
     pub fn with_response_cap(mut self, cap: usize) -> Self {
         self.response_cap = self.response_cap.min(cap);
         self
@@ -59,6 +64,7 @@ impl GitReadPlugin {
             .collect();
         Self {
             response_cap: limits.max_output_bytes,
+            read_sha256: false,
             limits,
             descriptor: ToolDescriptor {
                 id: "git_read".into(),
@@ -158,7 +164,15 @@ impl ToolPlugin for GitReadPlugin {
             Err(failure) => (failure.json(), 1),
         };
         if output.to_string().len() > self.response_cap {
-            output = output_limit_response();
+            // Keep the existing output_limit refusal, but never discard completed evidence.
+            let hash = output
+                .get("sha256")
+                .or_else(|| output.pointer("/metadata/sha256"))
+                .cloned();
+            output = hash
+                .as_ref()
+                .and_then(Value::as_str)
+                .map_or_else(output_limit_response, digest_limit_response);
             exit_code = 1;
         }
         Ok(ToolResult {
@@ -172,6 +186,12 @@ impl ToolPlugin for GitReadPlugin {
 }
 
 /// Config validation ensures that even the smallest response cap fits this error.
+pub(crate) fn digest_limit_response(hash: &str) -> Value {
+    let mut output = output_limit_response();
+    output["metadata"] = json!({"sha256":hash});
+    output
+}
+
 pub(crate) fn output_limit_response() -> Value {
     json!({"error":{"kind":"output_limit","message":"response exceeds byte cap"},"truncated":true})
 }
@@ -297,25 +317,53 @@ impl GitReadPlugin {
                     .trim()
                     .parse::<usize>()
                     .map_err(|_| Failure::new("git_error", "invalid blob size"))?;
-                if size > self.limits.max_file_bytes {
+                if !self.read_sha256 && size > self.limits.max_file_bytes {
                     return Err(Failure::new(
                         "output_limit",
                         "file exceeds git_read.max_file_bytes",
                     )
                     .truncated());
                 }
-                let content = repo
-                    .text(&[
+                let mut meta =
+                    json!({"commits":[commit],"path":path,"object_sha":object,"size":size});
+                let content = if self.read_sha256 {
+                    // A pinned Git object is immutable. Reserve its logical byte size once,
+                    // before cat-file starts, including bytes outside the visible page.
+                    if let Some(budget) = crate::managed_process::current_tool_budget() {
+                        if let Err(hit) = budget.charge_input(size as u64) {
+                            budget.record_plugin_hit(&hit);
+                            return Err(Failure::new(
+                                "tool_input_limit",
+                                "blob exceeds input budget",
+                            ));
+                        }
+                    }
+                    let blob = repo.blob_with_digest(&object).await?;
+                    if blob.stdout_bytes != size as u64 {
+                        return Err(Failure::new("git_error", "incomplete blob"));
+                    }
+                    meta["sha256"] = json!(blob.stdout_sha256.expect("digest requested"));
+                    if size > self.limits.max_file_bytes || blob.stdout_truncated {
+                        return Err(Failure::new("output_limit", "file exceeds display cap")
+                            .truncated()
+                            .details(meta));
+                    }
+                    blob.stdout
+                } else {
+                    repo.text(&[
                         "show",
                         "--format=",
                         "--no-ext-diff",
                         "--no-textconv",
                         &object,
                     ])
-                    .await?;
+                    .await?
+                };
                 if content.contains(['\0', '\u{fffd}']) {
-                    return Err(Failure::new("binary_file", "binary content is not returned")
-                        .details(json!({"repo":repo.path,"commits":[commit],"path":path,"object_sha":object,"size":size})));
+                    meta["repo"] = json!(repo.path);
+                    return Err(
+                        Failure::new("binary_file", "binary content is not returned").details(meta),
+                    );
                 }
                 let lines: Vec<_> = content.split_inclusive('\n').collect();
                 let end = args
@@ -323,11 +371,12 @@ impl GitReadPlugin {
                     .saturating_add(args.limit(self.limits.max_lines))
                     .min(lines.len());
                 let start = args.offset.min(lines.len());
-                Ok(
-                    json!({"commits":[commit],"path":path,"object_sha":object,"size":size,
-                    "content":lines[start..end].concat(),"offset":args.offset,"lines":end-start,
-                    "truncated":end<lines.len(),"next_offset":(end<lines.len()).then_some(end)}),
-                )
+                meta["content"] = json!(lines[start..end].concat());
+                meta["lines"] = json!(end - start);
+                meta["offset"] = json!(args.offset);
+                meta["truncated"] = json!(end < lines.len());
+                meta["next_offset"] = json!((end < lines.len()).then_some(end));
+                Ok(meta)
             }
             "list_tree" => {
                 let commit = repo.commit(args.rev()).await?;

@@ -1657,6 +1657,16 @@ This captures Daimonos's outgoing schema, not OpenRouter's downstream transforme
 request. It cannot recover older requests, prove downstream behavior, or correlate
 raw model responses; the UUID is local, not a provider request ID.
 
+## File evidence digests
+
+Pass `--read-sha256` to add a lowercase SHA-256 digest to `read_file` and `git_read` with `command: show_file`. The digest covers all stored bytes, including original line endings. The offset, line limit, output cap, and unchanged-file cache do not change its meaning.
+
+A text result carries `sha256`. A binary `read_file` result carries `binary`, `size`, and `sha256` without content. A Git binary or output-limit refusal can carry `metadata.sha256`. The Git digest identifies the pinned blob bytes, not the current worktree or the Git object header. Strict-pinning rules still apply.
+
+Supply `--tool-input-bytes` and `--tool-timeout-ms` to bound this work. A one-line page can require a full file read. A budget failure returns no digest. When `read_file` detects a change on the opened handle, it returns `file_changed`; retry the read. This check is not a filesystem snapshot. Large filesystem reads still buffer the file; use a byte limit for untrusted sizes.
+
+Digest mode bypasses model-assisted reformatting for these two tools. A Git output cap too small for the complete metadata error stops startup with `digest_metadata_cap`. Without `--read-sha256`, the existing read shapes and Git cap behavior stay unchanged.
+
 ## Read-only git (`git_read`)
 
 `git_read.strict_pinning` is false by default. Enable it to require explicit

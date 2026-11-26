@@ -10,6 +10,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Added
 
 - The local container accepts a caller-selected workspace and MCP arguments. `daimonos --version` reports its package, source revision, and independent tool-contract version.
+- `--read-sha256` includes complete stored-byte digests on filesystem and pinned Git reads, including paged and bounded results.
 
 ## [0.1.8] - 2026-11-24
 

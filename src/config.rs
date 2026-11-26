@@ -134,6 +134,9 @@ pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
     pub git_read: GitReadConfig,
+    /// Caller-owned read evidence option (ADR-031).
+    #[serde(skip)]
+    pub read_sha256: bool,
     pub process: ProcessConfig,
     pub tool_output: ToolOutputConfig,
     pub loop_detector: LoopDetectorConfig,

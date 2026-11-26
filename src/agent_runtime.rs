@@ -499,6 +499,7 @@ pub async fn run_agent(
                 // WP17 (FR-15): carry the full-schema mode into the daemon launch
                 // identity so an attach cannot silently downgrade it.
                 full_tool_schemas: crate::config::effective_full_tool_schemas(&cfg),
+                read_sha256: cfg.read_sha256,
             },
         )
         .await?;

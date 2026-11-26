@@ -457,8 +457,7 @@ async fn dispatch_tool_inner(
         session.end_tool_operation(budget_owned);
         return response_to_result(failure.into_response(name));
     }
-    let budget_remaining = session.budget_remaining();
-    let dispatched = crate::managed_process::with_budget_deadline(budget_remaining, async {
+    let dispatched = crate::managed_process::with_tool_budget(session.tool_budget(), async {
     // Registry-based dispatch: route ops-backed tools through the facade.
     if let Some(resp) = tool_facade::invoke(session, name, args).await {
         session.last_response_meta = resp.meta.clone();
@@ -837,8 +836,12 @@ async fn dispatch_tool_inner(
             match run_result {
                 Ok(result) => {
                     let text = result.output.to_string();
-                    if let Err(failure) = session.budget_charge_bytes(text.len() as u64, "git_read")
-                    {
+                    if session.cfg.read_sha256 && command == "show_file" {
+                        if let Some(hit) = session.tool_budget().and_then(|b| b.take_plugin_hit()) {
+                            session.note_budget_hit(&hit);
+                            return response_to_result(hit.into_failure(Some("git_read")).into_response("git_read"));
+                        }
+                    } else if let Err(failure) = session.budget_charge_bytes(text.len() as u64, "git_read") {
                         return response_to_result(failure.into_response("git_read"));
                     }
                     if result.exit_code == 0 {

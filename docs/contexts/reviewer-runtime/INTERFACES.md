@@ -299,12 +299,12 @@ _Status (WP18, implemented; state after the code review of 2026-11-23):_
 These fields are policy/error metadata, not a rewrite of every existing tool's successful payload.
 Audit records the named limit and the refusal. Error text is bounded and does not contain raw evidence.
 
-WP19 owns `src/file_digest.rs` (new) and the existing pinned-git runner.
+WP19 uses `src/file_digest.rs::read` for the opened filesystem handle and `src/plugins/git_read/runner.rs::ReadRepo::blob_with_digest` for the pinned Git object (ADR-031). `tests/test_file_digests.py` compares results with `sha256sum` and checks deterministic shared-budget refusals.
 It adds `sha256` to the existing read payload or binary metadata when enabled.
 Use all stored bytes from the authorized file handle or pinned git blob, not normalized text, a page, or decoded lossy output.
 A complete digest may accompany truncated text. A partial digest never appears.
 If limits prevent completion, return `tool_input_limit` or `tool_timeout` with no `sha256` value.
-`git_read` operations that cannot expose/count a complete blob stream refuse input-budget mode until supported.
+For `show_file` in digest mode the immutable blob size is reserved once before capture; the reader verifies the number of bytes received. Output JSON is not charged a second time. Other Git operations retain WP18 accounting and do not claim full-blob digests.
 Do not weaken existing binary withholding or strict full-commit pinning to provide a hash.
 
 ## Errors and exit reservations

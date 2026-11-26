@@ -158,6 +158,8 @@ pub struct ToolBudget {
     timeout_ms: Option<u64>,
     input_limit: Option<u64>,
     input_consumed: AtomicU64,
+    // Native plugin code cannot borrow Session. Carry genuine hits back in-band.
+    plugin_hit: std::sync::Mutex<Option<BudgetHit>>,
     entry_limit: Option<u64>,
     entry_consumed: AtomicU64,
 }
@@ -172,6 +174,7 @@ impl ToolBudget {
             timeout_ms: cfg.timeout_ms,
             input_limit: cfg.input_bytes,
             input_consumed: AtomicU64::new(0),
+            plugin_hit: std::sync::Mutex::new(None),
             entry_limit: cfg.max_entries,
             entry_consumed: AtomicU64::new(0),
         }
@@ -194,8 +197,16 @@ impl ToolBudget {
         .into_failure(argument)
     }
 
-    /// Error if the absolute deadline has passed. Checked at bounded work
-    /// boundaries by native/index readers.
+    /// Return a genuine plugin hit to the session for the audit record.
+    pub fn record_plugin_hit(&self, hit: &BudgetHit) {
+        *self.plugin_hit.lock().expect("plugin hit poisoned") = Some(hit.clone());
+    }
+
+    pub fn take_plugin_hit(&self) -> Option<BudgetHit> {
+        self.plugin_hit.lock().expect("plugin hit poisoned").take()
+    }
+
+    /// Refuse once the shared absolute deadline has passed.
     pub fn check_deadline(&self) -> Result<(), BudgetHit> {
         if let Some(d) = self.deadline {
             if Instant::now() >= d {
