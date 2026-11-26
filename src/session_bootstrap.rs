@@ -734,6 +734,42 @@ mod tests {
     }
 
     #[test]
+    fn selected_client_rejects_plain_and_unfingerprinted_daemons() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.provider = None;
+        opts.agent_env = None;
+        let plain = bootstrap_fingerprint(&opts);
+        let metadata = crate::session_daemon::instance_metadata_path(&socket);
+        for (digest, analytics) in [(true, false), (false, true)] {
+            opts.read_sha256 = digest;
+            opts.analytics_off = analytics;
+            for (record, expected) in [
+                (
+                    serde_json::json!({"selected_evidence_profile":false,"bootstrap_fingerprint":plain}),
+                    LaunchIdentity::Mismatched,
+                ),
+                (
+                    serde_json::json!({"bootstrap_fingerprint":plain}),
+                    LaunchIdentity::Mismatched,
+                ),
+                (serde_json::json!({"pid":1}), LaunchIdentity::Unavailable),
+                (
+                    serde_json::json!({"selected_evidence_profile":true,"bootstrap_fingerprint":bootstrap_fingerprint(&opts)}),
+                    LaunchIdentity::Matched,
+                ),
+            ] {
+                std::fs::write(&metadata, record.to_string()).unwrap();
+                std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                assert_eq!(launch_identity(&opts).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn read_digest_changes_daemon_identity_and_arguments() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("d.sock");

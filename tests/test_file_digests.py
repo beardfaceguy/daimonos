@@ -242,11 +242,17 @@ def test_git_replace_refs_do_not_substitute_blob_evidence(daimonos_factory, tmp_
     assert page["sha256"] == expected and page["content"] == "first line\nsecond line\n"
 
 
-def test_cached_read_then_page_hashes_current_bytes(daimonos_factory, tmp_path):
-    path = tmp_path / "note.txt"
+@pytest.mark.parametrize("confined", [False, True])
+def test_cached_read_then_page_hashes_current_bytes(daimonos_factory, tmp_path, confined):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    flags = ["--state-dir", str(state), "--confine-paths", "--no-follow-symlinks"] if confined else []
+    path = workspace / "note.txt"
     path.write_bytes(b"start\r\npage\n")
     for args in ([], ["--read-sha256"]):
-        client = daimonos_factory(tmp_path, args=args)
+        client = daimonos_factory(workspace, args=[*flags, *args])
         payload(client, "read_file", {"path": path.name})
         assert payload(client, "read_file", {"path": path.name})["unchanged"]
         page = payload(client, "read_file", {"path": path.name, "limit": 1, "offset": 1})

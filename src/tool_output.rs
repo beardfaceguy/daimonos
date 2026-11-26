@@ -691,7 +691,9 @@ pub async fn bound_text(cfg: &ToolOutputConfig, tool_name: &str, content: String
                     fallback["note"] = serde_json::json!(NO_SPILL_MARKER);
                 }
                 if fallback.to_string().len() > cfg.max_bytes {
-                    fallback.as_object_mut().unwrap().remove("full_output_path");
+                    let fields = fallback.as_object_mut().unwrap();
+                    fields.remove("full_output_path");
+                    fields.remove("note");
                 }
                 bounded.content = fallback.to_string();
                 bounded.visible_chars = bounded.content.chars().count();
@@ -1296,6 +1298,23 @@ mod tests {
         assert!(bounded.content.contains("truncated"));
         assert!(bounded.content.lines().count() <= 6);
         assert!(bounded.content.len() <= 256);
+    }
+
+    #[tokio::test]
+    async fn nested_no_spill_evidence_fits_minimum_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(dir.path());
+        config.max_bytes = 256;
+        config.save_full_output = false;
+        let hash = "f".repeat(64);
+        let original = json!({"metadata":{"sha256":hash}, "extra":vec![123; 400]});
+        let bounded = bound_text(&config, "git_read", original.to_string()).await;
+        assert!(bounded.content.len() <= config.max_bytes);
+        let parsed: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+        assert_eq!(parsed["metadata"]["sha256"], hash);
+        assert!(bounded.output_path.is_none());
+        let without_optional_fields = json!({"metadata":{"sha256":hash}, "truncated":true});
+        assert!(without_optional_fields.to_string().len() <= config.max_bytes);
     }
 
     #[tokio::test]

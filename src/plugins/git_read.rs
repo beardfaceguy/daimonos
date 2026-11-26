@@ -335,7 +335,12 @@ impl GitReadPlugin {
                 // and JSON rendering do not change its logical input size (ADR-031).
                 if let Some(budget) = crate::managed_process::current_tool_budget() {
                     if let Err(hit) = budget.charge_input(size as u64) {
-                        let _ = CALL_HIT.try_with(|cell| cell.set(Some(hit)));
+                        CALL_HIT.try_with(|cell| cell.set(Some(hit))).map_err(|_| {
+                            Failure::new(
+                                "git_budget_scope_missing",
+                                "budgeted Git reads require a call-local audit scope",
+                            )
+                        })?;
                         return Err(Failure::new(
                             "tool_input_limit",
                             "blob exceeds input budget",
