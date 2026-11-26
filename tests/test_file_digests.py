@@ -192,3 +192,19 @@ def test_agent_records_genuine_git_input_hit_without_a_digest(daimonos_binary, t
     hits = [event for line in audit.read_text().splitlines() if (event := json.loads(line))["kind"] == "limit_hit"]
     assert len(hits) == 1 and hits[0]["tool"] == "git_read"
     assert hits[0]["configured"] == size - 1 and hits[0]["consumed"] == size
+
+
+def test_digest_at_evidence_cutoff_after_branch_advances(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+    repo, cutoff = repository(tmp_path)
+    expected = digest(repo / "file.txt")
+    (repo / "file.txt").write_text("new evidence after cutoff\n")
+    git(repo, "commit", "-am", "move branch past cutoff")
+    assert git(repo, "rev-parse", "HEAD") != cutoff
+    config = tmp_path / "strict.toml"
+    config.write_text("[git_read]\nstrict_pinning=true\n")
+    client = daimonos_factory(tmp_path, args=["--read-sha256", "--config", str(config)])
+    args = {"command": "show_file", "repo": "source", "path": "file.txt", "rev": cutoff, "limit": 1}
+    page = payload(client, "git_read", args)
+    assert page["commits"] == [cutoff] and page["sha256"] == expected and page["content"] == "first line\n"
+    assert client.call_tool("git_read", {**args, "rev": "main"})["isError"]
