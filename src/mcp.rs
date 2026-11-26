@@ -1464,13 +1464,7 @@ impl ServerHandler for DaimonosHandler {
             // (even normally-lazy/on-demand tools) and nothing else — so served,
             // discovered, and executable names agree (ADR-023). With no explicit
             // list, the legacy lazy exposure set applies unchanged.
-            .filter(|t| {
-                if session.policy.is_active() {
-                    session.policy.allows(&t.name)
-                } else {
-                    session.exposed_tools.contains(&t.name)
-                }
-            })
+            .filter(|t| session.policy.visible(&t.name, &session.exposed_tools))
             .filter(|t| passes_session_context_check(&session, &t.name))
             .map(|t| {
                 let already_used = session.used_tools.contains(&t.name);
@@ -2192,13 +2186,7 @@ fn socket_list_tools_json(session: &Session) -> Vec<Value> {
         // FR-02 (WP06, listing inventory): the session-daemon socket listing is
         // filtered by the explicit allowlist too (mirrors the MCP tools/list
         // path), so an allowlisted daemon serves exactly the allowlisted tools.
-        .filter(|t| {
-            if session.policy.is_active() {
-                session.policy.allows(&t.name)
-            } else {
-                session.exposed_tools.contains(&t.name)
-            }
-        })
+        .filter(|t| session.policy.visible(&t.name, &session.exposed_tools))
         .filter(|t| passes_session_context_check(session, &t.name))
         .map(|t| {
             let already_used = session.used_tools.contains(&t.name);

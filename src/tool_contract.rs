@@ -59,9 +59,7 @@ pub struct EffectiveInputs<'a> {
     pub full_tool_schemas: bool,
     pub confined: bool,
     pub kgl_state_directory: Option<PathBuf>,
-    // Keep the legacy export unchanged. Offline export uses the same caller-narrowed
-    // catalog as listing and direct dispatch.
-    pub offline_policy: Option<crate::run_policy::ToolPolicy>,
+    pub policy: crate::run_policy::ToolPolicy,
 }
 
 impl<'a> EffectiveInputs<'a> {
@@ -78,10 +76,7 @@ impl<'a> EffectiveInputs<'a> {
             full_tool_schemas: crate::config::effective_full_tool_schemas(cfg),
             confined: cfg.filesystem_authority.is_some(),
             kgl_state_directory: cfg.kgl.state_directory.clone(),
-            offline_policy: cfg
-                .network
-                .offline()
-                .then(|| crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref())),
+            policy: crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref()),
         }
     }
 }
@@ -108,12 +103,7 @@ impl EffectiveToolCatalog {
         let rendered: Vec<rust_mcp_sdk::schema::Tool> =
             tools::tool_definitions(inputs.descriptions)
                 .into_iter()
-                .filter(|t| {
-                    inputs.offline_policy.as_ref().map_or_else(
-                        || exposed.contains(&t.name),
-                        |policy| policy.allows(&t.name),
-                    )
-                })
+                .filter(|t| inputs.policy.visible(&t.name, &exposed))
                 .filter(|t| {
                     passes_effective_context_check(
                         &t.name,
@@ -335,7 +325,7 @@ mod tests {
             full_tool_schemas: false,
             confined: false,
             kgl_state_directory: None,
-            offline_policy: None,
+            policy: crate::run_policy::ToolPolicy::from_config(cfg.tool_allowlist.as_ref()),
         }
     }
 

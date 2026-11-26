@@ -299,6 +299,8 @@ _Status (WP18, implemented; state after the code review of 2026-11-23):_
 These fields are policy/error metadata, not a rewrite of every existing tool's successful payload.
 Audit records the named limit and the refusal. Error text is bounded and does not contain raw evidence.
 
+The final integration uses `ToolPolicy::visible` for fresh MCP stdio and socket listings and the session-free contract export. An explicit empty selection exports no tools. With no selection the initial exposure tiers remain unchanged. This correction does not add a field to the export envelope.
+
 WP19 uses `src/file_digest.rs::read` for the opened filesystem handle and `src/plugins/git_read/runner.rs::ReadRepo::blob_with_digest` for the pinned Git object (ADR-031). `tests/test_file_digests.py` compares results with `sha256sum` and checks deterministic shared-budget refusals.
 It adds `sha256` to the existing read payload or binary metadata when enabled.
 Use all stored bytes from the authorized file handle or pinned git blob, not normalized text, a page, or decoded lossy output.
