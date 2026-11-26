@@ -122,3 +122,101 @@ def test_model_calls_restricted_container_worker(image, daimonos_binary, tmp_pat
         assert len(messages) == 1 and "wp12 isolated worker evidence" in messages[0]["content"], messages
     finally:
         provider.close()
+
+
+@pytest.fixture
+def offline_evidence_worker(image, tmp_path):
+    """Real WP12 isolation, WP20 admission, and WP19 digests with a WP18 byte cap."""
+    from test_read_only_workspace import _snapshot
+
+    workspace = tmp_path / "evidence-only"
+    workspace.mkdir(mode=0o755)
+    source = workspace / "sample.txt"
+    source.write_bytes(b"private-prefix\r\nvisible-page\r\nprivate-suffix\n")
+    size = source.stat().st_size
+    (workspace / "larger.txt").write_bytes(b"A" * (size + 1))
+    for path in workspace.iterdir():
+        path.chmod(0o444)
+    digest = subprocess.check_output(["sha256sum", source], text=True).split()[0]
+    before = _snapshot(workspace)
+    argv = worker_args(workspace, image)
+    argv[-1:-1] = ["--offline-tools", "--read-sha256", "--full-tool-schemas", "--no-output-spill",
+                   "--confine-paths", "--no-follow-symlinks", "--tool-input-bytes", str(size)]
+    yield argv, digest
+    assert _snapshot(workspace) == before
+
+
+def test_offline_worker_hashes_the_whole_file_within_its_byte_budget(offline_evidence_worker):
+    argv, digest = offline_evidence_worker
+    args = {"path": "sample.txt", "offset": 1, "limit": 1}
+    results = mcp_exchange(argv, [
+        ("tools/list", {}),
+        ("tools/call", {"name": "read_file", "arguments": args}),
+        ("tools/call", {"name": "read_file", "arguments": {**args, "path": "larger.txt"}}),
+        ("tools/call", {"name": "git_read", "arguments": {"command": "resolve"}}),
+    ])
+    assert {t["name"] for t in results[2]["tools"]} == {"read_file", "search", "workspace_info", "ls"}
+    page, refusal, forbidden = [json.loads(results[i]["content"][0]["text"]) for i in (3, 4, 5)]
+    assert not results[3].get("isError") and page["content"] == "visible-page" and page["sha256"] == digest
+    assert results[4]["isError"] and refusal["code"] == "tool_input_limit" and "sha256" not in refusal
+    assert results[5]["isError"] and forbidden["code"] == "offline_tool_forbidden"
+
+
+@pytest.mark.parametrize("wire", ["messages", "chat"])
+def test_model_receives_only_paged_offline_evidence(wire, offline_evidence_worker, daimonos_binary, tmp_path):
+    from test_agent_oneshot_sessions import tool_reply
+    from test_capability_probe import CRED_VALUE, FINAL_SCHEMA, FINAL_TOOL, _env, _write_final_output, _write_payload, _write_profile
+    from test_combined_reviewer_profile import ScriptEndpoint, _final, _worker_call
+
+    argv, digest = offline_evidence_worker
+    name = "mcp__container__read_file"
+    params = {"path": "sample.txt", "offset": 1, "limit": 1}
+    manifest = tmp_path / "worker.json"
+    manifest.write_text(json.dumps({"workers": {"container": {"command": "docker", "args": argv[1:],
+                                                            "env": {"PATH": os.defpath}}}}))
+    state = tmp_path / "model-state"
+    state.mkdir(mode=0o700)
+    workspace = tmp_path / "empty-model-workspace"
+    workspace.mkdir()
+    allow = tmp_path / "allow.json"
+    allow.write_text(json.dumps([name, FINAL_TOOL]))
+    audit = state / "audit.jsonl"
+    agent_env, env = _env(tmp_path)
+    if wire == "messages":
+        call = _worker_call(name)
+        call["content"][0]["input"] = params
+        script = [_final(), call, _final()]
+    else:
+        script = []
+        for tool, args in [(FINAL_TOOL, {"verdict": "supported"}), (name, params), (FINAL_TOOL, {"verdict": "supported"})]:
+            reply = tool_reply(tool, args)
+            script.append({"choices": [{"message": reply["message"], "finish_reason": reply["finish_reason"]}],
+                           "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    endpoint = ScriptEndpoint(script)
+    try:
+        profile = _write_profile(tmp_path / "profile.json", endpoint.url, wire=wire,
+                                 provider_label="anthropic" if wire == "messages" else "openrouter")
+        run = subprocess.run([daimonos_binary, "-w", str(workspace), "--state-dir", str(state), "--workspace-read-only",
+                              "--tool-allowlist", str(allow), "--full-tool-schemas", "--audit-path", str(audit), "agent",
+                              "--print", "--agent-env", str(agent_env), "--worker-config", str(manifest),
+                              "--model-profile", str(profile), "--final-output", str(_write_final_output(tmp_path / "final.json")),
+                              "--capability-probe-payload", str(_write_payload(tmp_path / "probe.json")), "read the evidence"],
+                             text=True, capture_output=True, env=env, timeout=60)
+    finally:
+        endpoint.close()
+    assert run.returncode == 0 and json.loads(run.stdout) == {"verdict": "supported"}, run.stderr
+    probe, work, finish = endpoint.requests
+    assert probe["tools"] == work["tools"] == finish["tools"]
+    definitions = [t.get("function", t) for t in work["tools"]]
+    schemas = {t["name"]: t.get("parameters", t.get("input_schema")) for t in definitions}
+    assert set(schemas) == {name, FINAL_TOOL} and schemas[FINAL_TOOL] == FINAL_SCHEMA
+    assert schemas[name]["properties"]["path"]["x-daimonos-path"] is True
+    evidence = json.dumps(finish["messages"])
+    assert digest in evidence and "visible-page" in evidence
+    assert "private-prefix" not in evidence and "private-suffix" not in evidence
+    raw = audit.read_text()
+    events = [json.loads(line) for line in raw.splitlines()]
+    assert [(e["kind"], e.get("route")) for e in events if e["kind"] == "tool_call"] == [("tool_call", "worker")]
+    assert events[-1]["kind"] == "run_end" and events[-1]["exit_code"] == 0
+    assert CRED_VALUE not in raw + run.stdout + run.stderr and "visible-page" not in raw
+    assert not list(workspace.iterdir())
