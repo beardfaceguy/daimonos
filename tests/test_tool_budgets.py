@@ -1026,7 +1026,7 @@ def test_budget_hit_writes_limit_hit_audit_event(daimonos_binary, tmp_path):
 # --- R1 (B1): allow-list inversion of the input/entry admission gate ---
 #
 # Under --tool-input-bytes / --tool-max-entries a tool is admitted only if it
-# meters its logical input (read_file, ls, content search, git_read) or reads
+# meters its logical input (read_file, ls, content search, git_read show_file) or reads
 # no workspace/external content (write_file, append_file, the session/meta/mail
 # tools, and the composite dispatchers). EVERY other name is refused with the
 # reviewed ``tool_policy_unsupported`` code (integrator D60) naming the budget
@@ -1381,3 +1381,53 @@ def test_a_call_during_a_budgeted_script_does_not_share_its_budget(daimonos_fact
     other = replies[9002]
     assert _code(other) is None, _text(other)
     assert "o" * 60 in _text(other)
+
+
+def test_git_read_page_reserves_whole_blob_without_digest(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+
+    repo, _ = repository(tmp_path)
+    path = repo / "large.txt"
+    path.write_bytes(b"small first line\n" + b"x" * 32768)
+    git(repo, "add", path.name)
+    git(repo, "commit", "-m", "large blob")
+    args = {"command": "show_file", "repo": "source", "rev": git(repo, "rev-parse", "HEAD"),
+            "path": path.name, "limit": 1}
+    size = path.stat().st_size
+    for cap in (1024, size - 1, size):
+        client = daimonos_factory(tmp_path, args=["--tool-input-bytes", str(cap)])
+        result = client.call_tool("git_read", args)
+        data = json.loads(_text(result))
+        if cap < size:
+            assert result.get("isError") and data["code"] == "tool_input_limit", data
+            assert data["configured"] == cap and data["consumed"] == size, data
+            assert "content" not in data and "sha256" not in data
+        else:
+            assert not result.get("isError") and data["content"] == "small first line\n", data
+            assert "sha256" not in data
+
+
+def test_git_read_refuses_unmetered_commands_before_opening_repo(daimonos_factory, tmp_path):
+    # An absent repository cannot mask the policy error: the refusal must precede discovery.
+    others = {"resolve", "list_tree", "grep", "log", "show_commit", "diff", "blame", "refs", "ancestry", "worktree_status"}
+    for option in ("--tool-input-bytes", "--tool-max-entries"):
+        client = daimonos_factory(tmp_path, args=[option, "1024"])
+        for command in others:
+            result = client.call_tool("git_read", {"command": command, "repo": "does-not-exist"})
+            data = json.loads(_text(result))
+            assert result.get("isError") and data.get("code") == "tool_policy_unsupported", (command, data)
+            assert data["tool"] == "git_read" and option in data["message"]
+
+
+def test_git_read_checks_input_allowance_before_display_cap(daimonos_factory, tmp_path):
+    from test_git_read import repository
+
+    repo, commit = repository(tmp_path)
+    size = (repo / "file.txt").stat().st_size
+    config = tmp_path / "display.toml"
+    config.write_text("[git_read]\nmax_file_bytes=2\n")
+    client = daimonos_factory(tmp_path, args=["--config", str(config), "--tool-input-bytes", str(size - 1)])
+    result = client.call_tool("git_read", {"command": "show_file", "repo": "source", "rev": commit, "path": "file.txt"})
+    data = json.loads(_text(result))
+    assert result.get("isError") and data.get("code") == "tool_input_limit", data
+    assert data["configured"] == size - 1 and data["consumed"] == size

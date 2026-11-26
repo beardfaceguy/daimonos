@@ -816,15 +816,16 @@ async fn dispatch_tool_inner(
 
         "git_read" => {
             let command = get_str(args, "command").unwrap_or_default();
-            // FR-19 (WP18, ADR-031): git_read runs inside the single budget +
-            // deadline scope installed above, so the git child's process group
-            // is reaped AT the deadline and a passed deadline becomes a typed
-            // tool_timeout at the post-dispatch check. Here we only meter the
-            // git object content it returned (the PM counts this as logical
-            // input): a byte-ceiling hit is tool_input_limit with no partial.
             let Some(registry) = &session.tool_registry else {
                 return err_text(serde_json::json!({"error":{"kind":"unavailable","message":"tool registry unavailable"}}).to_string());
             };
+            // ADR-031: only show_file can meter its logical input. Do not open
+            // the repository for another operation when an input limit is active.
+            if command != "show_file" && session.budget_has_input_limits() {
+                return response_to_result(crate::path_policy::ToolFailure::tool_budget_policy_unsupported(
+                    Some("git_read"), "only show_file supports Git input budgets",
+                ).into_response("git_read"));
+            }
             let run_result = registry
                 .run(
                     "git_read",
@@ -838,13 +839,9 @@ async fn dispatch_tool_inner(
             match run_result {
                 Ok(result) => {
                     let text = result.output.to_string();
-                    if session.cfg.read_sha256 && command == "show_file" {
-                        if let Some(hit) = session.tool_budget().and_then(|b| b.take_plugin_hit()) {
-                            session.note_budget_hit(&hit);
-                            return response_to_result(hit.into_failure(Some("git_read")).into_response("git_read"));
-                        }
-                    } else if let Err(failure) = session.budget_charge_bytes(text.len() as u64, "git_read") {
-                        return response_to_result(failure.into_response("git_read"));
+                    if let Some(hit) = session.tool_budget().and_then(|b| b.take_plugin_hit()) {
+                        session.note_budget_hit(&hit);
+                        return response_to_result(hit.into_failure(Some("git_read")).into_response("git_read"));
                     }
                     if result.exit_code == 0 {
                         ok_text(text)

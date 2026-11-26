@@ -2,6 +2,8 @@
 import json
 import subprocess
 
+import pytest
+
 
 def digest(path):
     return subprocess.check_output(["sha256sum", path], text=True).split()[0]
@@ -107,18 +109,20 @@ def test_digest_survives_output_caps_on_both_tools(daimonos_factory, tmp_path):
         assert data["sha256"] == digest(path), (tool, text)
 
 
-def test_composite_failure_never_exposes_a_partial_digest(daimonos_factory, tmp_path):
+@pytest.mark.parametrize("digest_args", [[], ["--read-sha256"]], ids=["plain", "digest"])
+def test_composite_failure_never_exposes_a_partial_digest(daimonos_factory, tmp_path, digest_args):
     from test_git_read import repository
     repo, rev = repository(tmp_path)
     src = repo / "file.txt"
     read = {"tool": "read_file", "arguments": {"path": "source/file.txt", "limit": 1}}
     blob = {"tool": "git_read", "arguments": {"command": "show_file", "repo": "source", "rev": rev, "path": "file.txt"}}
-    client = daimonos_factory(tmp_path, args=["--read-sha256", "--tool-input-bytes", str(src.stat().st_size)])
+    client = daimonos_factory(tmp_path, args=[*digest_args, "--tool-input-bytes", str(src.stat().st_size)])
     children = payload(client, "batch", {"ops": [read, blob]})
-    assert children[0]["ok"] and digest(src) in json.dumps(children[0])
+    assert children[0]["ok"]
+    assert (digest(src) in json.dumps(children[0])) == bool(digest_args)
     assert not children[1]["ok"] and json.loads(children[1]["error"])["code"] == "tool_input_limit"
     assert "sha256" not in children[1]["error"]
-    deadline = daimonos_factory(tmp_path, args=["--read-sha256", "--tool-timeout-ms", "300"])
+    deadline = daimonos_factory(tmp_path, args=[*digest_args, "--tool-timeout-ms", "300"])
     children = payload(deadline, "batch", {"ops": [{"tool": "exec", "arguments": {"command": "sleep", "args": ["30"]}}, read, blob]})
     for child in children:
         assert not child["ok"] and json.loads(child["error"])["code"] == "tool_timeout"
@@ -166,7 +170,8 @@ def test_digest_cap_rejects_only_an_impossible_metadata_envelope(daimonos_binary
             assert run.returncode == 0, run.stderr
 
 
-def test_agent_records_genuine_git_input_hit_without_a_digest(daimonos_binary, tmp_path):
+@pytest.mark.parametrize("digest_args", [[], ["--read-sha256"]], ids=["plain", "digest"])
+def test_agent_records_genuine_git_input_hit_without_a_digest(daimonos_binary, tmp_path, digest_args):
     from test_git_read import repository
     from test_tool_budgets import _FakeProvider, _agent_env_file, _isolated_env
     workspace = tmp_path / "workspace"
@@ -181,7 +186,7 @@ def test_agent_records_genuine_git_input_hit_without_a_digest(daimonos_binary, t
     try:
         envfile = _agent_env_file(tmp_path, provider, allowed="git_read")
         run = subprocess.run([daimonos_binary, "-w", str(workspace), "--state-dir", str(state),
-                              "--audit-path", str(audit), "--read-sha256", "--tool-input-bytes", str(size - 1),
+                              "--audit-path", str(audit), *digest_args, "--tool-input-bytes", str(size - 1),
                               "agent", "--print", "--output", "json", "--agent-env", str(envfile), "task"],
                              capture_output=True, text=True, env=_isolated_env(tmp_path), timeout=60)
         assert run.returncode == 0, run.stderr

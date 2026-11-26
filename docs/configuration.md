@@ -1947,8 +1947,8 @@ top-level tool call may consume. They are caller-owned (never read from
 - **`--tool-timeout-ms N`** — an absolute deadline, in milliseconds, for the
   call. A hit returns the reviewed `tool_timeout` code with no partial result.
 - **`--tool-input-bytes N`** — a logical input-byte ceiling for the call. It
-  counts the file content that a tool reads or scans, and the git content that
-  `git_read` returns. It never counts the displayed or truncated output bytes.
+  counts the file content that a tool reads or scans. For `git_read show_file`,
+  it counts the complete pinned blob once per read, not the page or the JSON response.
   A hit returns `tool_input_limit`.
 - **`--tool-max-entries N`** *(proposed)* — a directory-entry ceiling for the
   call (e.g. `ls` walking). A hit returns `tool_input_limit` naming
@@ -2007,8 +2007,7 @@ The default-off options `--tool-timeout-ms`, `--tool-input-bytes`, and
 - **Input bytes.** `search` in content mode charges the bytes that it scans and
   stops during the scan. `read_file` checks the file size before the read and
   charges the whole file, also when `offset` and `limit` select a part.
-  `git_read` charges the bytes of the content that it returns, after git ended.
-  That is an approximation of the git content read: it does not stop git early.
+  `git_read show_file` resolves the commit and blob, obtains the stored size, and reserves that many bytes before reading the blob. This applies with or without `--read-sha256`. A failed reservation reports the attempted cumulative size and returns no content or digest. It takes precedence over display caps. The counter measures logical blob content, not physical I/O or Git metadata lookups.
 - **Entries.** `ls` charges each directory entry during the walk and stops at
   the limit.
 - **Refused under an input or entry limit.** With `--tool-input-bytes` or
@@ -2020,6 +2019,7 @@ The default-off options `--tool-timeout-ms`, `--tool-input-bytes`, and
   in files mode (the index does not report the content that it reads). With
   `--confine-paths`, the offered tools `read_file`, `ls`, and `search` in
   content mode stay available.
+  Only `show_file` supports Git reads under an input or entry limit. The other `git_read` commands return `tool_policy_unsupported` before repository discovery. A deadline alone does not restrict the choice of Git command. The generic native `tool_run` opcode has no input meter and refuses delegation under an input or entry limit; use the named `git_read` tool for a metered read.
 - **Refused under each budget option.** `tool_pipeline`, and a run with
   `--worker-config` (at startup).
 

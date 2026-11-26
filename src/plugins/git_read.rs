@@ -317,6 +317,17 @@ impl GitReadPlugin {
                     .trim()
                     .parse::<usize>()
                     .map_err(|_| Failure::new("git_error", "invalid blob size"))?;
+                // Charge the immutable blob once, before opening it. Paging, hashing,
+                // and JSON rendering do not change its logical input size (ADR-031).
+                if let Some(budget) = crate::managed_process::current_tool_budget() {
+                    if let Err(hit) = budget.charge_input(size as u64) {
+                        budget.record_plugin_hit(&hit);
+                        return Err(Failure::new(
+                            "tool_input_limit",
+                            "blob exceeds input budget",
+                        ));
+                    }
+                }
                 if !self.read_sha256 && size > self.limits.max_file_bytes {
                     return Err(Failure::new(
                         "output_limit",
@@ -327,17 +338,6 @@ impl GitReadPlugin {
                 let mut meta =
                     json!({"commits":[commit],"path":path,"object_sha":object,"size":size});
                 let content = if self.read_sha256 {
-                    // A pinned Git object is immutable. Reserve its logical byte size once,
-                    // before cat-file starts, including bytes outside the visible page.
-                    if let Some(budget) = crate::managed_process::current_tool_budget() {
-                        if let Err(hit) = budget.charge_input(size as u64) {
-                            budget.record_plugin_hit(&hit);
-                            return Err(Failure::new(
-                                "tool_input_limit",
-                                "blob exceeds input budget",
-                            ));
-                        }
-                    }
                     let blob = repo.blob_with_digest(&object).await?;
                     if blob.stdout_bytes != size as u64 {
                         return Err(Failure::new("git_error", "incomplete blob"));

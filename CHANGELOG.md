@@ -14,6 +14,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `--offline-tools` serves four local evidence tools over MCP stdio or a Unix socket. It refuses network-capable producers and subprocess tools.
 - `--analytics-off` disables local analytics collection for a run and its session daemon. It leaves an explicitly requested local audit active.
 
+### Fixed
+
+- `git_read show_file` now applies `--tool-input-bytes` to the full pinned blob even without a digest. Other Git reads refuse input or entry budgets they cannot enforce. Calls without those limits keep their previous behavior.
+
 ## [0.1.8] - 2026-11-24
 
 ### Security
