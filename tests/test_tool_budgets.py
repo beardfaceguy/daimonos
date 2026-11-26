@@ -1456,3 +1456,16 @@ def test_repeated_git_pages_consume_one_full_reservation_per_call(daimonos_facto
     results = json.loads(_text(client.call_tool("batch", {"ops": [op, op]})))
     assert results[0]["ok"] and _child_failure(results[1])["consumed"] == 2 * size
     assert not client.call_tool("git_read", op["arguments"]).get("isError")
+
+
+def test_failed_git_display_does_not_refund_logical_input(daimonos_factory, tmp_path):
+    from test_git_read import git, repository
+    repo, rev = repository(tmp_path)
+    size = int(git(repo, "cat-file", "-s", f"{rev}:file.txt"))
+    config = tmp_path / "display.toml"
+    config.write_text("[git_read]\nmax_file_bytes=2\n")
+    op = {"tool": "git_read", "arguments": {"command": "show_file", "repo": "source", "rev": rev, "path": "file.txt"}}
+    client = daimonos_factory(tmp_path, args=["--tool-input-bytes", str(size), "--config", str(config)])
+    first, second = json.loads(_text(client.call_tool("batch", {"ops": [op, op]})))
+    assert not first["ok"] and "output_limit" in first["error"]
+    assert _child_failure(second)["code"] == "tool_input_limit" and _child_failure(second)["consumed"] == size * 2

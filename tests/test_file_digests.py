@@ -240,3 +240,18 @@ def test_git_replace_refs_do_not_substitute_blob_evidence(daimonos_factory, tmp_
     client = daimonos_factory(tmp_path, args=["--read-sha256"])
     page = payload(client, "git_read", {"command": "show_file", "repo": "source", "rev": commit, "path": "file.txt"})
     assert page["sha256"] == expected and page["content"] == "first line\nsecond line\n"
+
+
+def test_cached_read_then_page_hashes_current_bytes(daimonos_factory, tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_bytes(b"start\r\npage\n")
+    for args in ([], ["--read-sha256"]):
+        client = daimonos_factory(tmp_path, args=args)
+        payload(client, "read_file", {"path": path.name})
+        assert payload(client, "read_file", {"path": path.name})["unchanged"]
+        page = payload(client, "read_file", {"path": path.name, "limit": 1, "offset": 1})
+        assert page["content"].strip() == "page" and "unchanged" not in page
+        if args:
+            assert page["sha256"] == digest(path)
+        else:
+            assert "sha256" not in page

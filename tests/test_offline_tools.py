@@ -311,3 +311,19 @@ def test_offline_unix_socket_sessions_inherit_admission(daimonos_binary, tmp_pat
             events = log.read_text()
             assert "AF_UNIX" in events and "accept" in events
             assert_offline_trace(events, daimonos_binary)
+
+
+@pytest.mark.parametrize("selected", [None, []], ids=["implicit-four", "explicit-empty"])
+def test_offline_empty_and_default_catalogs_match(daimonos_binary, daimonos_factory, tmp_path, selected):
+    flags = ["--offline-tools", "--full-tool-schemas"]
+    if selected is not None:
+        path = tmp_path / "allow.json"
+        path.write_text(json.dumps(selected))
+        flags.extend(["--tool-allowlist", str(path)])
+    client = daimonos_factory(tmp_path, args=flags)
+    served = {t["name"]: t["inputSchema"] for t in client.list_tools()}
+    dumped = json.loads(subprocess.check_output([daimonos_binary, "-w", str(tmp_path), *flags, "tool-contract"]))
+    assert {t["name"]: t["input_schema"] for t in dumped["tools"]} == served
+    assert set(served) == (set() if selected == [] else {"read_file", "ls", "workspace_info", "search"})
+    missing = subprocess.run([daimonos_binary, "--offline-tools", "--tool-allowlist", str(tmp_path / "absent"), "tool-contract"], capture_output=True)
+    assert missing.returncode == 2 and not missing.stdout and b"tool_allowlist_invalid" in missing.stderr
