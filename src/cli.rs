@@ -505,6 +505,13 @@ pub struct Cli {
     #[arg(long = "tool-max-entries", global = true, value_name = "N")]
     pub tool_max_entries: Option<u64>,
 
+    /// Disable local analytics collection and storage for this process (ADR-032).
+    #[arg(long, global = true)]
+    pub analytics_off: bool,
+    /// Run local evidence tools without network producers (ADR-032).
+    #[arg(long, global = true)]
+    pub offline_tools: bool,
+
     /// Serve and export full, self-contained JSON Schema draft 2020-12 tool
     /// schemas instead of the default stripped placeholders (WP17, FR-15).
     /// Equivalent to `[mcp] full_tool_schemas = true`; the config/env seam still

@@ -30,6 +30,8 @@ pub struct BootstrapOptions<'a> {
     /// daemon launch identity so a daemon started with the mode is never reused
     /// by a frontend that did not request it, and vice versa.
     pub ignore_config_files: bool,
+    /// Forward the caller's collection policy and refuse reuse of a collecting daemon.
+    pub analytics_off: bool,
     /// Independent no-follow option (WP14). Part of the daemon's launch
     /// identity so a pinned session daemon enforces the same link policy.
     pub no_follow: bool,
@@ -236,6 +238,9 @@ fn daemon_args(options: &BootstrapOptions<'_>) -> Vec<OsString> {
         args.push(OsString::from("--agent-instructions"));
         args.push(path.as_os_str().to_owned());
     }
+    if options.analytics_off {
+        args.push(OsString::from("--analytics-off"));
+    }
     if options.debug_tokens {
         args.push(OsString::from("--debug-tokens"));
     }
@@ -365,6 +370,9 @@ fn bootstrap_fingerprint(options: &BootstrapOptions<'_>) -> String {
     if options.read_sha256 {
         digest.update(b"read-sha256\0");
     }
+    if options.analytics_off {
+        digest.update(b"analytics-off\0");
+    }
     if options.full_tool_schemas {
         digest.update(b"full-tool-schemas\0");
     }
@@ -383,6 +391,7 @@ fn launch_identity(options: &BootstrapOptions<'_>) -> std::io::Result<LaunchIden
         && options.confine_identity.is_none()
         && !options.ignore_config_files
         && !options.read_sha256
+        && !options.analytics_off
         && !options.no_follow
         && !options.tool_budget.any_enabled()
     {
@@ -499,6 +508,7 @@ mod tests {
             confine_reference: None,
             confine_identity: None,
             ignore_config_files: false,
+            analytics_off: false,
             no_follow: false,
             debug_tokens: false,
             workspace_read_only: false,
@@ -744,6 +754,28 @@ mod tests {
             bootstrap_fingerprint(&first),
             bootstrap_fingerprint(&second)
         );
+    }
+
+    // ADR-032: a client that disables analytics must not reuse a collecting daemon.
+    #[test]
+    fn analytics_off_is_forwarded_and_requires_a_matching_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let mut opts = options(dir.path(), dir.path(), &socket, dir.path());
+        opts.config_path = None;
+        opts.provider = None;
+        opts.agent_env = None;
+        let plain = bootstrap_fingerprint(&opts);
+        assert!(!daemon_args(&opts).contains(&OsString::from("--analytics-off")));
+        assert_eq!(
+            launch_identity(&opts).unwrap(),
+            LaunchIdentity::NotRequested
+        );
+
+        opts.analytics_off = true;
+        assert!(daemon_args(&opts).contains(&OsString::from("--analytics-off")));
+        assert_ne!(bootstrap_fingerprint(&opts), plain);
+        assert_eq!(launch_identity(&opts).unwrap(), LaunchIdentity::Unavailable);
     }
 
     #[test]

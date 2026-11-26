@@ -176,6 +176,20 @@ def _read_events(audit_path):
     return [json.loads(line) for line in lines if line.strip()]
 
 
+def test_analytics_off_preserves_local_audit(daimonos_binary, tmp_path):
+    provider = _FakeProvider([("end", DONE)])
+    try:
+        completed, audit_path = _run(daimonos_binary, tmp_path, provider, "say hello",
+                                     extra_global=["--analytics-off"])
+    finally:
+        provider.close()
+    assert completed.returncode == 0, completed.stderr
+    events = _read_events(audit_path)
+    assert (events[0]["kind"], events[-1]["kind"]) == ("run_start", "run_end")
+    assert events[-1]["status"] == "ok"
+    assert not list((tmp_path / "state").rglob("analytics.db*"))
+
+
 def test_successful_run_writes_run_start_and_run_end(daimonos_binary, tmp_path):
     """Slice 1: an opt-in run writes a versioned JSONL record whose first event
     is `run_start` and whose terminal event is `run_end` with the final status

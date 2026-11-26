@@ -46,7 +46,9 @@ pub async fn build_tool_services(
     analytics: Option<Arc<AnalyticsStore>>,
 ) -> ToolServices {
     let registry = Arc::new(ToolRegistry::with_process_config(cfg.process.clone()));
-    crate::plugins::register_builtin_plugins(cfg, &registry, quiet_stderr).await;
+    if !cfg.network.offline() {
+        crate::plugins::register_builtin_plugins(cfg, &registry, quiet_stderr).await;
+    }
 
     let index = Arc::new(
         WorkspaceIndex::new(workspace.to_path_buf(), &cfg.index, !quiet_stderr)

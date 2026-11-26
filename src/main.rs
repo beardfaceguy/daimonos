@@ -31,6 +31,7 @@ mod mcp_bridge;
 mod mcp_config_cmd;
 mod mcp_oauth;
 mod observability;
+mod offline_tools;
 mod oneshot_session;
 mod ops;
 mod path_annotations;
@@ -228,6 +229,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let mut runtime_mode = cli.runtime_mode();
+    let network = offline_tools::NetworkAuthority::from_cli(cli.offline_tools);
+    if let Err(error) = network.admit_mode(&runtime_mode) {
+        exit_for_state_failure(error);
+    }
 
     // ADR-021: until WP02 relocates frontend state, never accept a partial guarantee.
     if cli.state_dir.is_some()
@@ -260,7 +265,9 @@ async fn main() -> anyhow::Result<()> {
         install_parent_death_signal();
     }
 
-    session::enhance_process_path();
+    if !network.offline() {
+        session::enhance_process_path();
+    }
 
     let workspace = match std::fs::canonicalize(&cli.workspace) {
         Ok(path) => path,
@@ -581,6 +588,14 @@ async fn main() -> anyhow::Result<()> {
             ));
         }
     }
+    cfg.network = network;
+    if network.offline() {
+        cfg.observability.enabled = false;
+        cfg.tool_output.reformat.enabled = false;
+    }
+    if cli.analytics_off || network.offline() {
+        cfg.analytics.enabled = false;
+    }
     if let Some(authority) = state_authority {
         if let Err(error) = cfg.apply_state_authority(authority, &workspace) {
             eprintln!(
@@ -634,6 +649,7 @@ async fn main() -> anyhow::Result<()> {
     cfg.workspace_read_only = cli.workspace_read_only;
     if cfg.workspace_read_only
         && cfg.state_authority.is_none()
+        && !network.offline()
         && (kgl::autoindex::enabled() || kgl::observe::enabled())
     {
         // These writers emit `.kgl` under the workspace. Relocation needs an
@@ -777,6 +793,12 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         };
+        if let Some(name) = names.iter().find(|name| network.admit_tool(name).is_err()) {
+            exit_for_state_failure(state_root::RunFailure::configuration_invalid(
+                "offline_profile_incompatible",
+                format!("--tool-allowlist requests {name}, which has no offline adapter"),
+            ));
+        }
         // AC-02.4 / requirement 5: validate every entry against the effective
         // catalog before any model work. The known set is the full native /
         // registry catalog plus the caller's designated final-answer tool when
@@ -868,6 +890,14 @@ async fn main() -> anyhow::Result<()> {
         }
         cfg.tool_allowlist = Some(names);
         cfg.tool_allowlist_path = Some(path.clone());
+    }
+    if network.offline() && cfg.tool_allowlist.is_none() {
+        cfg.tool_allowlist = Some(
+            offline_tools::LOCAL_TOOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+        );
     }
     // FR-02 requirement 7: report the effective allowlist (the set the run will
     // actually permit) in a machine-readable line so the caller can confirm it
@@ -963,7 +993,7 @@ async fn main() -> anyhow::Result<()> {
             );
             std::process::exit(2);
         }
-        if kgl::autoindex::enabled() || kgl::observe::enabled() {
+        if !network.offline() && (kgl::autoindex::enabled() || kgl::observe::enabled()) {
             eprintln!(
                 "{}",
                 serde_json::json!({"error": {
@@ -1337,11 +1367,12 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let resource_telemetry = if cfg.logging.enabled && _logging_guard.is_some() {
-        logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs)
-    } else {
-        None
-    };
+    let resource_telemetry =
+        if !network.offline() && cfg.logging.enabled && _logging_guard.is_some() {
+            logging::spawn_resource_telemetry(cfg.logging.resource_interval_secs)
+        } else {
+            None
+        };
     tracing::info!(
         target: "daimonos::lifecycle",
         event = "process_start",
@@ -1366,6 +1397,7 @@ async fn main() -> anyhow::Result<()> {
                 token_log,
                 explicit_config_path,
                 explicit_agent_instructions,
+                cli.analytics_off,
             )
             .await
         }
@@ -1483,7 +1515,11 @@ async fn run_tool_service(
     // one-shot startup build so a fresh agent session gets a current graph
     // without a manual `kgl_query index`. Runs on a blocking task; never blocks
     // or breaks startup. Off unless DAIMONOS_KGL_AUTOINDEX is set.
-    if kgl::autoindex::enabled() && !overbroad && cfg.filesystem_authority.is_none() {
+    if !cfg.network.offline()
+        && kgl::autoindex::enabled()
+        && !overbroad
+        && cfg.filesystem_authority.is_none()
+    {
         let kgl_ws = workspace.clone();
         let quiet = mcp_quiet_stderr;
         let startup_cfg = cfg.kgl.clone();
