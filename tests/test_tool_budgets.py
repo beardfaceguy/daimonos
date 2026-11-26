@@ -747,17 +747,18 @@ def test_timeout_read_file_returns_timeout(daimonos_factory, tmp_path):
 
 
 def test_timeout_ls_returns_timeout(daimonos_factory, tmp_path):
-    """F2 (M2): the ls walk checks the deadline before building its result."""
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    for i in range(20):
-        (ws / f"f{i}.txt").write_text("x")
-    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1"])
-    result = client.call_tool("ls", {"path": "."})
-    assert result.get("isError") is True, result
-    data = json.loads(_text(result))
-    assert data["code"] == "tool_timeout", data
-    assert "entries" not in data, "no late listing on a deadline hit"
+    """A small directory may finish in 1 ms. Establish expiry, not a minimum walk duration."""
+    (tmp_path / "visible.txt").write_text("x")
+    client = daimonos_factory(tmp_path, args=["--tool-timeout-ms", "300"])
+    result = client.call_tool("batch", {"ops": [
+        {"tool": "exec", "arguments": {"command": "sleep", "args": ["30"]}},
+        {"tool": "ls", "arguments": {"path": "."}},
+    ]})
+    sleep, listing = json.loads(_text(result))
+    assert _child_failure(sleep)["code"] == "tool_timeout"
+    data = _child_failure(listing)
+    assert data["tool"] == "ls" and data["code"] == "tool_timeout", data
+    assert "entries" not in data and "visible.txt" not in listing["error"]
 
 
 def test_timeout_content_search_returns_timeout(daimonos_factory, tmp_path):
