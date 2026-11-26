@@ -829,32 +829,44 @@ def test_timeout_file_search_returns_timeout(daimonos_factory, tmp_path):
 
 
 def test_ac_19_1_large_tree_search_times_out_within_bound(daimonos_factory, tmp_path):
-    """AC-19.1 / F2: a content search on a large tree (10000 files x ~1 KB =
-    ~10 MB; a full walk+scan of this many files clearly exceeds the limit on any
-    host in this environment, where opening 10000 files alone costs well over
-    100 ms) with a 100 ms limit returns ``tool_timeout`` within a stated upper
-    bound (8 s, far below the time a full scan would take), proving the deadline
-    STOPPED the work rather than the scan finishing on its own. The control with
-    no option returns success. Kept under ~10 s including setup.
+    """AC-19.1: require a real one-second search deadline, even on a warm cache.
+
+    Hard links vary the logical scan size without allocating gigabytes on disk.
+    An early success is valid only with the complete result. Increase the work
+    in that case, never the deadline. A run that never times out fails the test.
     """
     ws = tmp_path / "ws"
     ws.mkdir()
-    blob = "lorem ipsum dolor sit amet " * 38  # ~1 KB, no match
-    for i in range(10000):
-        (ws / f"f{i:05}.txt").write_text(blob)
+    marker = ws / "marker.txt"
+    marker.write_text("needle\n")
+    source = tmp_path / "shared-content.txt"
+    source.touch()
+    for i in range(1024):
+        (ws / f"f{i:04}.txt").hardlink_to(source)
 
-    client = daimonos_factory(ws, args=["--tool-timeout-ms", "100"])
-    start = time.monotonic()
-    result = client.call_tool("search", {"pattern": "needle", "mode": "content"})
-    elapsed = time.monotonic() - start
-    assert elapsed < 8, f"budget did not stop the search promptly: {elapsed:.1f}s"
-    assert result.get("isError") is True, result
-    assert json.loads(_text(result))["code"] == "tool_timeout", _text(result)
-
+    query = {"pattern": "needle", "mode": "content"}
+    client = daimonos_factory(ws, args=["--tool-timeout-ms", "1000"])
     control = daimonos_factory(ws)
-    r2 = control.call_tool("search", {"pattern": "needle", "mode": "content"})
-    assert r2.get("isError") is not True, _text(r2)
-    assert "tool_timeout" not in _text(r2), _text(r2)
+    block = b"no match here. \n" * 4096  # 64 KiB per block
+    for blocks in (1, 16, 256):  # 64 MiB, 1 GiB, 16 GiB of logical content
+        source.write_bytes(block * blocks)
+        start = time.monotonic()
+        result = client.call_tool("search", query)
+        elapsed = time.monotonic() - start
+        assert elapsed < 8, f"budget did not stop the search promptly: {elapsed:.1f}s"
+        data = json.loads(_text(result))
+        if result.get("isError"):
+            assert data["code"] == "tool_timeout" and "matches" not in data, data
+            break
+        assert [m["f"] for m in data["matches"]] == [marker.name], data
+    else:
+        raise AssertionError("the workload did not exercise the search deadline")
+
+    # Identical tree and query, without the deadline: complete the scan and
+    # return exactly the known match. No file-size or elapsed-time inference.
+    result = control.call_tool("search", query)
+    assert not result.get("isError"), result
+    assert [m["f"] for m in json.loads(_text(result))["matches"]] == [marker.name]
 
 
 # --- F3: plugin/managed-process tools (M3 curl, M4 git) ---
